@@ -10,7 +10,7 @@ See [this thread](https://ziggit.dev/t/dynamic-linking-without-libc-adventures) 
 ### Notes
 
 
-A custom musl's `libc.so` is included, which is a patched version of musl 1.25. The library is stripped (`strip --strip-unneeded lib/libc.so`) as it is often the case when it is packaged fot linux distros.
+A custom musl's `libc.so` is included, which is a patched version of musl 1.25. The library is stripped (`strip --strip-unneeded lib/libc.so`) as it is often the case when it is packaged for linux distros.
 
 The patch is:
 
