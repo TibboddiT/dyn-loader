@@ -7,8 +7,35 @@ Works with a lightly patched musl for now.
 
 See [this thread](https://ziggit.dev/t/dynamic-linking-without-libc-adventures) for further information.
 
-### Notes
+### Usage
 
+```zig
+const std = @import("std");
+const dll = @import("dll");
+
+pub const debug = struct {
+    pub const SelfInfo = dll.CustomSelfInfo;
+};
+
+pub fn main() !void {
+    var gpa: std.heap.DebugAllocator(.{ .stack_trace_frames = 10 }) = .init;
+    const allocator = gpa.allocator();
+    defer if (gpa.deinit() != .ok) @panic("Memory check failed");
+
+    try dll.init(.{ .debug = false });
+    defer dll.deinit(allocator);
+
+    const lib_c = try dll.load(allocator, "libc.so.6");
+
+    const printf_sym = try lib_c.getSymbol("printf");
+    const printf_addr = printf_sym.addr;
+    const printf: *const fn ([*:0]const u8, ...) callconv(.c) c_int = @ptrFromInt(printf_addr);
+
+    _ = printf("Hello, %s!\n", "World");
+}
+```
+
+### Notes
 
 A custom musl's `libc.so` is included, which is a patched version of musl 1.25. The library is stripped (`strip --strip-unneeded lib/libc.so`) as it is often the case when it is packaged for linux distros.
 
@@ -56,7 +83,7 @@ An unpatched copy of `libvulkan.so.1.4.326` from [the Alpine repository](https:/
 
 Both are in the `resources/musl` directory. It is recommended that you produce those binary artifacts by yourself.
 
-### Usage
+### Build examples
 
 ```
 zig build run-printf
