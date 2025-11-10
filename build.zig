@@ -5,7 +5,7 @@ pub fn build(b: *std.Build) void {
 
     const optimize = b.standardOptimizeOption(.{});
 
-    const dll_mod = b.createModule(.{
+    const dll_mod = b.addModule("dll", .{
         .root_source_file = b.path("src/lib/dynamic_library_loader.zig"),
         .target = target,
         .optimize = optimize,
