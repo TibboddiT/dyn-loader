@@ -1,0 +1,2742 @@
+const std = @import("std");
+const builtin = @import("builtin");
+
+pub const CustomSelfInfo = struct {
+    rwlock: std.Thread.RwLock,
+
+    modules: std.ArrayList(Module),
+    ranges: std.ArrayList(Module.Range),
+
+    unwind_cache: if (can_unwind) ?[]std.debug.Dwarf.SelfUnwinder.CacheEntry else ?noreturn,
+
+    var extra_phdr_infos: std.ArrayList(*std.posix.dl_phdr_info) = .empty;
+
+    pub const init: SelfInfo = .{
+        .rwlock = .{},
+        .modules = .empty,
+        .ranges = .empty,
+        .unwind_cache = null,
+    };
+    pub fn deinit(si: *SelfInfo, gpa: std.mem.Allocator) void {
+        for (si.modules.items) |*mod| {
+            unwind: {
+                const u = &(mod.unwind orelse break :unwind catch break :unwind);
+                for (u.buf[0..u.len]) |*unwind| unwind.deinit(gpa);
+            }
+            loaded: {
+                const l = &(mod.loaded_elf orelse break :loaded catch break :loaded);
+                l.file.deinit(gpa);
+            }
+        }
+
+        si.modules.deinit(gpa);
+        si.ranges.deinit(gpa);
+        if (si.unwind_cache) |cache| gpa.free(cache);
+    }
+
+    pub fn addExtraElf(gpa: std.mem.Allocator, dl_phdr_info: *std.posix.dl_phdr_info) !void {
+        // TODO thread safety
+        try extra_phdr_infos.append(gpa, dl_phdr_info);
+    }
+
+    pub fn clearExtraElfs(gpa: std.mem.Allocator) void {
+        // TODO thread safety
+        for (extra_phdr_infos.items) |e| {
+            gpa.destroy(e);
+        }
+
+        extra_phdr_infos.clearAndFree(gpa);
+    }
+
+    pub fn getSymbol(si: *SelfInfo, gpa: std.mem.Allocator, io: std.Io, address: usize) std.debug.SelfInfoError!std.debug.Symbol {
+        _ = io;
+        const module = try si.findModule(gpa, address, .exclusive);
+        defer si.rwlock.unlock();
+
+        const vaddr = address - module.load_offset;
+
+        const loaded_elf = try module.getLoadedElf(gpa);
+        if (loaded_elf.file.dwarf) |*dwarf| {
+            if (!loaded_elf.scanned_dwarf) {
+                dwarf.open(gpa, builtin.target.cpu.arch.endian()) catch |err| switch (err) {
+                    error.InvalidDebugInfo,
+                    error.MissingDebugInfo,
+                    error.OutOfMemory,
+                    => |e| return e,
+                    error.EndOfStream,
+                    error.Overflow,
+                    error.ReadFailed,
+                    error.StreamTooLong,
+                    => return error.InvalidDebugInfo,
+                };
+                loaded_elf.scanned_dwarf = true;
+            }
+            if (dwarf.getSymbol(gpa, builtin.target.cpu.arch.endian(), vaddr)) |sym| {
+                return sym;
+            } else |err| switch (err) {
+                error.MissingDebugInfo => {},
+
+                error.InvalidDebugInfo,
+                error.OutOfMemory,
+                => |e| return e,
+
+                error.ReadFailed,
+                error.EndOfStream,
+                error.Overflow,
+                error.StreamTooLong,
+                => return error.InvalidDebugInfo,
+            }
+        }
+        // When DWARF is unavailable, fall back to searching the symtab.
+        return loaded_elf.file.searchSymtab(gpa, vaddr) catch |err| switch (err) {
+            error.NoSymtab, error.NoStrtab => return error.MissingDebugInfo,
+            error.BadSymtab => return error.InvalidDebugInfo,
+            error.OutOfMemory => |e| return e,
+        };
+    }
+    pub fn getModuleName(si: *SelfInfo, gpa: std.mem.Allocator, address: usize) std.debug.SelfInfoError![]const u8 {
+        const module = try si.findModule(gpa, address, .shared);
+        defer si.rwlock.unlockShared();
+        if (module.name.len == 0) return error.MissingDebugInfo;
+        return module.name;
+    }
+
+    pub const can_unwind: bool = s: {
+        // The DWARF code can't deal with ILP32 ABIs yet: https://github.com/ziglang/zig/issues/25447
+        switch (builtin.target.abi) {
+            .gnuabin32,
+            .muslabin32,
+            .gnux32,
+            .muslx32,
+            => break :s false,
+            else => {},
+        }
+
+        // Notably, we are yet to support unwinding on ARM. There, unwinding is not done through
+        // `.eh_frame`, but instead with the `.ARM.exidx` section, which has a different format.
+        const archs: []const std.Target.Cpu.Arch = switch (builtin.target.os.tag) {
+            // Not supported yet: arm
+            .haiku => &.{
+                .aarch64,
+                .m68k,
+                .riscv64,
+                .x86,
+                .x86_64,
+            },
+            // Not supported yet: arm/armeb/thumb/thumbeb, xtensa/xtensaeb
+            .linux => &.{
+                .aarch64,
+                .aarch64_be,
+                .arc,
+                .csky,
+                .loongarch64,
+                .m68k,
+                .mips,
+                .mipsel,
+                .mips64,
+                .mips64el,
+                .or1k,
+                .riscv32,
+                .riscv64,
+                .s390x,
+                .x86,
+                .x86_64,
+            },
+            .serenity => &.{
+                .aarch64,
+                .x86_64,
+                .riscv64,
+            },
+
+            .dragonfly => &.{
+                .x86_64,
+            },
+            // Not supported yet: arm
+            .freebsd => &.{
+                .aarch64,
+                .riscv64,
+                .x86_64,
+            },
+            // Not supported yet: arm/armeb, mips64/mips64el
+            .netbsd => &.{
+                .aarch64,
+                .aarch64_be,
+                .m68k,
+                .mips,
+                .mipsel,
+                .x86,
+                .x86_64,
+            },
+            // Not supported yet: arm
+            .openbsd => &.{
+                .aarch64,
+                .mips64,
+                .mips64el,
+                .riscv64,
+                .x86,
+                .x86_64,
+            },
+
+            .illumos => &.{
+                .x86,
+                .x86_64,
+            },
+
+            else => unreachable,
+        };
+        for (archs) |a| {
+            if (builtin.target.cpu.arch == a) break :s true;
+        }
+        break :s false;
+    };
+    comptime {
+        if (can_unwind) {
+            std.debug.assert(std.debug.Dwarf.supportsUnwinding(&builtin.target));
+        }
+    }
+    pub const UnwindContext = std.debug.Dwarf.SelfUnwinder;
+    pub fn unwindFrame(si: *SelfInfo, gpa: std.mem.Allocator, context: *UnwindContext) std.debug.SelfInfoError!usize {
+        comptime std.debug.assert(can_unwind);
+
+        {
+            si.rwlock.lockShared();
+            defer si.rwlock.unlockShared();
+            if (si.unwind_cache) |cache| {
+                if (std.debug.Dwarf.SelfUnwinder.CacheEntry.find(cache, context.pc)) |entry| {
+                    return context.next(gpa, entry);
+                }
+            }
+        }
+
+        const module = try si.findModule(gpa, context.pc, .exclusive);
+        defer si.rwlock.unlock();
+
+        if (si.unwind_cache == null) {
+            si.unwind_cache = try gpa.alloc(std.debug.Dwarf.SelfUnwinder.CacheEntry, 2048);
+            @memset(si.unwind_cache.?, .empty);
+        }
+
+        const unwind_sections = try module.getUnwindSections(gpa);
+        for (unwind_sections) |*unwind| {
+            if (context.computeRules(gpa, unwind, module.load_offset, null)) |entry| {
+                entry.populate(si.unwind_cache.?);
+                return context.next(gpa, &entry);
+            } else |err| switch (err) {
+                error.MissingDebugInfo => continue,
+
+                error.InvalidDebugInfo,
+                error.UnsupportedDebugInfo,
+                error.OutOfMemory,
+                => |e| return e,
+
+                error.EndOfStream,
+                error.StreamTooLong,
+                error.ReadFailed,
+                error.Overflow,
+                error.InvalidOpcode,
+                error.InvalidOperation,
+                error.InvalidOperand,
+                => return error.InvalidDebugInfo,
+
+                error.UnimplementedUserOpcode,
+                error.UnsupportedAddrSize,
+                => return error.UnsupportedDebugInfo,
+            }
+        }
+        return error.MissingDebugInfo;
+    }
+
+    const Module = struct {
+        load_offset: usize,
+        name: []const u8,
+        build_id: ?[]const u8,
+        gnu_eh_frame: ?[]const u8,
+
+        /// `null` means unwind information has not yet been loaded.
+        unwind: ?(std.debug.SelfInfoError!UnwindSections),
+
+        /// `null` means the ELF file has not yet been loaded.
+        loaded_elf: ?(std.debug.SelfInfoError!LoadedElf),
+
+        const LoadedElf = struct {
+            file: std.debug.ElfFile,
+            scanned_dwarf: bool,
+        };
+
+        const UnwindSections = struct {
+            buf: [2]std.debug.Dwarf.Unwind,
+            len: usize,
+        };
+
+        const Range = struct {
+            start: usize,
+            len: usize,
+            /// Index into `modules`
+            module_index: usize,
+        };
+
+        /// Assumes we already hold an exclusive lock.
+        fn getUnwindSections(mod: *Module, gpa: std.mem.Allocator) std.debug.SelfInfoError![]std.debug.Dwarf.Unwind {
+            if (mod.unwind == null) mod.unwind = loadUnwindSections(mod, gpa);
+            const us = &(mod.unwind.? catch |err| return err);
+            return us.buf[0..us.len];
+        }
+        fn loadUnwindSections(mod: *Module, gpa: std.mem.Allocator) std.debug.SelfInfoError!UnwindSections {
+            var us: UnwindSections = .{
+                .buf = undefined,
+                .len = 0,
+            };
+            if (mod.gnu_eh_frame) |section_bytes| {
+                const section_vaddr: u64 = @intFromPtr(section_bytes.ptr) - mod.load_offset;
+                const header = std.debug.Dwarf.Unwind.EhFrameHeader.parse(section_vaddr, section_bytes, @sizeOf(usize), builtin.target.cpu.arch.endian()) catch |err| switch (err) {
+                    error.ReadFailed => unreachable, // it's all fixed buffers
+                    error.InvalidDebugInfo => |e| return e,
+                    error.EndOfStream, error.Overflow => return error.InvalidDebugInfo,
+                    error.UnsupportedAddrSize => return error.UnsupportedDebugInfo,
+                };
+                us.buf[us.len] = .initEhFrameHdr(header, section_vaddr, @ptrFromInt(@as(usize, @intCast(mod.load_offset + header.eh_frame_vaddr))));
+                us.len += 1;
+            } else {
+                // There is no `.eh_frame_hdr` section. There may still be an `.eh_frame` or `.debug_frame`
+                // section, but we'll have to load the binary to get at it.
+                const loaded = try mod.getLoadedElf(gpa);
+                // If both are present, we can't just pick one -- the info could be split between them.
+                // `.debug_frame` is likely to be the more complete section, so we'll prioritize that one.
+                if (loaded.file.debug_frame) |*debug_frame| {
+                    us.buf[us.len] = .initSection(.debug_frame, debug_frame.vaddr, debug_frame.bytes);
+                    us.len += 1;
+                }
+                if (loaded.file.eh_frame) |*eh_frame| {
+                    us.buf[us.len] = .initSection(.eh_frame, eh_frame.vaddr, eh_frame.bytes);
+                    us.len += 1;
+                }
+            }
+            errdefer for (us.buf[0..us.len]) |*u| u.deinit(gpa);
+            for (us.buf[0..us.len]) |*u| u.prepare(gpa, @sizeOf(usize), builtin.target.cpu.arch.endian(), true, false) catch |err| switch (err) {
+                error.ReadFailed => unreachable, // it's all fixed buffers
+                error.InvalidDebugInfo,
+                error.MissingDebugInfo,
+                error.OutOfMemory,
+                => |e| return e,
+                error.EndOfStream,
+                error.Overflow,
+                error.StreamTooLong,
+                error.InvalidOperand,
+                error.InvalidOpcode,
+                error.InvalidOperation,
+                => return error.InvalidDebugInfo,
+                error.UnsupportedAddrSize,
+                error.UnsupportedDwarfVersion,
+                error.UnimplementedUserOpcode,
+                => return error.UnsupportedDebugInfo,
+            };
+            return us;
+        }
+
+        /// Assumes we already hold an exclusive lock.
+        fn getLoadedElf(mod: *Module, gpa: std.mem.Allocator) std.debug.SelfInfoError!*LoadedElf {
+            if (mod.loaded_elf == null) mod.loaded_elf = loadElf(mod, gpa);
+            return if (mod.loaded_elf.?) |*elf| elf else |err| err;
+        }
+        fn loadElf(mod: *Module, gpa: std.mem.Allocator) std.debug.SelfInfoError!LoadedElf {
+            const load_result = if (mod.name.len > 0) res: {
+                var file = std.fs.cwd().openFile(mod.name, .{}) catch return error.MissingDebugInfo;
+                defer file.close();
+                break :res std.debug.ElfFile.load(gpa, file, mod.build_id, &.native(mod.name));
+            } else res: {
+                const path = std.fs.selfExePathAlloc(gpa) catch |err| switch (err) {
+                    error.OutOfMemory => |e| return e,
+                    else => return error.ReadFailed,
+                };
+                defer gpa.free(path);
+                var file = std.fs.cwd().openFile(path, .{}) catch return error.MissingDebugInfo;
+                defer file.close();
+                break :res std.debug.ElfFile.load(gpa, file, mod.build_id, &.native(path));
+            };
+
+            var elf_file = load_result catch |err| switch (err) {
+                error.OutOfMemory,
+                error.Unexpected,
+                error.Canceled,
+                => |e| return e,
+
+                error.Overflow,
+                error.TruncatedElfFile,
+                error.InvalidCompressedSection,
+                error.InvalidElfMagic,
+                error.InvalidElfVersion,
+                error.InvalidElfClass,
+                error.InvalidElfEndian,
+                => return error.InvalidDebugInfo,
+
+                error.SystemResources,
+                error.MemoryMappingNotSupported,
+                error.AccessDenied,
+                error.LockedMemoryLimitExceeded,
+                error.ProcessFdQuotaExceeded,
+                error.SystemFdQuotaExceeded,
+                error.Streaming,
+                => return error.ReadFailed,
+            };
+            errdefer elf_file.deinit(gpa);
+
+            if (elf_file.endian != builtin.target.cpu.arch.endian()) return error.InvalidDebugInfo;
+            if (elf_file.is_64 != (@sizeOf(usize) == 8)) return error.InvalidDebugInfo;
+
+            return .{
+                .file = elf_file,
+                .scanned_dwarf = false,
+            };
+        }
+    };
+
+    fn findModule(si: *SelfInfo, gpa: std.mem.Allocator, address: usize, lock: enum { shared, exclusive }) std.debug.SelfInfoError!*Module {
+        // With the requested lock, scan the module ranges looking for `address`.
+        switch (lock) {
+            .shared => si.rwlock.lockShared(),
+            .exclusive => si.rwlock.lock(),
+        }
+        for (si.ranges.items) |*range| {
+            if (address >= range.start and address < range.start + range.len) {
+                return &si.modules.items[range.module_index];
+            }
+        }
+        // The address wasn't in a known range. We will rebuild the module/range lists, since it's possible
+        // a new module was loaded. Upgrade to an exclusive lock if necessary.
+        switch (lock) {
+            .shared => {
+                si.rwlock.unlockShared();
+                si.rwlock.lock();
+            },
+            .exclusive => {},
+        }
+        // Rebuild module list with the exclusive lock.
+        {
+            errdefer si.rwlock.unlock();
+            for (si.modules.items) |*mod| {
+                unwind: {
+                    const u = &(mod.unwind orelse break :unwind catch break :unwind);
+                    for (u.buf[0..u.len]) |*unwind| unwind.deinit(gpa);
+                }
+                loaded: {
+                    const l = &(mod.loaded_elf orelse break :loaded catch break :loaded);
+                    l.file.deinit(gpa);
+                }
+            }
+            si.modules.clearRetainingCapacity();
+            si.ranges.clearRetainingCapacity();
+            var ctx: DlIterContext = .{ .si = si, .gpa = gpa };
+            try std.posix.dl_iterate_phdr(&ctx, error{OutOfMemory}, DlIterContext.callback);
+
+            for (extra_phdr_infos.items) |info| {
+                try DlIterContext.callback(info, @sizeOf(std.posix.dl_phdr_info), &ctx);
+            }
+        }
+        // Downgrade the lock back to shared if necessary.
+        switch (lock) {
+            .shared => {
+                si.rwlock.unlock();
+                si.rwlock.lockShared();
+            },
+            .exclusive => {},
+        }
+        // Scan the newly rebuilt module ranges.
+        for (si.ranges.items) |*range| {
+            if (address >= range.start and address < range.start + range.len) {
+                return &si.modules.items[range.module_index];
+            }
+        }
+        // Still nothing; unlock and error.
+        switch (lock) {
+            .shared => si.rwlock.unlockShared(),
+            .exclusive => si.rwlock.unlock(),
+        }
+        return error.MissingDebugInfo;
+    }
+    const DlIterContext = struct {
+        si: *SelfInfo,
+        gpa: std.mem.Allocator,
+
+        fn callback(info: *std.posix.dl_phdr_info, size: usize, context: *@This()) !void {
+            _ = size;
+
+            var build_id: ?[]const u8 = null;
+            var gnu_eh_frame: ?[]const u8 = null;
+
+            // Populate `build_id` and `gnu_eh_frame`
+            for (info.phdr[0..info.phnum]) |phdr| {
+                switch (phdr.p_type) {
+                    std.elf.PT_NOTE => {
+                        // Look for .note.gnu.build-id
+                        const segment_ptr: [*]const u8 = @ptrFromInt(info.addr + phdr.p_vaddr);
+                        var r: std.Io.Reader = .fixed(segment_ptr[0..phdr.p_memsz]);
+                        const name_size = r.takeInt(u32, builtin.target.cpu.arch.endian()) catch continue;
+                        const desc_size = r.takeInt(u32, builtin.target.cpu.arch.endian()) catch continue;
+                        const note_type = r.takeInt(u32, builtin.target.cpu.arch.endian()) catch continue;
+                        const name = r.take(name_size) catch continue;
+                        if (note_type != std.elf.NT_GNU_BUILD_ID) continue;
+                        if (!std.mem.eql(u8, name, "GNU\x00")) continue;
+                        const desc = r.take(desc_size) catch continue;
+                        build_id = desc;
+                    },
+                    std.elf.PT_GNU_EH_FRAME => {
+                        const segment_ptr: [*]const u8 = @ptrFromInt(info.addr + phdr.p_vaddr);
+                        gnu_eh_frame = segment_ptr[0..phdr.p_memsz];
+                    },
+                    else => {},
+                }
+            }
+
+            const gpa = context.gpa;
+            const si = context.si;
+
+            const module_index = si.modules.items.len;
+            try si.modules.append(gpa, .{
+                .load_offset = info.addr,
+                // Android libc uses NULL instead of "" to mark the main program
+                .name = std.mem.sliceTo(info.name, 0) orelse "",
+                .build_id = build_id,
+                .gnu_eh_frame = gnu_eh_frame,
+                .unwind = null,
+                .loaded_elf = null,
+            });
+
+            for (info.phdr[0..info.phnum]) |phdr| {
+                if (phdr.p_type != std.elf.PT_LOAD) continue;
+                try context.si.ranges.append(gpa, .{
+                    // Overflowing addition handles VSDOs having p_vaddr = 0xffffffffff700000
+                    .start = info.addr +% phdr.p_vaddr,
+                    .len = phdr.p_memsz,
+                    .module_index = module_index,
+                });
+            }
+        }
+    };
+
+    const SelfInfo = @This();
+};
+
+const PT = enum(u32) {
+    PT_NULL = 0,
+    PT_LOAD = 1,
+    PT_DYNAMIC = 2,
+    PT_INTERP = 3,
+    PT_NOTE = 4,
+    PT_SHLIB = 5,
+    PT_PHDR = 6,
+    PT_TLS = 7,
+    PT_NUM = 8,
+    PT_LOOS = 0x60000000,
+    PT_GNU_EH_FRAME = 0x6474e550,
+    PT_GNU_STACK = 0x6474e551,
+    PT_GNU_RELRO = 0x6474e552,
+    PT_GNU_PROPERTY = 0x6474e553,
+    PT_GNU_SFRAME = 0x6474e554,
+    PT_LOSUNW_OR_PT_SUNWBSS = 0x6ffffffa, // PT_SUNWBSS = 0x6ffffffa,
+    PT_SUNWSTACK = 0x6ffffffb,
+    PT_HISUNW_OR_PT_HIOS = 0x6fffffff, // PT_HIOS = 0x6fffffff,
+    PT_LOPROC = 0x70000000,
+    PT_HIPROC = 0x7fffffff,
+};
+
+const SHT = enum(u32) {
+    SHT_NULL = 0,
+    SHT_PROGBITS = 1,
+    SHT_SYMTAB = 2,
+    SHT_STRTAB = 3,
+    SHT_RELA = 4,
+    SHT_HASH = 5,
+    SHT_DYNAMIC = 6,
+    SHT_NOTE = 7,
+    SHT_NOBITS = 8,
+    SHT_REL = 9,
+    SHT_SHLIB = 10,
+    SHT_DYNSYM = 11,
+    SHT_INIT_ARRAY = 14,
+    SHT_FINI_ARRAY = 15,
+    SHT_PREINIT_ARRAY = 16,
+    SHT_GROUP = 17,
+    SHT_SYMTAB_SHNDX = 18,
+    SHT_RELR = 19,
+    SHT_LOOS = 0x60000000,
+    SHT_LLVM_ADDRSIG = 0x6fff4c03,
+    SHT_GNU_SFRAME = 0x6ffffff4,
+    SHT_GNU_HASH = 0x6ffffff6,
+    SHT_GNU_VERDEF = 0x6ffffffd,
+    SHT_GNU_VERNEED = 0x6ffffffe,
+    SHT_GNU_VERSYM_OR_HIOS = 0x6fffffff,
+    SHT_LOPROC = 0x70000000,
+    SHT_X86_64_UNWIND = 0x70000001,
+    SHT_HIPROC = 0x7fffffff,
+    SHT_LOUSER = 0x80000000,
+    SHT_HIUSER = 0xffffffff,
+};
+
+const DT = enum(i64) {
+    DT_NULL = 0,
+    DT_NEEDED_OR_ALPHA_NUM_OR_IA_64_NUM = 1,
+    DT_PLTRELSZ_OR_SPARC_NUM_OR_PPC_NUM = 2,
+    DT_PLTGOT_OR_EXTRANUM = 3,
+    DT_HASH_OR_PPC64_NUM = 4,
+    DT_STRTAB = 5,
+    DT_SYMTAB = 6,
+    DT_RELA = 7,
+    DT_RELASZ = 8,
+    DT_RELAENT = 9,
+    DT_STRSZ = 10,
+    DT_SYMENT_OR_ADDRNUM = 11,
+    DT_INIT_OR_VALNUM = 12,
+    DT_FINI = 13,
+    DT_SONAME = 14,
+    DT_RPATH = 15,
+    DT_SYMBOLI_OR_VERSIONTAGNUM = 16,
+    DT_REL = 17,
+    DT_RELSZ = 18,
+    DT_RELENT = 19,
+    DT_PLTREL = 20,
+    DT_DEBUG = 21,
+    DT_TEXTREL = 22,
+    DT_JMPREL = 23,
+    DT_BIND_NOW = 24,
+    DT_INIT_ARRAY = 25,
+    DT_FINI_ARRAY = 26,
+    DT_INIT_ARRAYSZ = 27,
+    DT_FINI_ARRAYSZ = 28,
+    DT_RUNPATH = 29,
+    DT_FLAGS = 30,
+    DT_ENCODING_OR_PREINIT_ARRAY = 32,
+    DT_PREINIT_ARRAYSZ = 33,
+    DT_SYMTAB_SHNDX = 34,
+    DT_RELRSZ = 35,
+    DT_RELR = 36,
+    DT_RELRENT = 37,
+    DT_NUM = 38,
+    DT_LOOS = 0x6000000d,
+    DT_HIOS = 0x6ffff000,
+    DT_LOPROC_OR_ALPHA_PLTRO_OR_PPC_GOT_OR_PPC64_GLINK_OR_IA_64_PLT_RESERVE = 0x70000000,
+    DT_HIPROC_OR_FILTER = 0x7fffffff,
+    DT_PROCNUM_OR_MIPS_NUM = 0x36,
+    DT_VALRNGLO = 0x6ffffd00,
+    DT_GNU_PRELINKED = 0x6ffffdf5,
+    DT_GNU_CONFLICTSZ = 0x6ffffdf6,
+    DT_GNU_LIBLISTSZ = 0x6ffffdf7,
+    DT_CHECKSUM = 0x6ffffdf8,
+    DT_PLTPADSZ = 0x6ffffdf9,
+    DT_MOVEENT = 0x6ffffdfa,
+    DT_MOVESZ = 0x6ffffdfb,
+    DT_FEATURE_1 = 0x6ffffdfc,
+    DT_POSFLAG_1 = 0x6ffffdfd,
+    DT_SYMINSZ = 0x6ffffdfe,
+    DT_SYMINENT_OR_VALRNGHI = 0x6ffffdff,
+    DT_ADDRRNGLO = 0x6ffffe00,
+    DT_GNU_HASH = 0x6ffffef5,
+    DT_TLSDESC_PLT = 0x6ffffef6,
+    DT_TLSDESC_GOT = 0x6ffffef7,
+    DT_GNU_CONFLICT = 0x6ffffef8,
+    DT_GNU_LIBLIST = 0x6ffffef9,
+    DT_CONFIG = 0x6ffffefa,
+    DT_DEPAUDIT = 0x6ffffefb,
+    DT_AUDIT = 0x6ffffefc,
+    DT_PLTPAD = 0x6ffffefd,
+    DT_MOVETAB = 0x6ffffefe,
+    DT_SYMINFO_OR_ADDRRNGHI = 0x6ffffeff,
+    DT_VERSYM = 0x6ffffff0,
+    DT_RELACOUNT = 0x6ffffff9,
+    DT_RELCOUNT = 0x6ffffffa,
+    DT_FLAGS_1 = 0x6ffffffb,
+    DT_VERDEF = 0x6ffffffc,
+    DT_VERDEFNUM = 0x6ffffffd,
+    DT_VERNEED = 0x6ffffffe,
+    DT_VERNEEDNUM = 0x6fffffff,
+    DT_AUXILIARY = 0x7ffffffd,
+    DT_SPARC_REGISTER_OR_MIPS_RLD_VERSION_OR_PPC_OPT_OR_PPC64_OPD = 0x70000001,
+    DT_MIPS_TIME_STAMP_OR_PPC64_OPDSZ_OR_NIOS2_GP = 0x70000002,
+    DT_MIPS_ICHECKSUM_OR_PPC64_OPT = 0x70000003,
+    DT_MIPS_IVERSION = 0x70000004,
+    DT_MIPS_FLAGS = 0x70000005,
+    DT_MIPS_BASE_ADDRESS = 0x70000006,
+    DT_MIPS_MSYM = 0x70000007,
+    DT_MIPS_CONFLICT = 0x70000008,
+    DT_MIPS_LIBLIST = 0x70000009,
+    DT_MIPS_LOCAL_GOTNO = 0x7000000a,
+    DT_MIPS_CONFLICTNO = 0x7000000b,
+    DT_MIPS_LIBLISTNO = 0x70000010,
+    DT_MIPS_SYMTABNO = 0x70000011,
+    DT_MIPS_UNREFEXTNO = 0x70000012,
+    DT_MIPS_GOTSYM = 0x70000013,
+    DT_MIPS_HIPAGENO = 0x70000014,
+    DT_MIPS_RLD_MAP = 0x70000016,
+    DT_MIPS_DELTA_CLASS = 0x70000017,
+    DT_MIPS_DELTA_CLASS_NO = 0x70000018,
+    DT_MIPS_DELTA_INSTANCE = 0x70000019,
+    DT_MIPS_DELTA_INSTANCE_NO = 0x7000001a,
+    DT_MIPS_DELTA_RELOC = 0x7000001b,
+    DT_MIPS_DELTA_RELOC_NO = 0x7000001c,
+    DT_MIPS_DELTA_SYM = 0x7000001d,
+    DT_MIPS_DELTA_SYM_NO = 0x7000001e,
+    DT_MIPS_DELTA_CLASSSYM = 0x70000020,
+    DT_MIPS_DELTA_CLASSSYM_NO = 0x70000021,
+    DT_MIPS_CXX_FLAGS = 0x70000022,
+    DT_MIPS_PIXIE_INIT = 0x70000023,
+    DT_MIPS_SYMBOL_LIB = 0x70000024,
+    DT_MIPS_LOCALPAGE_GOTIDX = 0x70000025,
+    DT_MIPS_LOCAL_GOTIDX = 0x70000026,
+    DT_MIPS_HIDDEN_GOTIDX = 0x70000027,
+    DT_MIPS_PROTECTED_GOTIDX = 0x70000028,
+    DT_MIPS_OPTIONS = 0x70000029,
+    DT_MIPS_INTERFACE = 0x7000002a,
+    DT_MIPS_DYNSTR_ALIGN = 0x7000002b,
+    DT_MIPS_INTERFACE_SIZE = 0x7000002c,
+    DT_MIPS_RLD_TEXT_RESOLVE_ADDR = 0x7000002d,
+    DT_MIPS_PERF_SUFFIX = 0x7000002e,
+    DT_MIPS_COMPACT_SIZE = 0x7000002f,
+    DT_MIPS_GP_VALUE = 0x70000030,
+    DT_MIPS_AUX_DYNAMIC = 0x70000031,
+    DT_MIPS_PLTGOT = 0x70000032,
+    DT_MIPS_RWPLT = 0x70000034,
+    DT_MIPS_RLD_MAP_REL = 0x70000035,
+};
+
+const STB = enum(u4) {
+    STB_LOCAL = 0,
+    STB_GLOBAL = 1,
+    STB_WEAK = 2,
+    STB_NUM = 3,
+    STB_LOOS_OR_GNU_UNIQUE = 10,
+    STB_HIOS = 12,
+    STB_LOPROC_OR_MIPS_SPLIT_COMMON = 13,
+    STB_HIPROC = 15,
+};
+
+const SHN = enum(u16) {
+    SHN_UNDEF = 0,
+    SHN_LORESERVE_OR_LOPROC = 0xff00,
+    SHN_HIPROC = 0xff1f,
+    SHN_LIVEPATCH = 0xff20,
+    SHN_ABS = 0xfff1,
+    SHN_COMMON = 0xfff2,
+    SHN_HIRESERVE = 0xffff,
+    _,
+
+    fn nameOrValue(shn: SHN, buf: []u8) ![]const u8 {
+        return switch (shn) {
+            .SHN_UNDEF,
+            .SHN_LORESERVE_OR_LOPROC,
+            .SHN_HIPROC,
+            .SHN_LIVEPATCH,
+            .SHN_ABS,
+            .SHN_COMMON,
+            .SHN_HIRESERVE,
+            => @tagName(shn),
+            _ => try std.fmt.bufPrint(buf, "0x{x}", .{@intFromEnum(shn)}),
+        };
+    }
+};
+
+const STT = enum(u4) {
+    STT_NOTYPE = 0,
+    STT_OBJECT = 1,
+    STT_FUNC = 2,
+    STT_SECTION = 3,
+    STT_FILE = 4,
+    STT_COMMON = 5,
+    STT_TLS = 6,
+    STT_NUM = 7,
+    STT_LOOS_OR_GNU_IFUNC = 10,
+    STT_HIOS_OR_HP_STUB = 12,
+    STT_LOPROC_OR_SPARC_REGISTER_OR_PARISC_MILLICODE_OR_ARM_TFUNC = 13,
+    STT_HIPROC_OR_ARM_16BIT = 15,
+    STT_HP_OPAQUE = 11,
+};
+
+const LinkMap = extern struct {
+    l_addr: usize,
+    l_name: [*:0]const u8,
+    l_ld: ?*std.elf.Dyn,
+    l_next: ?*LinkMap,
+    l_prev: ?*LinkMap,
+
+    pub const Iterator = struct {
+        current: ?*LinkMap,
+
+        pub fn end(self: *Iterator) bool {
+            return self.current == null;
+        }
+
+        pub fn next(self: *Iterator) ?*LinkMap {
+            if (self.current) |it| {
+                self.current = it.l_next;
+                return it;
+            }
+            return null;
+        }
+    };
+};
+
+const RDebug = extern struct {
+    r_version: i32,
+    r_map: ?*LinkMap,
+    r_brk: usize,
+    r_state: enum(u8) { RT_CONSISTENT, RT_ADD, RT_DELETE },
+    r_ldbase: usize,
+};
+
+const LoadSegmentFlags = struct {
+    read: bool,
+    write: bool,
+    exec: bool,
+
+    mem_offset: usize,
+    mem_size: usize,
+
+    pub fn toStr(flags: LoadSegmentFlags, out: []u8) ![]const u8 {
+        return std.fmt.bufPrint(out, "{s}{s}{s}", .{
+            @as([]const u8, if (flags.read) "R" else ""),
+            @as([]const u8, if (flags.write) "W" else ""),
+            @as([]const u8, if (flags.exec) "X" else ""),
+        });
+    }
+};
+
+const LoadSegment = struct {
+    file_offset: usize,
+    file_size: usize,
+    mem_offset: usize,
+    mem_size: usize,
+    mem_align: usize,
+    mapped_from_file: bool,
+    flags_first: LoadSegmentFlags,
+    flags_last: LoadSegmentFlags,
+    loaded_at: usize,
+};
+
+const LoadSegmentList = std.AutoArrayHashMapUnmanaged(usize, LoadSegment);
+
+const DynSym = struct {
+    name: []const u8,
+    version: []const u8,
+    hidden: bool,
+    offset: usize,
+    type: STT,
+    bind: STB,
+    shidx: SHN,
+    value: usize,
+    size: usize,
+};
+
+const DynSymList = std.StringArrayHashMapUnmanaged(std.ArrayList(usize));
+
+const ResolvedSymbol = struct {
+    value: usize,
+    address: usize,
+    name: []const u8,
+    version: []const u8,
+};
+
+const Reloc = struct {
+    type: std.elf.R_X86_64,
+    is_relr: bool,
+    sym_idx: usize,
+    offset: usize,
+    addend: isize,
+};
+
+const RelocList = std.ArrayList(Reloc);
+
+var irel_resolved_addrs: std.AutoArrayHashMapUnmanaged(usize, usize) = .empty;
+var irel_resolved_targets: std.AutoArrayHashMapUnmanaged(usize, usize) = .empty;
+
+const DynObject = struct {
+    name_is_key: bool,
+    name: []const u8,
+    path: []const u8,
+    file_handle: i32,
+    mapped_at: usize,
+    mapped_size: usize,
+    segments: LoadSegmentList,
+    tls_init_file_offset: usize,
+    tls_init_file_size: usize,
+    tls_init_mem_offset: usize,
+    tls_init_mem_size: usize,
+    tls_align: usize,
+    tls_offset: usize,
+    eh: *std.elf.Elf64_Ehdr,
+    eh_init_file_offset: usize,
+    eh_init_file_size: usize,
+    eh_init_mem_offset: usize,
+    eh_init_mem_size: usize,
+    eh_align: usize,
+    eh_offset: usize,
+    syms: DynSymList,
+    syms_array: std.ArrayList(DynSym),
+    dependencies: std.ArrayList(usize),
+    relocs: RelocList,
+    init_addr: usize,
+    fini_addr: usize,
+    init_array_addr: usize,
+    init_array_size: usize,
+    fini_array_addr: usize,
+    fini_array_size: usize,
+    loaded: bool,
+    loaded_at: ?usize,
+    loaded_size: usize,
+};
+
+const DynObjectList = std.StringArrayHashMapUnmanaged(DynObject);
+
+const Symbol = struct {
+    addr: usize,
+};
+
+pub const DynamicLibrary = struct {
+    index: usize,
+
+    pub fn getSymbol(lib: DynamicLibrary, sym_name: []const u8) !Symbol {
+        const dyn_obj = &dyn_objects.values()[lib.index];
+        const sym = try getResolvedSymbol(dyn_obj, sym_name);
+        return .{
+            .addr = sym.address,
+        };
+    }
+
+    // pub fn unload(lib: DynamicLibrary, allocator: std.mem.Allocator) void {
+    //     const dyn_obj = &dyn_objects.values()[lib.index];
+    //     unloadDso(dyn_obj, allocator);
+    // }
+};
+
+const stack_memory_size = 16 * 1024 * 1024;
+
+var dyn_objects: DynObjectList = .empty;
+
+const Logger = struct {
+    const inner_logger = std.log.scoped(.dynamic_library_loader);
+    var active = false;
+
+    fn debug(comptime format: []const u8, args: anytype) void {
+        if (Logger.active) {
+            inner_logger.debug(format, args);
+        }
+    }
+
+    fn info(comptime format: []const u8, args: anytype) void {
+        if (Logger.active) {
+            inner_logger.info(format, args);
+        }
+    }
+
+    fn warn(comptime format: []const u8, args: anytype) void {
+        if (Logger.active) {
+            inner_logger.warn(format, args);
+        }
+    }
+
+    fn err(comptime format: []const u8, args: anytype) void {
+        if (Logger.active) {
+            inner_logger.err(format, args);
+        }
+    }
+};
+
+export fn _dl_debug_state() callconv(.c) void {
+    Logger.info("_dl_debug_state", .{});
+}
+
+pub export var r_debug: RDebug = .{
+    .r_version = 1,
+    .r_brk = 0,
+    .r_map = null,
+    .r_state = .RT_CONSISTENT,
+    .r_ldbase = 0,
+};
+
+var initialized: bool = false;
+
+const InitOptions = struct {
+    debug: bool = false,
+};
+
+// TODO thread safety
+pub fn init(options: InitOptions) !void {
+    if (initialized) {
+        return error.AlreadyInitialized;
+    }
+
+    if (options.debug) {
+        Logger.active = true;
+    }
+
+    r_debug.r_brk = @intFromPtr(&_dl_debug_state);
+
+    // TODO:
+    // - restructure TLS
+    // - assert linux x86_64 gnu
+    // - assert statically linked
+    // - assert only one thread
+
+    initialized = true;
+}
+
+// TODO thread safety
+pub fn deinit(allocator: std.mem.Allocator) void {
+    for (dyn_objects.values()) |*dyn_object| {
+        for (dyn_object.syms_array.items) |*sym| {
+            allocator.free(sym.name);
+            allocator.free(sym.version);
+        }
+        dyn_object.syms_array.deinit(allocator);
+
+        for (dyn_object.syms.values()) |*v| {
+            v.deinit(allocator);
+        }
+        dyn_object.syms.deinit(allocator);
+
+        dyn_object.relocs.deinit(allocator);
+        dyn_object.dependencies.deinit(allocator);
+        dyn_object.segments.deinit(allocator);
+
+        if (!dyn_object.name_is_key) {
+            allocator.free(dyn_object.name);
+        }
+        allocator.free(dyn_object.path);
+    }
+
+    for (dyn_objects.keys()) |k| {
+        allocator.free(k);
+    }
+
+    dyn_objects.clearAndFree(allocator);
+
+    irel_resolved_addrs.clearAndFree(allocator);
+    irel_resolved_targets.clearAndFree(allocator);
+
+    CustomSelfInfo.clearExtraElfs(allocator);
+
+    // TODO:
+    // - unmap unnecessary maps
+    // - call fini / fini_array
+}
+
+// TODO thread safety
+// TODO handle errors gracefully
+pub fn load(allocator: std.mem.Allocator, f_path: []const u8) !DynamicLibrary {
+    if (!initialized) {
+        return error.Unitialized;
+    }
+
+    // TODO:
+    // - open flags
+    // - rpath
+    // - LD_* env vars
+
+    const lib = try loadRecursive(allocator, f_path);
+
+    if (Logger.active) {
+        // var buf: [16]u8 = undefined;
+        for (dyn_objects.values()) |*dyn_object| {
+            if (dyn_object.loaded) {
+                continue;
+            }
+
+            //     Logger.info("name: {s}", .{dyn_object.name});
+            //     Logger.info("  path: {s}", .{dyn_object.path});
+            //     Logger.info("  mapped_at: 0x{x}", .{dyn_object.mapped_at});
+            //     Logger.info("  segments:", .{});
+            //     Logger.info("    {d} segments loaded", .{dyn_object.segments.count()});
+            //     for (dyn_object.segments.values(), 1..) |segment, s| {
+            //         Logger.info("    - {d}:", .{s});
+            //         Logger.info("      file_offset: 0x{x}", .{segment.file_offset});
+            //         Logger.info("      file_size: 0x{x}", .{segment.file_size});
+            //         Logger.info("      mem_offset: 0x{x}", .{segment.mem_offset});
+            //         Logger.info("      mem_size: 0x{x}", .{segment.mem_size});
+            //         Logger.info("      mem_align: 0x{x}", .{segment.mem_align});
+            //         Logger.info("      loadedAt: 0x{x}", .{segment.loaded_at});
+            //         Logger.info("      flags_first: {s}", .{try segment.flags_first.toStr(&buf)});
+            //         Logger.info("      flags_last: {s}", .{try segment.flags_last.toStr(&buf)});
+            //     }
+            //     Logger.info("  tls_init_file_offset: 0x{x}", .{dyn_object.tls_init_file_offset});
+            //     Logger.info("  tls_init_file_size: 0x{x}", .{dyn_object.tls_init_file_size});
+            //     Logger.info("  tls_init_mem_offset: 0x{x}", .{dyn_object.tls_init_mem_offset});
+            //     Logger.info("  tls_init_mem_size: 0x{x}", .{dyn_object.tls_init_mem_size});
+            //     Logger.info("  init/fini:", .{});
+            //     Logger.info("    init_addr: 0x{x}", .{dyn_object.init_addr});
+            //     Logger.info("    fini_addr: 0x{x}", .{dyn_object.fini_addr});
+            //     Logger.info("    init_array_addr: 0x{x}, size: 0x{x}", .{ dyn_object.init_array_addr, dyn_object.init_array_size });
+            //     Logger.info("    fini_array_addr: 0x{x}, size: 0x{x}", .{ dyn_object.fini_array_addr, dyn_object.fini_array_size });
+            //     Logger.info("  symbols:", .{});
+            //     Logger.info("    {d} / {d} symbols", .{ dyn_object.syms.count(), dyn_object.syms_array.items.len });
+            //     for (dyn_object.syms_array.items, 0..) |sym, s| {
+            //         Logger.debug("    - index: {d}:", .{s});
+            //         Logger.debug("      name: {s}", .{sym.name});
+            //         Logger.debug("      version: {s}", .{sym.version});
+            //         Logger.debug("      hidden: {}", .{sym.hidden});
+            //         Logger.debug("      offset: 0x{x}", .{sym.offset});
+            //         Logger.debug("      type: {s}", .{@tagName(sym.type)});
+            //         Logger.debug("      bind: {s}", .{@tagName(sym.bind)});
+            //         Logger.debug("      shidx: {s}", .{try sym.shidx.nameOrValue(&buf)});
+            //         Logger.debug("      value: 0x{x}", .{sym.value});
+            //         Logger.debug("      size: 0x{x}", .{sym.size});
+            //     }
+            //     Logger.info("  relocs:", .{});
+            //     Logger.info("    {d} relocs", .{dyn_object.relocs.items.len});
+            //     for (dyn_object.relocs.items, 1..) |reloc, s| {
+            //         Logger.debug("    - {d}:", .{s});
+            //         Logger.debug("      type: {s}", .{@tagName(reloc.type)});
+            //         Logger.debug("      sym_idx: 0x{x}", .{reloc.sym_idx});
+            //         Logger.debug("      offset: 0x{x}", .{reloc.offset});
+            //         Logger.debug("      addend: 0x{x}", .{reloc.addend});
+            //     }
+        }
+    }
+
+    // TODO how many new DynObject were loaded ?
+    var init_list: [10]*DynObject = undefined;
+
+    var count: usize = 0;
+    var it = dyn_objects.iterator();
+    while (it.next()) |entry| {
+        init_list[count] = entry.value_ptr;
+        count += 1;
+    }
+    std.mem.reverse(*DynObject, init_list[0..count]);
+
+    for (init_list[0..count]) |dyn_obj| {
+        if (dyn_obj.loaded) {
+            continue;
+        }
+
+        computeTcbOffset(dyn_obj);
+        try processRelocations(dyn_obj);
+        try mapTlsBlock(dyn_obj);
+        try processIRelativeRelocations(allocator, dyn_obj);
+
+        // TODO temporarily to help debugging
+        // TODO don't call _dl_debug_state, call r_debug.r_brk, add loaded objects to r_debug.map list, and call again r_brk
+        _dl_debug_state();
+    }
+
+    for (init_list[0..count]) |dyn_obj| {
+        if (dyn_obj.loaded) {
+            continue;
+        }
+        try updateSegmentsPermissions(dyn_obj);
+        try callInitFunctions(dyn_obj);
+    }
+
+    it = dyn_objects.iterator();
+    while (it.next()) |entry| {
+        const dyn_obj = entry.value_ptr;
+
+        dyn_obj.loaded = true;
+
+        if (dyn_obj.loaded_at == null) {
+            continue;
+        }
+
+        const dl_phdr_info = try allocator.create(std.posix.dl_phdr_info);
+
+        dl_phdr_info.* = .{
+            .addr = dyn_obj.loaded_at.?,
+            .name = @ptrCast(dyn_obj.path),
+            .phdr = @ptrFromInt(dyn_obj.loaded_at.? + dyn_obj.eh.e_phoff),
+            .phnum = dyn_obj.eh.e_phnum,
+        };
+
+        try CustomSelfInfo.addExtraElf(allocator, dl_phdr_info);
+    }
+
+    // it = dyn_objects.iterator();
+    // while (it.next()) |entry| {
+    //     try dumpSegments(entry.value_ptr);
+    // }
+
+    return lib;
+}
+
+// TODO return how many DynObjects were loaded
+fn loadRecursive(allocator: std.mem.Allocator, o_path: []const u8) !DynamicLibrary {
+    const lib = try loadDso(allocator, o_path);
+
+    var hasUnloaded = true;
+    while (hasUnloaded) {
+        hasUnloaded = false;
+
+        var it = dyn_objects.iterator();
+        while (it.next()) |entry| {
+            const dyn_object = entry.value_ptr;
+
+            if (dyn_object.mapped_at != 0) {
+                continue;
+            }
+
+            hasUnloaded = true;
+            const name = dyn_object.name;
+
+            _ = try loadDso(allocator, name);
+
+            break;
+        }
+    }
+
+    return lib;
+}
+
+// TODO mimic path resolution of linux-ld better
+fn resolvePath(allocator: std.mem.Allocator, r_path: []const u8) ![]const u8 {
+    const lib_dirs = [_][]const u8{
+        "/usr/local/lib/x86_64-linux-gnu",
+        "/lib/x86_64-linux-gnu",
+        "/usr/lib/x86_64-linux-gnu",
+        "/usr/lib/x86_64-linux-gnu64",
+        "/usr/local/lib64",
+        "/lib64",
+        "/usr/lib64",
+        "/usr/local/lib",
+        "/lib",
+        "/usr/lib",
+        "/usr/x86_64-linux-gnu/lib64",
+        "/usr/x86_64-linux-gnu/lib",
+    };
+
+    // TODO max path len
+    var buf: [2048]u8 = @splat(0);
+
+    var path: ?[]const u8 = null;
+
+    for (lib_dirs) |dir| {
+        const a_path = try std.fmt.bufPrint(&buf, "{s}/{s}", .{
+            dir,
+            r_path,
+        });
+
+        std.fs.accessAbsolute(a_path, .{ .read = true }) catch continue;
+
+        path = try std.fmt.allocPrint(allocator, "{s}", .{a_path});
+
+        Logger.debug("found {s}: {s}", .{ r_path, path.? });
+
+        break;
+    }
+
+    return path orelse error.LibraryNotFound;
+}
+
+fn loadDso(allocator: std.mem.Allocator, o_path: []const u8) !DynamicLibrary {
+    const path: []const u8 = if (std.mem.startsWith(u8, o_path, "/")) try allocator.dupe(u8, o_path) else try resolvePath(allocator, o_path);
+    defer allocator.free(path);
+
+    Logger.info("loading: {s} [{s}]", .{ o_path, path });
+
+    const f = try std.fs.openFileAbsolute(path, .{ .mode = .read_only });
+    const stat = try f.stat();
+    const size = std.math.cast(usize, stat.size) orelse return error.FileTooBig;
+
+    const file_bytes = try std.posix.mmap(
+        null,
+        std.mem.alignForward(usize, size, std.heap.pageSize()),
+        std.posix.PROT.READ,
+        .{ .TYPE = .PRIVATE },
+        f.handle,
+        0,
+    );
+
+    const file_addr = @intFromPtr(file_bytes.ptr);
+
+    const dyn_object_name = try allocator.dupe(u8, std.fs.path.basename(path));
+    errdefer allocator.free(dyn_object_name);
+
+    // TODO check how many new dyn_object will be needed
+    try dyn_objects.ensureUnusedCapacity(allocator, 10);
+
+    const eh: *std.elf.Elf64_Ehdr = @ptrCast(file_bytes);
+    if (!std.mem.eql(u8, eh.e_ident[0..4], std.elf.MAGIC)) return error.NotAnElfFile;
+
+    const do_entry = try dyn_objects.getOrPut(allocator, dyn_object_name);
+    defer if (do_entry.found_existing) {
+        allocator.free(dyn_object_name);
+    };
+
+    do_entry.value_ptr.* = .{
+        .name_is_key = false,
+        .name = try allocator.dupe(u8, dyn_object_name),
+        .path = try allocator.dupe(u8, path),
+        .file_handle = f.handle,
+        .mapped_at = file_addr,
+        .mapped_size = file_bytes.len,
+        .segments = .empty,
+        .tls_init_file_offset = 0,
+        .tls_init_file_size = 0,
+        .tls_init_mem_offset = 0,
+        .tls_init_mem_size = 0,
+        .tls_align = 0,
+        .tls_offset = 0,
+        .eh = eh,
+        .eh_init_file_offset = 0,
+        .eh_init_file_size = 0,
+        .eh_init_mem_offset = 0,
+        .eh_init_mem_size = 0,
+        .eh_align = 0,
+        .eh_offset = 0,
+        .syms = .empty,
+        .syms_array = .empty,
+        .relocs = .empty,
+        .dependencies = .empty,
+        .init_addr = 0,
+        .fini_addr = 0,
+        .init_array_addr = 0,
+        .init_array_size = 0,
+        .fini_array_addr = 0,
+        .fini_array_size = 0,
+        .loaded = false,
+        .loaded_at = null,
+        .loaded_size = 0,
+    };
+
+    const dyn_object = dyn_objects.getEntry(dyn_object_name).?.value_ptr;
+
+    const lib: DynamicLibrary = .{ .index = dyn_objects.entries.len - 1 };
+
+    Logger.debug("elf type: {s}", .{@tagName(eh.e_type)});
+
+    var i: usize = 0;
+
+    Logger.debug("sections headers offset: 0x{x}", .{eh.e_shoff});
+    Logger.debug("sections headers string table index: {d}", .{eh.e_shstrndx});
+
+    const sh_section_strtbl_addr = file_addr + eh.e_shoff + (eh.e_shstrndx * eh.e_shentsize);
+    const sh_strtbl: *std.elf.Shdr = @ptrFromInt(sh_section_strtbl_addr);
+    const sh_strtab_addr: usize = file_addr + sh_strtbl.sh_offset;
+
+    var dyn_strtab_addr: usize = undefined;
+    var versym_tab_addr: ?usize = null;
+    var verdef_tab_addr: usize = undefined;
+    var verneed_tab_addr: usize = undefined;
+
+    var dyn_symtab_addr: usize = undefined;
+    var dyn_symtab_size: usize = undefined;
+
+    Logger.debug("sections headers:", .{});
+
+    var sh_addr: usize = file_addr + eh.e_shoff;
+
+    i = 0;
+    while (i < eh.e_shnum) : ({
+        i += 1;
+        sh_addr += eh.e_shentsize;
+    }) {
+        const sh: *std.elf.Shdr = @ptrFromInt(sh_addr);
+        const name: [*:0]const u8 = @ptrFromInt(sh_strtab_addr + sh.sh_name);
+        Logger.debug("  - {d}:", .{i});
+        Logger.debug("    name: {s}", .{name});
+        Logger.debug("    link: {d}", .{sh.sh_link});
+        Logger.debug("    type: 0x{x}", .{sh.sh_type});
+        Logger.debug("    type: {s}", .{@tagName(@as(SHT, @enumFromInt(sh.sh_type)))});
+        Logger.debug("    flags: {b}", .{sh.sh_flags});
+        Logger.debug("    offset: 0x{x}", .{sh.sh_offset});
+        Logger.debug("    size: 0x{x}", .{sh.sh_size});
+
+        if (@as(SHT, @enumFromInt(sh.sh_type)) == .SHT_STRTAB) {
+            Logger.debug("    content:", .{});
+
+            const strtab_addr: usize = file_addr + sh.sh_offset;
+            const strs: [*]u8 = @ptrFromInt(strtab_addr);
+
+            var j: usize = 0;
+            while (j < sh.sh_size) : (j += 1) {
+                // TODO max len of section name ?
+                var buf: [2048]u8 = [_]u8{0} ** 2048;
+                var k: usize = 0;
+                while (j < sh.sh_size) : ({
+                    k += 1;
+                    j += 1;
+                }) {
+                    buf[k] = strs[j];
+                    if (strs[j] == 0) {
+                        break;
+                    }
+                }
+                if (k > 0) {
+                    Logger.debug("      - {s}", .{buf[0..k]});
+                }
+            }
+
+            if (std.mem.eql(u8, std.mem.sliceTo(name, 0), ".dynstr")) {
+                dyn_strtab_addr = file_addr + sh.sh_offset;
+            } else if (!std.mem.eql(u8, std.mem.sliceTo(name, 0), ".shstrtab")) {
+                Logger.err("    == TODO: STRTAB: {s}", .{std.mem.sliceTo(name, 0)});
+            }
+        } else if (@as(SHT, @enumFromInt(sh.sh_type)) == .SHT_DYNSYM) {
+            if (std.mem.eql(u8, std.mem.sliceTo(name, 0), ".dynsym")) {
+                dyn_symtab_addr = file_addr + sh.sh_offset;
+                dyn_symtab_size = sh.sh_size;
+            } else {
+                Logger.err("    == TODO: DYNSYM: {s}", .{std.mem.sliceTo(name, 0)});
+            }
+        } else if (@as(SHT, @enumFromInt(sh.sh_type)) == .SHT_GNU_VERSYM_OR_HIOS) {
+            if (std.mem.eql(u8, std.mem.sliceTo(name, 0), ".gnu.version")) {
+                versym_tab_addr = file_addr + sh.sh_offset;
+            } else {
+                Logger.err("    == TODO: GNU_VERSYM: {s}", .{std.mem.sliceTo(name, 0)});
+            }
+        } else if (@as(SHT, @enumFromInt(sh.sh_type)) == .SHT_GNU_VERDEF) {
+            if (std.mem.eql(u8, std.mem.sliceTo(name, 0), ".gnu.version_d")) {
+                verdef_tab_addr = file_addr + sh.sh_offset;
+            } else {
+                Logger.err("    == TODO: GNU_VERDEF: {s}", .{std.mem.sliceTo(name, 0)});
+            }
+        } else if (@as(SHT, @enumFromInt(sh.sh_type)) == .SHT_GNU_VERNEED) {
+            if (std.mem.eql(u8, std.mem.sliceTo(name, 0), ".gnu.version_r")) {
+                verneed_tab_addr = file_addr + sh.sh_offset;
+            } else {
+                Logger.err("    == TODO: GNU_VERDEF: {s}", .{std.mem.sliceTo(name, 0)});
+            }
+        } else {
+            switch (@as(SHT, @enumFromInt(sh.sh_type))) {
+                .SHT_NULL,
+                .SHT_PROGBITS,
+                .SHT_INIT_ARRAY,
+                .SHT_NOBITS,
+                .SHT_RELA,
+                .SHT_RELR,
+                .SHT_DYNAMIC,
+                => {},
+                else => |t| {
+                    Logger.err("    == TODO: {t}: {s}", .{ t, name });
+                },
+            }
+        }
+    }
+
+    if (versym_tab_addr) |vst_addr| {
+        Logger.debug("versym table addr: 0x{x}", .{vst_addr});
+    }
+
+    const versym_table: ?[*]std.elf.Half = if (versym_tab_addr) |vst| @ptrFromInt(vst) else null;
+
+    Logger.debug("dynamic string table addr: 0x{x}", .{dyn_strtab_addr});
+    Logger.debug("dynamic sym table addr: 0x{x}", .{dyn_symtab_addr});
+
+    Logger.debug("symbols: ", .{});
+
+    for (0..dyn_symtab_size / @sizeOf(std.elf.Sym)) |j| {
+        const sym: *std.elf.Sym = @ptrFromInt(dyn_symtab_addr + j * @sizeOf(std.elf.Sym));
+
+        // TODO max len of sym name / aux name ?
+        var buf_str: [2048]u8 = @splat(0);
+        const strs: [*]u8 = @ptrFromInt(dyn_strtab_addr);
+        var k: usize = 0;
+        while (strs[k + sym.st_name] != 0) : (k += 1) {
+            buf_str[k] = strs[k + sym.st_name];
+        }
+
+        const name = try std.fmt.allocPrint(allocator, "{s}", .{buf_str[0..k]});
+
+        var version: []const u8 = "";
+        var ver_sym: ?std.elf.Versym = null;
+        var ver_idx: ?u15 = null;
+        var hidden = false;
+
+        if (versym_table != null) {
+            ver_sym = @bitCast(versym_table.?[j]);
+            ver_idx = ver_sym.?.VERSION;
+            hidden = ver_sym.?.HIDDEN;
+
+            if (ver_sym == std.elf.Versym.GLOBAL) {
+                version = try allocator.dupe(u8, "GLOBAL");
+            } else if (ver_sym == std.elf.Versym.LOCAL) {
+                version = try allocator.dupe(u8, "LOCAL");
+            } else {
+                if (sym.st_shndx == @intFromEnum(@as(SHN, .SHN_UNDEF))) {
+                    const ver_table_addr = verneed_tab_addr;
+
+                    var ver_table_cursor = ver_table_addr;
+                    var curr_def: *std.elf.Elf64_Verneed = @ptrFromInt(ver_table_cursor);
+
+                    // logger.debug("searching ver_idx: {d}", .{ver_idx});
+
+                    outer: while (true) {
+                        var aux: *std.elf.Vernaux = @ptrFromInt(ver_table_cursor + curr_def.vn_aux);
+                        while (true) {
+                            if (aux.other == ver_idx.?) {
+                                k = 0;
+                                while (strs[k + aux.name] != 0) : (k += 1) {
+                                    buf_str[k] = strs[k + aux.name];
+                                }
+
+                                version = try std.fmt.allocPrint(allocator, "{s}", .{buf_str[0..k]});
+                                break :outer;
+                            }
+
+                            // logger.debug("skipping ver_idx: {d}", .{aux.other});
+
+                            if (aux.next == 0) {
+                                break;
+                            }
+
+                            // logger.debug("next aux offset: {d}", .{aux.next});
+                            aux = @ptrFromInt(@intFromPtr(aux) + aux.next);
+                        }
+
+                        if (curr_def.vn_next == 0) {
+                            Logger.err("symbol version {d} not found", .{ver_idx.?});
+                            return error.SymbolVersionNotFound;
+                        }
+
+                        ver_table_cursor += curr_def.vn_next;
+                        // logger.debug("ver table_cursor: 0x{x}: {d}", .{ ver_table_cursor, curr_def.vn_next });
+                        curr_def = @ptrFromInt(ver_table_cursor);
+                    }
+                } else {
+                    const ver_table_addr = verdef_tab_addr;
+
+                    var ver_table_cursor = ver_table_addr;
+                    var curr_def: *std.elf.Verdef = @ptrFromInt(ver_table_cursor);
+
+                    // logger.debug("searching ver_idx: {d}", .{ver_idx});
+
+                    while (true) {
+                        if (curr_def.ndx == @as(std.elf.VER_NDX, @enumFromInt(ver_idx.?))) {
+                            const aux: *std.elf.Verdaux = @ptrFromInt(ver_table_cursor + curr_def.aux);
+
+                            k = 0;
+                            while (strs[k + aux.name] != 0) : (k += 1) {
+                                buf_str[k] = strs[k + aux.name];
+                            }
+
+                            version = try std.fmt.allocPrint(allocator, "{s}", .{buf_str[0..k]});
+                            break;
+                        }
+
+                        if (curr_def.next == 0) {
+                            Logger.err("symbol version {d} not found", .{ver_idx.?});
+                            return error.SymbolVersionNotFound;
+                        }
+
+                        // logger.debug("skipping ver_idx: {d}", .{@intFromEnum(curr_def.ndx)});
+
+                        ver_table_cursor += curr_def.next;
+                        // logger.debug("ver table_cursor: 0x{x}: {d}", .{ ver_table_cursor, curr_def.next });
+                        curr_def = @ptrFromInt(ver_table_cursor);
+                    }
+                }
+            }
+        }
+
+        Logger.debug("  - {d}:", .{j});
+        Logger.debug("    name: {s}", .{name});
+        Logger.debug("    ver idx: {?d}", .{if (ver_sym) |vs| vs.VERSION else null});
+        Logger.debug("    version: {s}", .{version});
+        Logger.debug("    hidden: {}", .{hidden});
+        Logger.debug("    raw type: 0x{x}", .{sym.st_type()});
+        Logger.debug("    type: {s}", .{@tagName(@as(STT, @enumFromInt(sym.st_type())))});
+        Logger.debug("    bind: {s}", .{@tagName(@as(STB, @enumFromInt(sym.st_bind())))});
+        Logger.debug("    value: 0x{x}", .{sym.st_value});
+        Logger.debug("    sh idx: 0x{x}", .{sym.st_shndx});
+        Logger.debug("    size: 0x{x}", .{sym.st_size});
+        Logger.debug("    info: 0x{x}", .{sym.st_info});
+
+        const s: DynSym = .{
+            .name = name,
+            .version = version,
+            .hidden = hidden,
+            .offset = j * @sizeOf(std.elf.Sym),
+            .type = @as(STT, @enumFromInt(sym.st_type())),
+            .bind = @as(STB, @enumFromInt(sym.st_bind())),
+            .shidx = @as(SHN, @enumFromInt(sym.st_shndx)),
+            .value = sym.st_value,
+            .size = sym.st_size,
+        };
+
+        const ent = try dyn_object.syms.getOrPut(allocator, s.name);
+        if (!ent.found_existing) {
+            ent.value_ptr.* = .empty;
+        }
+
+        try ent.value_ptr.append(allocator, dyn_object.syms_array.items.len);
+        try dyn_object.syms_array.append(allocator, s);
+    }
+
+    Logger.debug("programs headers offset: 0x{x}", .{eh.e_phoff});
+    Logger.debug("programs headers:", .{});
+
+    var ph_addr: usize = file_addr + eh.e_phoff;
+
+    i = 0;
+    while (i < eh.e_phnum) : ({
+        i += 1;
+        ph_addr += eh.e_phentsize;
+    }) {
+        const ph: *std.elf.Phdr = @ptrFromInt(ph_addr);
+
+        Logger.debug("  - {d}: [0x{x}]", .{ i, ph.p_type });
+        Logger.debug("    type: {s}", .{@tagName(@as(PT, @enumFromInt(ph.p_type)))});
+        Logger.debug("    flags: {b}", .{ph.p_flags});
+        Logger.debug("    offset: 0x{x}", .{ph.p_offset});
+        Logger.debug("    v_addr: 0x{x}", .{ph.p_vaddr});
+        Logger.debug("    fsize: 0x{x}", .{ph.p_filesz});
+        Logger.debug("    msize: 0x{x}", .{ph.p_memsz});
+
+        if (@as(PT, @enumFromInt(ph.p_type)) == .PT_LOAD) {
+            const segment: LoadSegment = .{
+                .file_offset = ph.p_offset,
+                .file_size = ph.p_filesz,
+                .mem_offset = ph.p_vaddr,
+                .mem_size = ph.p_memsz,
+                .mem_align = ph.p_align,
+                .mapped_from_file = false,
+                .flags_first = .{
+                    .read = ((ph.p_flags >> 2) & 1) > 0,
+                    .write = ((ph.p_flags >> 1) & 1) > 0,
+                    .exec = ((ph.p_flags >> 0) & 1) > 0,
+                    .mem_offset = ph.p_vaddr,
+                    .mem_size = ph.p_memsz,
+                },
+                .flags_last = .{
+                    .read = ((ph.p_flags >> 2) & 1) > 0,
+                    .write = ((ph.p_flags >> 1) & 1) > 0,
+                    .exec = ((ph.p_flags >> 0) & 1) > 0,
+                    .mem_offset = ph.p_vaddr,
+                    .mem_size = ph.p_memsz,
+                },
+                .loaded_at = 0,
+            };
+
+            try dyn_object.segments.put(allocator, segment.mem_offset, segment);
+        } else if (@as(PT, @enumFromInt(ph.p_type)) == .PT_GNU_RELRO) {
+            var segment = dyn_object.segments.get(ph.p_vaddr) orelse return error.SegmentNotFound;
+
+            std.debug.assert(segment.flags_last.mem_offset == segment.flags_first.mem_offset and segment.flags_last.mem_size == segment.flags_first.mem_size);
+
+            segment.flags_last = .{
+                .read = ((ph.p_flags >> 2) & 1) > 0,
+                .write = ((ph.p_flags >> 1) & 1) > 0,
+                .exec = ((ph.p_flags >> 0) & 1) > 0,
+                .mem_offset = ph.p_vaddr,
+                .mem_size = ph.p_memsz,
+            };
+
+            try dyn_object.segments.put(allocator, segment.mem_offset, segment);
+        } else if (@as(PT, @enumFromInt(ph.p_type)) == .PT_TLS) {
+            dyn_object.tls_init_file_offset = ph.p_offset;
+            dyn_object.tls_init_file_size = ph.p_filesz;
+            dyn_object.tls_init_mem_offset = ph.p_vaddr;
+            dyn_object.tls_init_mem_size = ph.p_memsz;
+            dyn_object.tls_align = ph.p_align;
+        } else if (@as(PT, @enumFromInt(ph.p_type)) == .PT_GNU_EH_FRAME) {
+            dyn_object.eh_init_file_offset = ph.p_offset;
+            dyn_object.eh_init_file_size = ph.p_filesz;
+            dyn_object.eh_init_mem_offset = ph.p_vaddr;
+            dyn_object.eh_init_mem_size = ph.p_memsz;
+            dyn_object.eh_align = ph.p_align;
+        } else if (@as(PT, @enumFromInt(ph.p_type)) == .PT_DYNAMIC) {
+            const dyn_addr: usize = file_addr + ph.p_offset;
+            const dyns: [*]std.elf.Dyn = @ptrFromInt(dyn_addr);
+
+            var libName: [*:0]u8 = undefined;
+            var runpath: [*:0]u8 = undefined;
+
+            var rela_reloc_tbl_addr: usize = 0;
+            var rela_reloc_tbl_size: usize = 0;
+            var rela_reloc_tbl_entry_size: usize = 0;
+            var rela_reloc_nb_entry: usize = 0;
+
+            var relr_reloc_tbl_addr: usize = 0;
+            var relr_reloc_tbl_size: usize = 0;
+            var relr_reloc_tbl_entry_size: usize = 0;
+
+            var plt_reloc_type: DT = .DT_NULL;
+            var plt_reloc_tbl_size: usize = 0;
+            var plt_reloc_tbl_addr: usize = 0;
+
+            var plt_got_addr: usize = 0;
+
+            var j: usize = 0;
+            while (dyns[j].d_tag != 0) : (j += 1) {
+                Logger.debug("      {s}: 0x{x}", .{ @tagName(@as(DT, @enumFromInt(dyns[j].d_tag))), dyns[j].d_val });
+
+                if (dyns[j].d_tag == @intFromEnum(@as(DT, .DT_NEEDED_OR_ALPHA_NUM_OR_IA_64_NUM))) {
+                    libName = @ptrFromInt(dyn_strtab_addr + dyns[j].d_val);
+                    Logger.debug("        => lib name: {s}", .{libName});
+
+                    const libNameLen = std.mem.len(libName);
+
+                    if (!dyn_objects.contains(libName[0..libNameLen])) {
+                        const key = try std.fmt.allocPrint(allocator, "{s}", .{libName[0..libNameLen]});
+                        dyn_objects.putAssumeCapacityNoClobber(key, .{
+                            .name_is_key = true,
+                            .name = key,
+                            .path = undefined,
+                            .file_handle = -1,
+                            .mapped_at = 0,
+                            .mapped_size = 0,
+                            .segments = .empty,
+                            .tls_init_file_offset = 0,
+                            .tls_init_file_size = 0,
+                            .tls_init_mem_offset = 0,
+                            .tls_init_mem_size = 0,
+                            .tls_align = 0,
+                            .tls_offset = 0,
+                            .eh = undefined,
+                            .eh_init_file_offset = 0,
+                            .eh_init_file_size = 0,
+                            .eh_init_mem_offset = 0,
+                            .eh_init_mem_size = 0,
+                            .eh_align = 0,
+                            .eh_offset = 0,
+                            .syms = .empty,
+                            .syms_array = .empty,
+                            .relocs = .empty,
+                            .dependencies = .empty,
+                            .init_addr = 0,
+                            .fini_addr = 0,
+                            .init_array_addr = 0,
+                            .init_array_size = 0,
+                            .fini_array_addr = 0,
+                            .fini_array_size = 0,
+                            .loaded = false,
+                            .loaded_at = null,
+                            .loaded_size = 0,
+                        });
+                        try dyn_object.dependencies.append(allocator, dyn_objects.count() - 1);
+                    } else {
+                        const idx = dyn_objects.getIndex(libName[0..libNameLen]).?;
+                        try dyn_object.dependencies.append(allocator, idx);
+                    }
+                } else if (dyns[j].d_tag == @intFromEnum(@as(DT, .DT_RUNPATH))) {
+                    runpath = @ptrFromInt(dyn_strtab_addr + dyns[j].d_val);
+                    Logger.debug("        => lib rpath: {s}", .{runpath});
+                } else if (dyns[j].d_tag == @intFromEnum(@as(DT, .DT_RELA))) {
+                    rela_reloc_tbl_addr = file_addr + dyns[j].d_val;
+                    Logger.debug("        => rela reloc table addr: 0x{x}", .{rela_reloc_tbl_addr});
+                } else if (dyns[j].d_tag == @intFromEnum(@as(DT, .DT_RELASZ))) {
+                    rela_reloc_tbl_size = dyns[j].d_val;
+                    Logger.debug("        => rela reloc table size: 0x{x}", .{rela_reloc_tbl_size});
+                } else if (dyns[j].d_tag == @intFromEnum(@as(DT, .DT_RELAENT))) {
+                    rela_reloc_tbl_entry_size = dyns[j].d_val;
+                    Logger.debug("        => rela reloc table entry size: 0x{x}", .{rela_reloc_tbl_entry_size});
+                } else if (dyns[j].d_tag == @intFromEnum(@as(DT, .DT_RELACOUNT))) {
+                    rela_reloc_nb_entry = dyns[j].d_val;
+                    Logger.debug("        => rela reloc nb entry: {d}", .{rela_reloc_nb_entry});
+                } else if (dyns[j].d_tag == @intFromEnum(@as(DT, .DT_RELR))) {
+                    relr_reloc_tbl_addr = file_addr + dyns[j].d_val;
+                    Logger.debug("        => relr reloc table addr: 0x{x}", .{relr_reloc_tbl_addr});
+                } else if (dyns[j].d_tag == @intFromEnum(@as(DT, .DT_RELRSZ))) {
+                    relr_reloc_tbl_size = dyns[j].d_val;
+                    Logger.debug("        => relr reloc table size: 0x{x}", .{relr_reloc_tbl_size});
+                } else if (dyns[j].d_tag == @intFromEnum(@as(DT, .DT_RELRENT))) {
+                    relr_reloc_tbl_entry_size = dyns[j].d_val;
+                    Logger.debug("        => relr reloc table entry size: 0x{x}", .{relr_reloc_tbl_entry_size});
+                } else if (dyns[j].d_tag == @intFromEnum(@as(DT, .DT_PLTREL))) {
+                    plt_reloc_type = @enumFromInt(dyns[j].d_val);
+                    Logger.debug("        => plt reloc type: {s}", .{@tagName(plt_reloc_type)});
+                } else if (dyns[j].d_tag == @intFromEnum(@as(DT, .DT_PLTRELSZ_OR_SPARC_NUM_OR_PPC_NUM))) {
+                    plt_reloc_tbl_size = dyns[j].d_val;
+                    Logger.debug("        => plt reloc table size: 0x{x}", .{plt_reloc_tbl_size});
+                } else if (dyns[j].d_tag == @intFromEnum(@as(DT, .DT_JMPREL))) {
+                    plt_reloc_tbl_addr = file_addr + dyns[j].d_val;
+                    Logger.debug("        => plt reloc table addr: 0x{x}", .{plt_reloc_tbl_addr});
+                } else if (dyns[j].d_tag == @intFromEnum(@as(DT, .DT_PLTGOT_OR_EXTRANUM))) {
+                    plt_got_addr = file_addr + dyns[j].d_val;
+                    Logger.debug("        => plt got addr: 0x{x}", .{plt_got_addr});
+                } else if (dyns[j].d_tag == @intFromEnum(@as(DT, .DT_INIT_OR_VALNUM))) {
+                    dyn_object.init_addr = dyns[j].d_val;
+                    Logger.debug("        => init addr: 0x{x}", .{dyn_object.init_addr});
+                } else if (dyns[j].d_tag == @intFromEnum(@as(DT, .DT_FINI))) {
+                    dyn_object.fini_addr = dyns[j].d_val;
+                    Logger.debug("        => fini addr: 0x{x}", .{dyn_object.fini_addr});
+                } else if (dyns[j].d_tag == @intFromEnum(@as(DT, .DT_INIT_ARRAY))) {
+                    dyn_object.init_array_addr = dyns[j].d_val;
+                    Logger.debug("        => init array addr: 0x{x}", .{dyn_object.init_array_addr});
+                } else if (dyns[j].d_tag == @intFromEnum(@as(DT, .DT_INIT_ARRAYSZ))) {
+                    dyn_object.init_array_size = dyns[j].d_val;
+                    Logger.debug("        => init array size: 0x{x}", .{dyn_object.init_array_size});
+                } else if (dyns[j].d_tag == @intFromEnum(@as(DT, .DT_FINI_ARRAY))) {
+                    dyn_object.fini_array_addr = dyns[j].d_val;
+                    Logger.debug("        => fini array addr: 0x{x}", .{dyn_object.fini_array_addr});
+                } else if (dyns[j].d_tag == @intFromEnum(@as(DT, .DT_FINI_ARRAYSZ))) {
+                    dyn_object.fini_array_size = dyns[j].d_val;
+                    Logger.debug("        => fini array size: 0x{x}", .{dyn_object.fini_array_size});
+                } else if (dyns[j].d_tag == @intFromEnum(@as(DT, .DT_FLAGS))) {
+                    Logger.err("        => TODO: DT_FLAGS: 0x{x}", .{dyns[j].d_val});
+                } else if (dyns[j].d_tag == @intFromEnum(@as(DT, .DT_FLAGS_1))) {
+                    Logger.err("        => TODO: DT_FLAGS_1: 0x{x}", .{dyns[j].d_val});
+                } else if (dyns[j].d_tag == @intFromEnum(@as(DT, .DT_VERDEFNUM))) {
+                    Logger.err("        => TODO: DT_VERDEFNUM: 0x{x}", .{dyns[j].d_val});
+                } else {
+                    switch (@as(DT, @enumFromInt(dyns[j].d_tag))) {
+                        .DT_STRTAB, .DT_SYMTAB, .DT_STRSZ => {},
+                        else => {
+                            Logger.err("        == TODO: {s}: 0x{x}", .{ @tagName(@as(DT, @enumFromInt(dyns[j].d_tag))), dyns[j].d_val });
+                        },
+                    }
+                }
+            }
+
+            // TODO handle old Elf64_Rel relocs
+
+            if (rela_reloc_tbl_addr > 0) {
+                const nb_entries = rela_reloc_tbl_size / rela_reloc_tbl_entry_size;
+                Logger.debug("        => nb rela relocs: {d}", .{nb_entries});
+                for (0..nb_entries) |r| {
+                    const rela_reloc_addr = rela_reloc_tbl_addr + r * rela_reloc_tbl_entry_size;
+                    const rela_reloc: *std.elf.Elf64_Rela = @ptrFromInt(rela_reloc_addr);
+                    // logger.debug("           0x{x}: {d}", .{ rela_reloc_addr - file_addr, rela_reloc.r_type() });
+                    Logger.debug("          - [{d}] rela reloc: {s}, sym: 0x{x}, offset: 0x{x}, addend: 0x{x}", .{
+                        r,
+                        @tagName(@as(std.elf.R_X86_64, @enumFromInt(rela_reloc.r_type()))),
+                        rela_reloc.r_sym(),
+                        rela_reloc.r_offset,
+                        rela_reloc.r_addend,
+                    });
+
+                    try dyn_object.relocs.append(allocator, .{
+                        .type = @as(std.elf.R_X86_64, @enumFromInt(rela_reloc.r_type())),
+                        .is_relr = false,
+                        .sym_idx = rela_reloc.r_sym(),
+                        .offset = rela_reloc.r_offset,
+                        .addend = rela_reloc.r_addend,
+                    });
+
+                    if (@as(std.elf.R_X86_64, @enumFromInt(rela_reloc.r_type())) == .RELATIVE) {
+                        std.debug.assert(rela_reloc.r_addend != 0);
+                    }
+                }
+            }
+
+            if (plt_reloc_tbl_addr > 0) {
+                // TODO entry size might be rel_reloc_tabl_entry_size
+                const entry_size = rela_reloc_tbl_entry_size;
+
+                const nb_entries = plt_reloc_tbl_size / entry_size;
+                Logger.debug("        => nb plt relocs: {d}", .{nb_entries});
+                for (0..nb_entries) |r| {
+                    const plt_reloc_addr = plt_reloc_tbl_addr + r * entry_size;
+
+                    // TODO type might be std.elf.Elf64_Rel
+                    const plt_reloc: *std.elf.Elf64_Rela = @ptrFromInt(plt_reloc_addr);
+                    // logger.debug("           0x{x}: {d}", .{ plt_reloc_addr - file_addr, plt_reloc.r_type() });
+                    Logger.debug("          - [{d}] plt reloc: {s}, sym: 0x{x}, offset: 0x{x}, addend: 0x{x}", .{
+                        r,
+                        @tagName(@as(std.elf.R_X86_64, @enumFromInt(plt_reloc.r_type()))),
+                        plt_reloc.r_sym(),
+                        plt_reloc.r_offset,
+                        plt_reloc.r_addend,
+                    });
+
+                    try dyn_object.relocs.append(allocator, .{
+                        .type = @as(std.elf.R_X86_64, @enumFromInt(plt_reloc.r_type())),
+                        .sym_idx = plt_reloc.r_sym(),
+                        .is_relr = false,
+                        .offset = plt_reloc.r_offset,
+                        .addend = plt_reloc.r_addend,
+                    });
+
+                    if (@as(std.elf.R_X86_64, @enumFromInt(plt_reloc.r_type())) == .RELATIVE) {
+                        std.debug.assert(plt_reloc.r_addend != 0);
+                    }
+                }
+            }
+
+            if (relr_reloc_tbl_addr > 0) {
+                const nb_entries = relr_reloc_tbl_size / relr_reloc_tbl_entry_size;
+                Logger.debug("        => nb relr relocs: {d}", .{nb_entries});
+
+                var next: std.elf.Elf64_Addr = undefined;
+
+                for (0..nb_entries) |r| {
+                    const relr_reloc_addr = relr_reloc_tbl_addr + r * relr_reloc_tbl_entry_size;
+                    const relr_reloc: *std.elf.Elf64_Relr = @ptrFromInt(relr_reloc_addr);
+
+                    if ((relr_reloc.* & 1) == 0) {
+                        Logger.debug("          - [{d}] relr reloc: {s}, sym: 0x{x}, offset: 0x{x}, addend: 0x{x}", .{
+                            r,
+                            "R_X86_64.RELATIVE",
+                            0,
+                            relr_reloc.*,
+                            0,
+                        });
+                        try dyn_object.relocs.append(allocator, .{
+                            .type = .RELATIVE,
+                            .is_relr = true,
+                            .sym_idx = 0,
+                            .offset = relr_reloc.*,
+                            .addend = 0,
+                        });
+
+                        next = relr_reloc.* + @sizeOf(std.elf.Elf64_Addr);
+                    } else {
+                        for (0..(8 * @sizeOf(std.elf.Elf64_Addr) - 1)) |sr| {
+                            if (((relr_reloc.* >> @as(u6, @intCast(sr + 1))) & 1) != 0) {
+                                Logger.debug("          - [{d} - {d}] relr reloc: {s}, sym: 0x{x}, offset: 0x{x}, addend: 0x{x}", .{
+                                    r,
+                                    sr,
+                                    "R_X86_64.RELATIVE",
+                                    0,
+                                    next + sr * @sizeOf(std.elf.Elf64_Addr),
+                                    0,
+                                });
+                                try dyn_object.relocs.append(allocator, .{
+                                    .type = .RELATIVE,
+                                    .is_relr = true,
+                                    .sym_idx = 0,
+                                    .offset = next + sr * @sizeOf(std.elf.Elf64_Addr),
+                                    .addend = 0,
+                                });
+                            }
+                        }
+
+                        next += @sizeOf(std.elf.Elf64_Addr) * (8 * @sizeOf(std.elf.Elf64_Addr) - 1);
+                    }
+                }
+            }
+        } else {
+            Logger.err("    => TODO: {s}", .{@tagName(@as(PT, @enumFromInt(ph.p_type)))});
+        }
+    }
+
+    try mapSegments(dyn_object, file_bytes);
+
+    return lib;
+}
+
+fn mapSegments(dyn_object: *DynObject, file_bytes: []const u8) !void {
+    _ = file_bytes;
+
+    Logger.debug("mapping library {s} with {d} segments", .{ dyn_object.name, dyn_object.segments.count() });
+
+    var mem_end: usize = std.math.minInt(usize);
+
+    for (dyn_object.segments.values()) |*segment| {
+        std.debug.assert(segment.mem_align >= std.heap.pageSize() and segment.mem_align % std.heap.pageSize() == 0);
+        const aligned_mem_end = std.mem.alignForward(usize, segment.mem_offset + segment.mem_size, segment.mem_align);
+        mem_end = @max(mem_end, aligned_mem_end);
+    }
+
+    const total_mem_size = mem_end;
+
+    Logger.debug("mapping segments: from file, library loaded size: 0x{x} (0x{x} to 0x{x})", .{ total_mem_size, 0, mem_end });
+
+    const mapped_space = std.posix.mmap(
+        null,
+        total_mem_size,
+        std.posix.PROT.NONE,
+        .{ .TYPE = .PRIVATE, .ANONYMOUS = true },
+        -1,
+        0,
+    ) catch |err| {
+        Logger.err("failed to allocate library space: {s}", .{@errorName(err)});
+        return err;
+    };
+
+    const base_addr = @intFromPtr(mapped_space.ptr);
+
+    dyn_object.loaded_at = base_addr;
+    dyn_object.loaded_size = total_mem_size;
+
+    Logger.debug("mapping segments: reserved 0x{x} bytes from 0x{x} to 0x{x}", .{ total_mem_size, base_addr, base_addr + total_mem_size });
+
+    for (dyn_object.segments.values(), 0..) |*segment, s| {
+        Logger.debug("  segment {d}: foff: 0x{x}, moff: 0x{x}, fsize: 0x{x}, msize: 0x{x}", .{ s, segment.file_offset, segment.mem_offset, segment.file_size, segment.mem_size });
+
+        var prot: u32 = std.posix.PROT.NONE;
+        if (segment.flags_first.read) prot |= std.posix.PROT.READ;
+        if (segment.flags_first.write) prot |= std.posix.PROT.WRITE;
+        if (segment.flags_first.exec) prot |= std.posix.PROT.EXEC;
+
+        const aligned_ptr: [*]align(std.heap.pageSize()) u8 = @ptrFromInt(std.mem.alignBackward(usize, base_addr + segment.mem_offset, segment.mem_align));
+        const aligned_end: usize = std.mem.alignForward(usize, base_addr + segment.mem_offset + segment.mem_size, segment.mem_align);
+        const aligned_size = aligned_end - @intFromPtr(aligned_ptr);
+        const aligned_file_offset = std.mem.alignBackward(usize, segment.file_offset, segment.mem_align);
+
+        segment.loaded_at = base_addr + segment.mem_offset;
+        segment.mapped_from_file = true;
+
+        Logger.debug("  segment {d}: mapping: aligned foff: 0x{x}, from 0x{x} to 0x{x}, size: 0x{x}", .{ s, aligned_file_offset, @as(usize, @intFromPtr(aligned_ptr)), aligned_end, aligned_size });
+        Logger.debug("  segment {d}: data: from 0x{x} to 0x{x}, size: 0x{x}", .{ s, segment.loaded_at, segment.loaded_at + segment.mem_size, segment.mem_size });
+
+        _ = try std.posix.mmap(
+            aligned_ptr,
+            aligned_size,
+            prot,
+            .{
+                .TYPE = .PRIVATE,
+                .FIXED = true,
+            },
+            dyn_object.file_handle,
+            aligned_file_offset,
+        );
+
+        if (segment.file_size != segment.mem_size) {
+            Logger.debug("  segment {d}: zeroing from 0x{x} (0x{x}) to 0x{x} (0x{x})", .{
+                s,
+                segment.mem_offset + segment.file_size,
+                segment.loaded_at + segment.file_size,
+                segment.mem_offset + segment.mem_size,
+                segment.loaded_at + segment.mem_size,
+            });
+
+            const zero_start = std.mem.alignForward(usize, segment.loaded_at + segment.file_size, segment.mem_align);
+            const zero_ptr: [*]align(std.heap.pageSize()) u8 = @ptrFromInt(zero_start);
+            const zero_end: usize = std.mem.alignForward(usize, segment.loaded_at + segment.mem_size, segment.mem_align);
+            const zero_size = zero_end - @intFromPtr(zero_ptr);
+
+            if (zero_start > segment.loaded_at + segment.file_size) {
+                const zero_sub_size = zero_start - (segment.loaded_at + segment.file_size);
+                Logger.debug("  segment {d}: memory: zeroing from 0x{x} to 0x{x}, size: 0x{x}", .{ s, segment.loaded_at + segment.file_size, zero_start, zero_sub_size });
+                @memset(@as([*]u8, @ptrFromInt(segment.loaded_at))[segment.file_size..][0..zero_sub_size], 0);
+            }
+
+            if (zero_size > 0) {
+                Logger.debug("  segment {d}: mapping: zeroing from 0x{x} to 0x{x}, size: 0x{x}", .{ s, @intFromPtr(zero_ptr), zero_end, zero_size });
+                _ = try std.posix.mmap(
+                    zero_ptr,
+                    zero_size,
+                    prot,
+                    .{
+                        .TYPE = .PRIVATE,
+                        .FIXED = true,
+                        .ANONYMOUS = true,
+                    },
+                    -1,
+                    0,
+                );
+            }
+        }
+    }
+
+    Logger.debug("successfully mapped {d} segments for {s} at base 0x{x}", .{ dyn_object.segments.count(), dyn_object.name, base_addr });
+}
+
+const AbiTcb = extern struct {
+    self: *AbiTcb,
+};
+
+const ZigTcb = extern struct {
+    dummy: usize,
+};
+
+const Dtv = extern struct {
+    len: usize = 1,
+    tls_block: [*]u8,
+};
+
+// What libpthread expects at FS:
+//
+// typedef struct
+// {
+//   void *tcb; /* Pointer to the TCB.  Not necessarily the
+//                 thread descriptor used by libpthread. */
+//   dtv_t *dtv;
+//   void *self; /* Pointer to the thread descriptor.  */
+//   int multiple_threads;
+//   int gscope_flag;
+//   uintptr_t sysinfo;
+//   uintptr_t stack_guard;
+//   uintptr_t pointer_guard;
+//   unsigned long int unused_vgetcpu_cache[2];
+//   /* Bit 0: X86_FEATURE_1_IBT.
+//      Bit 1: X86_FEATURE_1_SHSTK.
+//    */
+//   unsigned int feature_1;
+//   int __glibc_unused1;
+//   /* Reservation of some values for the TM ABI.  */
+//   void *__private_tm[4];
+//   /* GCC split stack support.  */
+//   void *__private_ss;
+//   /* The marker for the current shadow stack.  */
+//   unsigned long long int ssp_base;
+//   /* Must be kept even if it is no longer used by glibc since programs,
+//      like AddressSanitizer, depend on the size of tcbhead_t.  */
+//   __128bits __glibc_unused2[8][4] __attribute__ ((aligned (32)));
+//
+//   void *__padding[8];
+// } tcbhead_t;
+//
+// typedef union dtv
+// {
+//   size_t counter;
+//   struct dtv_pointer pointer;
+// } dtv_t;
+//
+// struct dtv_pointer
+// {
+//   void *val;                    /* Pointer to data, or TLS_DTV_UNALLOCATED.  */
+//   void *to_free;                /* Unaligned pointer, for deallocation.  */
+// };
+//
+// #define TLS_DTV_UNALLOCATED ((void *) -1l)
+
+fn computeTcbOffset(dyn_object: *DynObject) void {
+    Logger.debug("computing tcb offset of library {s}", .{dyn_object.name});
+
+    const current_tls_area_desc = std.os.linux.tls.area_desc;
+
+    var new_area_size: usize = 0;
+    new_area_size += dyn_object.tls_init_mem_size;
+    new_area_size = if (new_area_size > 0) std.mem.alignForward(usize, new_area_size, dyn_object.tls_align) else new_area_size;
+    new_area_size += current_tls_area_desc.block.size;
+    new_area_size = if (new_area_size > 0) std.mem.alignForward(usize, new_area_size, current_tls_area_desc.alignment) else new_area_size;
+    const new_abi_tcb_offset = new_area_size;
+    dyn_object.tls_offset = new_abi_tcb_offset;
+}
+
+fn mapTlsBlock(dyn_object: *DynObject) !void {
+    Logger.debug("mapping tls block of library {s}", .{dyn_object.name});
+
+    const mapped_bytes: []const u8 = @as([*]u8, @ptrFromInt(dyn_object.loaded_at.?))[0..dyn_object.loaded_size];
+
+    const current_tls_area_desc = std.os.linux.tls.area_desc;
+
+    var new_area_size: usize = 0;
+    const new_block_offset: usize = 0;
+    new_area_size += dyn_object.tls_init_mem_size;
+    new_area_size = if (new_area_size > 0) std.mem.alignForward(usize, new_area_size, dyn_object.tls_align) else new_area_size;
+    const prev_block_offset = new_area_size;
+    new_area_size += current_tls_area_desc.block.size;
+    new_area_size = if (new_area_size > 0) std.mem.alignForward(usize, new_area_size, current_tls_area_desc.alignment) else new_area_size;
+    const new_abi_tcb_offset = new_area_size;
+    new_area_size += @sizeOf(AbiTcb);
+    new_area_size += @sizeOf(ZigTcb);
+    new_area_size = std.mem.alignForward(usize, new_area_size, @alignOf(Dtv));
+    const new_dtv_offset = new_area_size;
+    new_area_size += @sizeOf(Dtv);
+
+    std.debug.assert(new_abi_tcb_offset == dyn_object.tls_offset);
+
+    const sizeof_pthread: usize = sp: {
+        const sym = resolveSymbolByName("_thread_db_sizeof_pthread") catch {
+            Logger.warn("no _thread_db_sizeof_pthread symbol found, using defaut 2048", .{});
+            break :sp 2048;
+        };
+        const sizeof_pthread_ptr: *u32 = @ptrFromInt(sym.address);
+        break :sp sizeof_pthread_ptr.*;
+    };
+    Logger.debug("size of pthread struct: 0x{x} ({d})", .{ sizeof_pthread, sizeof_pthread });
+
+    const new_area = std.posix.mmap(null, new_area_size + sizeof_pthread, std.posix.PROT.READ | std.posix.PROT.WRITE, .{ .TYPE = .PRIVATE, .ANONYMOUS = true }, -1, 0) catch |err| {
+        Logger.err("failed to allocate tls space: {s}", .{@errorName(err)});
+        return err;
+    };
+
+    if (dyn_object.tls_init_file_size > 0) {
+        @memcpy(new_area[0..dyn_object.tls_init_file_size], mapped_bytes[dyn_object.tls_init_mem_offset .. dyn_object.tls_init_mem_offset + dyn_object.tls_init_file_size]);
+    }
+
+    var old_tp: usize = undefined;
+    const e_get_fs = std.os.linux.syscall2(.arch_prctl, std.os.linux.ARCH.GET_FS, @intFromPtr(&old_tp));
+    std.debug.assert(e_get_fs == 0);
+
+    if (current_tls_area_desc.block.size > 0) {
+        @memcpy(new_area[prev_block_offset .. prev_block_offset + current_tls_area_desc.block.size], @as([*]u8, @ptrFromInt(old_tp - current_tls_area_desc.block.size)));
+    }
+
+    if (current_tls_area_desc.gdt_entry_number != @as(usize, @bitCast(@as(isize, -1)))) {
+        @memcpy(new_area[new_abi_tcb_offset .. new_area_size + sizeof_pthread], @as([*]u8, @ptrFromInt(old_tp)));
+    }
+
+    const new_block_init = new_area[0..new_abi_tcb_offset];
+    const new_block_size = new_block_init.len;
+
+    const new_align_factor = @max(dyn_object.tls_align, current_tls_area_desc.alignment);
+
+    // TODO area desc type is not really compliant.
+    //
+    // currently:
+    //
+    //-----------------------------------------------
+    //| TLS Blocks | ABI TCB | Zig TCB | DTV struct |
+    //-------------^---------------------------------
+    //              `-- The TP register points here.
+    //
+    // it should be:
+    //
+    //                       | POTENTIAL PTHREAD STRUCT ====>
+    //---------------------------------------------------------
+    //| TLS Blocks | Zig TCB | ABI TCB | *DTV | *SELF | SPACE
+    //-----------------------^---------------------------------
+    //                       `-- The TP register points here.
+    //
+    // In this case, when main zig executable is relocating, it should take into account
+    // the offset created by the Zig TCB struct.
+    //
+    const new_tls_area_desc: @TypeOf(current_tls_area_desc) = .{
+        .size = new_area_size,
+        .alignment = new_align_factor,
+
+        .dtv = .{
+            .offset = new_dtv_offset,
+        },
+
+        .abi_tcb = .{
+            .offset = new_abi_tcb_offset,
+        },
+
+        .block = .{
+            .init = new_block_init,
+            .offset = new_block_offset,
+            .size = new_block_size,
+        },
+
+        .gdt_entry_number = 1,
+    };
+
+    std.os.linux.tls.area_desc = new_tls_area_desc;
+
+    // const new_tp = std.os.linux.tls.prepareArea(new_area);
+
+    const new_tp = @intFromPtr(new_area.ptr) + new_abi_tcb_offset;
+
+    // TODO unmap previous area
+
+    const new_tcb: *AbiTcb = @ptrCast(@alignCast(new_area.ptr + new_tls_area_desc.abi_tcb.offset));
+    new_tcb.self = @ptrFromInt(new_tp);
+
+    // setting dtv.len to self because it happens to coincide with what is expected by pthread
+    const new_dtv: *Dtv = @ptrCast(@alignCast(new_area.ptr + new_tls_area_desc.dtv.offset));
+    new_dtv.tls_block = new_area.ptr;
+    new_dtv.len = new_tp;
+
+    Logger.debug("tls space mapped, new TP: 0x{x}", .{new_tp});
+
+    const e_set_fs = std.os.linux.syscall2(.arch_prctl, std.os.linux.ARCH.SET_FS, new_tp);
+    std.debug.assert(e_set_fs == 0);
+
+    dyn_object.tls_offset = new_abi_tcb_offset;
+    Logger.debug("tls offset: {d}", .{new_abi_tcb_offset});
+
+    const is_libc_so = if (std.mem.find(u8, dyn_object.name, "libc.so")) |_| true else false;
+    if (is_libc_so) {
+        const maybe_rtld_global_ro = resolveSymbolByName("_rtld_global_ro") catch null;
+
+        if (maybe_rtld_global_ro) |rtld_global_ro| {
+            Logger.debug("rtld_global_ro: 0x{x}", .{rtld_global_ro.address});
+
+            // TODO: we should find a way to get those field offsets at runtime
+            const dl_tls_static_size: *usize = @ptrFromInt(rtld_global_ro.address + 704);
+            const dl_tls_static_align: *usize = @ptrFromInt(rtld_global_ro.address + 712);
+
+            // TODO: these values should be set every time a new library is loaded
+            // It implies switching related segment permissions
+            dl_tls_static_size.* = new_tls_area_desc.block.size;
+            dl_tls_static_align.* = new_tls_area_desc.alignment;
+        }
+    }
+}
+
+fn processRelocations(dyn_object: *DynObject) !void {
+    Logger.debug("processing {d} relocations for {s}", .{ dyn_object.relocs.items.len, dyn_object.name });
+
+    for (dyn_object.relocs.items) |reloc| {
+        const reloc_addr = try vAddressToLoadedAddress(dyn_object, reloc.offset);
+        const ptr: *usize = @ptrFromInt(reloc_addr);
+
+        std.debug.assert(reloc.addend >= 0);
+
+        switch (reloc.type) {
+            .RELATIVE => {
+                // R_X86_64_RELATIVE: B + A
+                const value = try vAddressToLoadedAddress(dyn_object, @as(usize, @intCast(reloc.addend)) + if (reloc.addend == 0) ptr.* else 0);
+                Logger.debug("  RELATIVE: 0x{x} (0x{x}): 0x{x} -> 0x{x} (addend: 0x{x}, relr: {})", .{ reloc_addr, reloc.offset, ptr.*, value, reloc.addend, reloc.is_relr });
+                ptr.* = value;
+            },
+            .@"64" => {
+                // R_X86_64_64: S + A
+                const sym = try resolveSymbol(dyn_object, reloc.sym_idx);
+                const value = sym.address + @as(usize, @intCast(reloc.addend));
+                Logger.debug("  64: 0x{x} (0x{x}): 0x{x} -> 0x{x} (0x{x}, {s}@{s} + 0x{x})", .{ reloc_addr, reloc.offset, ptr.*, value, sym.value, sym.name, sym.version, reloc.addend });
+                ptr.* = value;
+            },
+            .GLOB_DAT => {
+                // R_X86_64_GLOB_DAT: S
+                const sym = try resolveSymbol(dyn_object, reloc.sym_idx);
+                const value = sym.address;
+                Logger.debug("  GLOB_DAT: 0x{x} (0x{x}): 0x{x} -> 0x{x} (0x{x}, {s}@{s} + 0x{x})", .{ reloc_addr, reloc.offset, ptr.*, value, sym.value, sym.name, sym.version, reloc.addend });
+                ptr.* = value;
+            },
+            .JUMP_SLOT => {
+                // R_X86_64_JUMP_SLOT: S
+                const sym = try resolveSymbol(dyn_object, reloc.sym_idx);
+                const value = if (getSubstituteAddress(sym)) |a| a else sym.address;
+                Logger.debug("  JUMP_SLOT: 0x{x} (0x{x}): 0x{x} -> 0x{x} (0x{x}, {s}@{s} + 0x{x})", .{ reloc_addr, reloc.offset, ptr.*, value, sym.value, sym.name, sym.version, reloc.addend });
+                ptr.* = value;
+            },
+            .TPOFF64 => {
+                // R_X86_64_TPOFF64: S + A (TLS offset)
+                const sym = try resolveSymbol(dyn_object, reloc.sym_idx);
+                const value = @as(isize, @intCast(sym.value)) + reloc.addend - @as(isize, @intCast(dyn_object.tls_offset));
+                Logger.debug("  TPOFF64: 0x{x} (0x{x}): 0x{x} -> 0x{x} (0x{x}, {s}@{s} - [MODULE_TLS_OFFSET]0x{x} + 0x{x})", .{
+                    reloc_addr,
+                    reloc.offset,
+                    ptr.*,
+                    value,
+                    sym.value,
+                    sym.name,
+                    sym.version,
+                    dyn_object.tls_offset,
+                    reloc.addend,
+                });
+                ptr.* = @bitCast(value);
+            },
+            .IRELATIVE => {
+                // R_X86_64_IRELATIVE: indirect relative (function pointer)
+                // Will be handled in a second pass
+                continue;
+            },
+            else => {
+                Logger.err("unhandled relocation type: {s}", .{@tagName(reloc.type)});
+                return error.UnhandledReloctationType;
+            },
+        }
+    }
+
+    Logger.debug("processed relocations for {s}", .{dyn_object.name});
+}
+
+fn processIRelativeRelocations(allocator: std.mem.Allocator, dyn_object: *DynObject) !void {
+    Logger.debug("processing IRELATIVE relocations for {s}", .{dyn_object.name});
+
+    for (dyn_object.relocs.items) |reloc| {
+        const reloc_addr = try vAddressToLoadedAddress(dyn_object, reloc.offset);
+        const ptr: *usize = @ptrFromInt(reloc_addr);
+
+        std.debug.assert(reloc.addend >= 0);
+
+        switch (reloc.type) {
+            .RELATIVE,
+            .@"64",
+            .GLOB_DAT,
+            .JUMP_SLOT,
+            .TPOFF64,
+            => {},
+            .IRELATIVE => {
+                const resolver_addr = try vAddressToLoadedAddress(dyn_object, @intCast(reloc.addend));
+                const resolver: *const fn () callconv(.c) usize = @ptrFromInt(resolver_addr);
+                Logger.debug("  IRELATIVE: calling resolver at 0x{x} (0x{x})", .{ resolver_addr, reloc.addend });
+                const value = resolver();
+                Logger.debug("  IRELATIVE: 0x{x} (0x{x}): 0x{x} -> 0x{x}", .{ reloc_addr, reloc.offset, ptr.*, value });
+                ptr.* = value;
+                if (irel_resolved_addrs.get(resolver_addr)) |res_val| {
+                    std.debug.assert(res_val == value);
+                }
+                try irel_resolved_addrs.put(allocator, resolver_addr, value);
+                try irel_resolved_targets.putNoClobber(allocator, reloc_addr, value);
+            },
+            else => {
+                Logger.err("unhandled relocation type: {s}", .{@tagName(reloc.type)});
+                return error.UnhandledReloctationType;
+            },
+        }
+    }
+
+    Logger.debug("processed IRELATIVE relocations for {s}", .{dyn_object.name});
+}
+
+// TODO Should receive a *DynObject, which should contain links to dependencies,
+// and only look in those.
+fn resolveSymbolByName(sym_name: []const u8) !ResolvedSymbol {
+    var it = dyn_objects.iterator();
+    while (it.next()) |entry| {
+        const dep_object = entry.value_ptr;
+
+        if (dep_object.syms.get(sym_name)) |dep_sym_list| {
+            for (dep_sym_list.items) |dep_sym_idx| {
+                const dep_sym = dep_object.syms_array.items[dep_sym_idx];
+                if (dep_sym.shidx != .SHN_UNDEF and !dep_sym.hidden) {
+                    if (dep_sym.shidx == .SHN_ABS) {
+                        Logger.debug("WARNING: ABSOLUTE SYMBOL from dep: {s}", .{dep_sym.name});
+                    }
+
+                    const dep_sym_address = dep_sym.value;
+
+                    var dep_addr = try vAddressToLoadedAddress(dep_object, dep_sym_address);
+                    if (irel_resolved_addrs.get(dep_addr)) |res_addr| {
+                        dep_addr = res_addr;
+                    }
+
+                    return .{
+                        .value = dep_sym.value,
+                        .address = dep_addr,
+                        .name = dep_sym.name,
+                        .version = dep_sym.version,
+                    };
+                }
+
+                if (dep_sym.shidx != .SHN_UNDEF and dep_sym.hidden) {
+                    Logger.debug("WARNING: HIDDEN SYMBOL from dep: {s}", .{dep_sym.name});
+                }
+            }
+        }
+    }
+
+    return error.UnresolvedSymbol;
+}
+
+// TODO we should only look into dyn_object dependencies, in order
+// TODO thread safety (called from Symbol)
+fn getResolvedSymbol(dyn_object: *DynObject, sym_name: []const u8) !ResolvedSymbol {
+    _ = dyn_object;
+
+    var it = dyn_objects.iterator();
+    while (it.next()) |entry| {
+        const dep_object = entry.value_ptr;
+
+        if (dep_object.syms.get(sym_name)) |dep_sym_list| {
+            for (dep_sym_list.items) |dep_sym_idx| {
+                const dep_sym = dep_object.syms_array.items[dep_sym_idx];
+                if (dep_sym.shidx != .SHN_UNDEF and !dep_sym.hidden) {
+                    if (dep_sym.shidx == .SHN_ABS) {
+                        Logger.debug("WARNING: ABSOLUTE SYMBOL from dep: {s}", .{dep_sym.name});
+                    }
+
+                    const dep_sym_address = dep_sym.value;
+
+                    var dep_addr = try vAddressToLoadedAddress(dep_object, dep_sym_address);
+                    if (irel_resolved_addrs.get(dep_addr)) |res_addr| {
+                        dep_addr = res_addr;
+                    }
+
+                    var res_sym: ResolvedSymbol = .{
+                        .value = dep_sym.value,
+                        .address = dep_addr,
+                        .name = dep_sym.name,
+                        .version = dep_sym.version,
+                    };
+
+                    if (getSubstituteAddress(res_sym)) |a| {
+                        res_sym.address = a;
+                    }
+
+                    return res_sym;
+                }
+
+                if (dep_sym.shidx != .SHN_UNDEF and dep_sym.hidden) {
+                    Logger.debug("WARNING: HIDDEN SYMBOL from dep: {s}", .{dep_sym.name});
+                }
+            }
+        }
+    }
+
+    return error.UnresolvedSymbol;
+}
+
+// TODO we should only look in dyn_object dependencies, in order
+// TODO rules for symbol resolution should be rigorously implemented
+fn resolveSymbol(dyn_object: *DynObject, sym_idx: usize) !ResolvedSymbol {
+    if (sym_idx >= dyn_object.syms_array.items.len) {
+        return error.InvalidSymbolIndex;
+    }
+
+    const sym = dyn_object.syms_array.items[sym_idx];
+
+    if (sym_idx == 0 or sym.shidx != .SHN_UNDEF) {
+        if (sym.bind == .STB_WEAK) {
+            Logger.debug("WARNING: WEAK SYMBOL: {s}", .{if (sym_idx == 0) "ZERO" else sym.name});
+        }
+
+        if (sym.shidx == .SHN_ABS) {
+            Logger.debug("WARNING: ABSOLUTE SYMBOL: {s}", .{if (sym_idx == 0) "ZERO" else sym.name});
+        }
+
+        const sym_address = sym.value;
+
+        var addr = try vAddressToLoadedAddress(dyn_object, sym_address);
+        if (irel_resolved_addrs.get(addr)) |res_addr| {
+            Logger.debug("IREL: {s}: 0x{x} => 0x{x}", .{ sym.name, addr, res_addr });
+            addr = res_addr;
+        }
+
+        return .{
+            .value = sym.value,
+            .address = addr,
+            .name = sym.name,
+            .version = sym.version,
+        };
+    }
+
+    var it = dyn_objects.iterator();
+    while (it.next()) |entry| {
+        const dep_name = entry.key_ptr.*;
+        const dep_object = entry.value_ptr;
+
+        if (std.mem.eql(u8, dep_name, dyn_object.name)) {
+            continue;
+        }
+
+        if (dep_object.syms.get(sym.name)) |dep_sym_list| {
+            for (dep_sym_list.items) |dep_sym_idx| {
+                const dep_sym = dep_object.syms_array.items[dep_sym_idx];
+                if (dep_sym.shidx != .SHN_UNDEF and std.mem.eql(u8, dep_sym.version, sym.version) and !dep_sym.hidden) {
+                    if (dep_sym.bind == .STB_WEAK) {
+                        Logger.debug("WARNING: WEAK SYMBOL from dep: {s}", .{if (sym_idx == 0) "ZERO" else dep_sym.name});
+                    }
+
+                    if (dep_sym.shidx == .SHN_ABS) {
+                        Logger.debug("WARNING: ABSOLUTE SYMBOL from dep: {s}", .{if (sym_idx == 0) "ZERO" else dep_sym.name});
+                    }
+
+                    const dep_sym_address = dep_sym.value;
+
+                    var dep_addr = try vAddressToLoadedAddress(dep_object, dep_sym_address);
+                    if (irel_resolved_addrs.get(dep_addr)) |res_addr| {
+                        Logger.debug("IREL: {s}: 0x{x} => 0x{x}", .{ dep_sym.name, dep_addr, res_addr });
+                        dep_addr = res_addr;
+                    }
+
+                    return .{
+                        .value = dep_sym.value,
+                        .address = dep_addr,
+                        .name = dep_sym.name,
+                        .version = dep_sym.version,
+                    };
+                }
+
+                if (dep_sym.shidx != .SHN_UNDEF and std.mem.eql(u8, dep_sym.version, sym.version) and dep_sym.hidden) {
+                    Logger.debug("WARNING: HIDDEN SYMBOL from dep: {s}", .{dep_sym.name});
+                }
+            }
+        }
+    }
+
+    if (sym.bind == .STB_WEAK) {
+        Logger.debug("WARNING: UNRESOLVED WEAK SYMBOL: {s}", .{if (sym_idx == 0) "ZERO" else sym.name});
+
+        if (sym.shidx == .SHN_ABS) {
+            Logger.debug("WARNING: UNRESOLVED WEAK ABSOLUTE SYMBOL: {s}", .{if (sym_idx == 0) "ZERO" else sym.name});
+        }
+
+        return .{
+            .value = 0,
+            .address = 0,
+            .name = sym.name,
+            .version = sym.version,
+        };
+    }
+
+    Logger.err("unresolved symbol: {s} in {s}", .{ sym.name, dyn_object.name });
+    return error.UnresolvedSymbol;
+}
+
+fn updateSegmentsPermissions(dyn_object: *DynObject) !void {
+    Logger.debug("updating segment permissions for {s}", .{dyn_object.name});
+
+    for (dyn_object.segments.values(), 0..) |*segment, s| {
+        var prot: u32 = std.posix.PROT.NONE;
+        if (segment.flags_last.read) prot |= std.posix.PROT.READ;
+        if (segment.flags_last.write) prot |= std.posix.PROT.WRITE;
+        if (segment.flags_last.exec) prot |= std.posix.PROT.EXEC;
+
+        const aligned_start = std.mem.alignBackward(usize, segment.loaded_at + (segment.flags_last.mem_offset - segment.mem_offset), std.heap.pageSize());
+        const aligned_end = std.mem.alignForward(usize, segment.loaded_at + (segment.flags_last.mem_offset - segment.mem_offset) + segment.flags_last.mem_size, std.heap.pageSize());
+        Logger.debug("  updating segment {d}: from 0x{x} to 0x{x}, prot: 0x{x}", .{ s, aligned_start, aligned_end, prot });
+
+        const segment_slice = @as([*]align(std.heap.pageSize()) u8, @ptrFromInt(aligned_start))[0 .. aligned_end - aligned_start];
+        std.posix.mprotect(segment_slice, prot) catch |err| {
+            Logger.err("failed to update segment permissions: {s}", .{@errorName(err)});
+            return err;
+        };
+    }
+
+    Logger.debug("successfully updated {d} segments for {s}", .{ dyn_object.segments.count(), dyn_object.name });
+}
+
+fn vAddressToLoadedAddress(dyn_object: *DynObject, addr: usize) !usize {
+    var containing_segment: ?*LoadSegment = null;
+    for (dyn_object.segments.values()) |*s| {
+        const segment_start = s.mem_offset;
+        const segment_end = segment_start + s.mem_size;
+        if (addr >= segment_start and addr < segment_end) {
+            containing_segment = s;
+            break;
+        }
+    }
+    if (containing_segment == null) {
+        Logger.err("addr 0x{x} not in any mapped segment", .{addr});
+        return error.AddressNotInMappedSegments;
+    }
+
+    const segment = containing_segment.?;
+
+    return segment.loaded_at + addr - segment.mem_offset;
+}
+
+fn vAddressToFileAddress(dyn_object: *DynObject, addr: usize) !usize {
+    var containing_segment: ?*LoadSegment = null;
+    for (dyn_object.segments.values()) |*s| {
+        const segment_start = s.mem_offset;
+        const segment_end = segment_start + s.mem_size;
+        if (addr >= segment_start and addr < segment_end) {
+            containing_segment = s;
+            break;
+        }
+    }
+    if (containing_segment == null) {
+        Logger.err("addr 0x{x} not in any mapped segment", .{addr});
+        return error.AddressNotInMappedSegments;
+    }
+
+    const segment = containing_segment.?;
+
+    return dyn_object.mapped_at + addr - (segment.mem_offset - segment.file_offset);
+}
+
+fn dumpSegments(dyn_obj: *DynObject) !void {
+    var bufName: [256]u8 = undefined;
+
+    for (dyn_obj.segments.values()) |*s| {
+        const mem_start = s.loaded_at;
+        const mem_size = s.mem_size;
+
+        const segment_file_name = try std.fmt.bufPrint(&bufName, "{s}_0x{x}_0x{x}__0x{x}", .{ dyn_obj.name, mem_start, mem_start + mem_size, s.file_offset });
+        const segment_file = try std.fs.cwd().createFile(segment_file_name, .{});
+        defer segment_file.close();
+
+        const data: []const u8 = (@as([*]const u8, @ptrFromInt(mem_start)))[0..mem_size];
+
+        var writer = segment_file.writer(&.{});
+        try writer.interface.writeAll(data);
+    }
+}
+
+fn callInitFunctions(dyn_obj: *DynObject) !void {
+    const is_libc_so = if (std.mem.find(u8, dyn_obj.name, "libc.so")) |_| true else false;
+
+    if (is_libc_so) {
+        var maybe_sym: ?ResolvedSymbol = undefined;
+        maybe_sym = resolveSymbolByName("__libc_early_init") catch null;
+        if (maybe_sym) |sym| {
+            Logger.info("libc: found early init: 0x{x}", .{sym.address});
+            const early_init: *const fn (bool) callconv(.c) void = @ptrFromInt(sym.address);
+            early_init(false);
+        }
+
+        maybe_sym = resolveSymbolByName("__pre_dls2b") catch null;
+        if (maybe_sym) |sym| {
+            Logger.info("libc: found __pre_dls2b: 0x{x}", .{sym.address});
+            const early_init: *const fn ([*c]usize) callconv(.c) void = @ptrFromInt(sym.address);
+
+            early_init(if (std.os.linux.elf_aux_maybe) |auxv| @ptrCast(auxv) else 0);
+        }
+    }
+
+    if (dyn_obj.init_addr != 0) {
+        const initial_addr = dyn_obj.init_addr;
+        const actual_addr = try vAddressToLoadedAddress(dyn_obj, dyn_obj.init_addr);
+        Logger.info("calling init function for {s} at 0x{x} (initial address: 0x{x})", .{ dyn_obj.name, actual_addr, initial_addr });
+        const func = @as(*const fn () callconv(.c) void, @ptrFromInt(actual_addr));
+        func();
+    }
+
+    if (dyn_obj.init_array_addr != 0 and dyn_obj.init_array_size > 0) {
+        const num_funcs = dyn_obj.init_array_size / @sizeOf(usize);
+        Logger.info("calling {d} init_array functions for {s} (0x{x})", .{ num_funcs, dyn_obj.name, dyn_obj.init_array_addr });
+        const initial_init_array: [*]const usize = @ptrFromInt(try vAddressToFileAddress(dyn_obj, dyn_obj.init_array_addr));
+        const actual_init_array: [*]const usize = @ptrFromInt(try vAddressToLoadedAddress(dyn_obj, dyn_obj.init_array_addr));
+
+        for (0..num_funcs) |i| {
+            const initial_addr = initial_init_array[i];
+            const actual_addr = actual_init_array[i];
+
+            if (actual_addr == 0) {
+                Logger.info("skipping call to init_array[{d}]: null addr (initial address: 0x{x})", .{ i, initial_addr });
+                continue;
+            }
+
+            if (!is_libc_so) {
+                Logger.info("calling init_array[{d}] for {s} at 0x{x} (initial address: 0x{x})", .{ i, dyn_obj.name, actual_addr, initial_addr });
+                const func = @as(*const fn () callconv(.c) void, @ptrFromInt(actual_addr));
+                func();
+            } else {
+                Logger.info("calling libc init_array[{d}] for {s} at 0x{x} (initial address: 0x{x})", .{ i, dyn_obj.name, actual_addr, initial_addr });
+
+                const argc: c_int = @intCast(std.os.argv.len);
+                const argv: [*c]const [*c]const u8 = @ptrCast(std.os.argv);
+                const env: [*c]const [*c]const u8 = @ptrCast(std.os.environ);
+
+                const func = @as(*const fn (
+                    c_int,
+                    [*c]const [*c]const u8,
+                    [*c]const [*c]const u8,
+                ) callconv(.c) void, @ptrFromInt(actual_addr));
+                func(argc, argv, env);
+            }
+        }
+    }
+}
+
+fn getSubstituteAddress(sym: ResolvedSymbol) ?usize {
+    var addr: ?usize = null;
+
+    // TODO
+    // - void *(*dlopen) (const char *file, int mode, void *dl_caller);
+    // - int (*dlclose) (void *handle);
+    // - void *(*dlsym) (void *handle, const char *name, void *dl_caller);
+    // - void *(*dlvsym) (void *handle, const char *name, const char *version, void *dl_caller);
+    // - char *(*dlerror) (void);
+    // - int (*dladdr) (const void *address, Dl_info *info);
+    // - int (*dladdr1) (const void *address, Dl_info *info, void **extra_info, int flags);
+    // - int (*dlinfo) (void *handle, int request, void *arg);
+    // - void *(*dlmopen) (Lmid_t nsid, const char *file, int mode, void *dl_caller);
+
+    if (std.mem.eql(u8, sym.name, "dlopen")) {
+        addr = @intFromPtr(&dlopenSubstitute);
+    } else if (std.mem.eql(u8, sym.name, "dlclose")) {
+        addr = @intFromPtr(&dlcloseSubstitute);
+    } else if (std.mem.eql(u8, sym.name, "dlsym")) {
+        addr = @intFromPtr(&dlsymSubstitute);
+    } else if (std.mem.eql(u8, sym.name, "dladdr")) {
+        addr = @intFromPtr(&dladdrSubstitute);
+    } else if (std.mem.eql(u8, sym.name, "dlerror")) {
+        addr = @intFromPtr(&dlerrorSubstitute);
+    } else {
+        return null;
+    }
+
+    Logger.debug("substitutes: found for {s}: 0x{x} => 0x{x}", .{ sym.name, sym.address, addr.? });
+
+    return addr;
+}
+
+fn dlopenSubstitute(path: ?[*:0]const u8, flags: c_int) callconv(.c) ?*anyopaque {
+    // TODO real implementation
+    Logger.debug("substitutes: dlopen called: {s}, 0x{x}", .{ path orelse "NULL", flags });
+    return null;
+}
+
+fn dlcloseSubstitute(lib: ?*anyopaque) callconv(.c) c_int {
+    // TODO real implementation
+    Logger.debug("substitutes: dlclose called: 0x{x}", .{if (lib != null) @intFromPtr(lib) else 0});
+    return 0;
+}
+
+fn dlsymSubstitute(lib: ?*anyopaque, sym_name: ?[*:0]const u8, caller: ?*anyopaque) callconv(.c) ?*anyopaque {
+    // TODO real implementation
+    Logger.debug("substitutes: dlsym called: 0x{x}, {s}, 0x{x}", .{ if (lib != null) @intFromPtr(lib) else 0, sym_name orelse "NULL", if (caller != null) @intFromPtr(caller) else 0 });
+    return null;
+}
+
+// typedef struct {
+//     const char *dli_fname;  /* Pathname of shared object that contains address */
+//     void       *dli_fbase;  /* Base address at which shared object is loaded */
+//     const char *dli_sname;  /* Name of symbol whose definition overlaps addr */
+//     void       *dli_saddr;  /* Exact address of symbol named in dli_sname */
+// } Dl_info;
+
+const DlInfo = extern struct {
+    dli_fname: ?[*:0]const u8,
+    dli_fbase: ?[*:0]const u8,
+    dli_fsname: ?[*:0]const u8,
+    dli_fsaddr: ?[*:0]const u8,
+};
+
+fn dladdrSubstitute(addr: ?*anyopaque, dl_info: ?*DlInfo) callconv(.c) c_int {
+    // TODO real implementation
+    _ = dl_info;
+    Logger.debug("substitutes: dladdr called: 0x{x}", .{if (addr != null) @intFromPtr(addr) else 0});
+    return 0;
+}
+
+fn dlerrorSubstitute() callconv(.c) [*:0]const u8 {
+    // TODO real implementation
+    Logger.debug("substitutes: dlerror called", .{});
+    return "";
+}
