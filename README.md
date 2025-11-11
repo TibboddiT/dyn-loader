@@ -91,7 +91,9 @@ zig build run-vulkan
 zig build run-vulkan_advanced
 zig build run-vulkan_musl
 zig build run-vulkan_advanced_musl
+zig build run-x11_window
 ```
 
-Non musl versions expect a glibc based system.
-Both `vulkan_advanced` versions will currently result in an error, until libc's `dl` function replacements are implemented.
+- Non musl versions expect a glibc based system.
+- Both `vulkan_advanced` versions will currently result in an error, until libc's `dl` function replacements are implemented.
+- X11 example segfaults in release mode.
