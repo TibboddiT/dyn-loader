@@ -866,7 +866,6 @@ const DynObject = struct {
     eh_init_mem_offset: usize,
     eh_init_mem_size: usize,
     eh_align: usize,
-    eh_offset: usize,
     syms: DynSymList,
     syms_array: std.ArrayList(DynSym),
     dependencies: std.ArrayList(usize),
@@ -908,6 +907,7 @@ pub const DynamicLibrary = struct {
 const stack_memory_size = 16 * 1024 * 1024;
 
 var dyn_objects: DynObjectList = .empty;
+var dyn_objects_sorted_indices: std.ArrayList(usize) = .empty;
 
 const Logger = struct {
     const inner_logger = std.log.scoped(.dynamic_library_loader);
@@ -968,7 +968,7 @@ pub fn init(options: InitOptions) !void {
 
     r_debug.r_brk = @intFromPtr(&_dl_debug_state);
 
-    // TODO:
+    // TODO
     // - restructure TLS
     // - assert linux x86_64 gnu
     // - assert statically linked
@@ -1006,15 +1006,77 @@ pub fn deinit(allocator: std.mem.Allocator) void {
     }
 
     dyn_objects.clearAndFree(allocator);
+    dyn_objects_sorted_indices.deinit(allocator);
 
     irel_resolved_addrs.clearAndFree(allocator);
     irel_resolved_targets.clearAndFree(allocator);
 
     CustomSelfInfo.clearExtraElfs(allocator);
 
-    // TODO:
+    // TODO
     // - unmap unnecessary maps
     // - call fini / fini_array
+}
+
+fn logSummary() void {
+    if (Logger.active) {
+        var buf: [16]u8 = undefined;
+
+        for (dyn_objects.values()) |*dyn_object| {
+            if (dyn_object.loaded) {
+                continue;
+            }
+
+            Logger.info("name: {s}", .{dyn_object.name});
+            Logger.info("  path: {s}", .{dyn_object.path});
+            Logger.info("  mapped_at: 0x{x}", .{dyn_object.mapped_at});
+            Logger.info("  segments:", .{});
+            Logger.info("    {d} segments loaded", .{dyn_object.segments.count()});
+            for (dyn_object.segments.values(), 1..) |segment, s| {
+                Logger.info("    - {d}:", .{s});
+                Logger.info("      file_offset: 0x{x}", .{segment.file_offset});
+                Logger.info("      file_size: 0x{x}", .{segment.file_size});
+                Logger.info("      mem_offset: 0x{x}", .{segment.mem_offset});
+                Logger.info("      mem_size: 0x{x}", .{segment.mem_size});
+                Logger.info("      mem_align: 0x{x}", .{segment.mem_align});
+                Logger.info("      loadedAt: 0x{x}", .{segment.loaded_at});
+                Logger.info("      flags_first: {s}", .{segment.flags_first.toStr(&buf) catch unreachable});
+                Logger.info("      flags_last: {s}", .{segment.flags_last.toStr(&buf) catch unreachable});
+            }
+            Logger.info("  tls_init_file_offset: 0x{x}", .{dyn_object.tls_init_file_offset});
+            Logger.info("  tls_init_file_size: 0x{x}", .{dyn_object.tls_init_file_size});
+            Logger.info("  tls_init_mem_offset: 0x{x}", .{dyn_object.tls_init_mem_offset});
+            Logger.info("  tls_init_mem_size: 0x{x}", .{dyn_object.tls_init_mem_size});
+            Logger.info("  init/fini:", .{});
+            Logger.info("    init_addr: 0x{x}", .{dyn_object.init_addr});
+            Logger.info("    fini_addr: 0x{x}", .{dyn_object.fini_addr});
+            Logger.info("    init_array_addr: 0x{x}, size: 0x{x}", .{ dyn_object.init_array_addr, dyn_object.init_array_size });
+            Logger.info("    fini_array_addr: 0x{x}, size: 0x{x}", .{ dyn_object.fini_array_addr, dyn_object.fini_array_size });
+            Logger.info("  symbols:", .{});
+            Logger.info("    {d} / {d} symbols", .{ dyn_object.syms.count(), dyn_object.syms_array.items.len });
+            for (dyn_object.syms_array.items, 0..) |sym, s| {
+                Logger.debug("    - index: {d}:", .{s});
+                Logger.debug("      name: {s}", .{sym.name});
+                Logger.debug("      version: {s}", .{sym.version});
+                Logger.debug("      hidden: {}", .{sym.hidden});
+                Logger.debug("      offset: 0x{x}", .{sym.offset});
+                Logger.debug("      type: {s}", .{@tagName(sym.type)});
+                Logger.debug("      bind: {s}", .{@tagName(sym.bind)});
+                Logger.debug("      shidx: {s}", .{sym.shidx.nameOrValue(&buf) catch unreachable});
+                Logger.debug("      value: 0x{x}", .{sym.value});
+                Logger.debug("      size: 0x{x}", .{sym.size});
+            }
+            Logger.info("  relocs:", .{});
+            Logger.info("    {d} relocs", .{dyn_object.relocs.items.len});
+            for (dyn_object.relocs.items, 1..) |reloc, s| {
+                Logger.debug("    - {d}:", .{s});
+                Logger.debug("      type: {s}", .{@tagName(reloc.type)});
+                Logger.debug("      sym_idx: 0x{x}", .{reloc.sym_idx});
+                Logger.debug("      offset: 0x{x}", .{reloc.offset});
+                Logger.debug("      addend: 0x{x}", .{reloc.addend});
+            }
+        }
+    }
 }
 
 // TODO thread safety
@@ -1024,83 +1086,18 @@ pub fn load(allocator: std.mem.Allocator, f_path: []const u8) !DynamicLibrary {
         return error.Unitialized;
     }
 
-    // TODO:
+    // TODO
     // - open flags
     // - rpath
     // - LD_* env vars
 
     const lib = try loadRecursive(allocator, f_path);
 
-    if (Logger.active) {
-        // var buf: [16]u8 = undefined;
-        for (dyn_objects.values()) |*dyn_object| {
-            if (dyn_object.loaded) {
-                continue;
-            }
+    logSummary();
 
-            //     Logger.info("name: {s}", .{dyn_object.name});
-            //     Logger.info("  path: {s}", .{dyn_object.path});
-            //     Logger.info("  mapped_at: 0x{x}", .{dyn_object.mapped_at});
-            //     Logger.info("  segments:", .{});
-            //     Logger.info("    {d} segments loaded", .{dyn_object.segments.count()});
-            //     for (dyn_object.segments.values(), 1..) |segment, s| {
-            //         Logger.info("    - {d}:", .{s});
-            //         Logger.info("      file_offset: 0x{x}", .{segment.file_offset});
-            //         Logger.info("      file_size: 0x{x}", .{segment.file_size});
-            //         Logger.info("      mem_offset: 0x{x}", .{segment.mem_offset});
-            //         Logger.info("      mem_size: 0x{x}", .{segment.mem_size});
-            //         Logger.info("      mem_align: 0x{x}", .{segment.mem_align});
-            //         Logger.info("      loadedAt: 0x{x}", .{segment.loaded_at});
-            //         Logger.info("      flags_first: {s}", .{try segment.flags_first.toStr(&buf)});
-            //         Logger.info("      flags_last: {s}", .{try segment.flags_last.toStr(&buf)});
-            //     }
-            //     Logger.info("  tls_init_file_offset: 0x{x}", .{dyn_object.tls_init_file_offset});
-            //     Logger.info("  tls_init_file_size: 0x{x}", .{dyn_object.tls_init_file_size});
-            //     Logger.info("  tls_init_mem_offset: 0x{x}", .{dyn_object.tls_init_mem_offset});
-            //     Logger.info("  tls_init_mem_size: 0x{x}", .{dyn_object.tls_init_mem_size});
-            //     Logger.info("  init/fini:", .{});
-            //     Logger.info("    init_addr: 0x{x}", .{dyn_object.init_addr});
-            //     Logger.info("    fini_addr: 0x{x}", .{dyn_object.fini_addr});
-            //     Logger.info("    init_array_addr: 0x{x}, size: 0x{x}", .{ dyn_object.init_array_addr, dyn_object.init_array_size });
-            //     Logger.info("    fini_array_addr: 0x{x}, size: 0x{x}", .{ dyn_object.fini_array_addr, dyn_object.fini_array_size });
-            //     Logger.info("  symbols:", .{});
-            //     Logger.info("    {d} / {d} symbols", .{ dyn_object.syms.count(), dyn_object.syms_array.items.len });
-            //     for (dyn_object.syms_array.items, 0..) |sym, s| {
-            //         Logger.debug("    - index: {d}:", .{s});
-            //         Logger.debug("      name: {s}", .{sym.name});
-            //         Logger.debug("      version: {s}", .{sym.version});
-            //         Logger.debug("      hidden: {}", .{sym.hidden});
-            //         Logger.debug("      offset: 0x{x}", .{sym.offset});
-            //         Logger.debug("      type: {s}", .{@tagName(sym.type)});
-            //         Logger.debug("      bind: {s}", .{@tagName(sym.bind)});
-            //         Logger.debug("      shidx: {s}", .{try sym.shidx.nameOrValue(&buf)});
-            //         Logger.debug("      value: 0x{x}", .{sym.value});
-            //         Logger.debug("      size: 0x{x}", .{sym.size});
-            //     }
-            //     Logger.info("  relocs:", .{});
-            //     Logger.info("    {d} relocs", .{dyn_object.relocs.items.len});
-            //     for (dyn_object.relocs.items, 1..) |reloc, s| {
-            //         Logger.debug("    - {d}:", .{s});
-            //         Logger.debug("      type: {s}", .{@tagName(reloc.type)});
-            //         Logger.debug("      sym_idx: 0x{x}", .{reloc.sym_idx});
-            //         Logger.debug("      offset: 0x{x}", .{reloc.offset});
-            //         Logger.debug("      addend: 0x{x}", .{reloc.addend});
-            //     }
-        }
-    }
+    for (dyn_objects_sorted_indices.items) |idx| {
+        const dyn_obj = &dyn_objects.values()[idx];
 
-    // TODO how many new DynObject were loaded ?
-    var init_list: [10]*DynObject = undefined;
-
-    var count: usize = 0;
-    var it = dyn_objects.iterator();
-    while (it.next()) |entry| {
-        init_list[count] = entry.value_ptr;
-        count += 1;
-    }
-    std.mem.reverse(*DynObject, init_list[0..count]);
-
-    for (init_list[0..count]) |dyn_obj| {
         if (dyn_obj.loaded) {
             continue;
         }
@@ -1108,30 +1105,28 @@ pub fn load(allocator: std.mem.Allocator, f_path: []const u8) !DynamicLibrary {
         computeTcbOffset(dyn_obj);
         try processRelocations(dyn_obj);
         try mapTlsBlock(dyn_obj);
-        try processIRelativeRelocations(allocator, dyn_obj);
-
-        // TODO temporarily to help debugging
-        // TODO don't call _dl_debug_state, call r_debug.r_brk, add loaded objects to r_debug.map list, and call again r_brk
         _dl_debug_state();
+        try processIRelativeRelocations(allocator, dyn_obj);
     }
 
-    for (init_list[0..count]) |dyn_obj| {
+    for (dyn_objects_sorted_indices.items) |idx| {
+        const dyn_obj = &dyn_objects.values()[idx];
+
         if (dyn_obj.loaded) {
             continue;
         }
+
         try updateSegmentsPermissions(dyn_obj);
+        _dl_debug_state();
         try callInitFunctions(dyn_obj);
     }
 
-    it = dyn_objects.iterator();
-    while (it.next()) |entry| {
-        const dyn_obj = entry.value_ptr;
-
-        dyn_obj.loaded = true;
-
+    for (dyn_objects.values()) |*dyn_obj| {
         if (dyn_obj.loaded_at == null) {
             continue;
         }
+
+        dyn_obj.loaded = true;
 
         const dl_phdr_info = try allocator.create(std.posix.dl_phdr_info);
 
@@ -1145,17 +1140,23 @@ pub fn load(allocator: std.mem.Allocator, f_path: []const u8) !DynamicLibrary {
         try CustomSelfInfo.addExtraElf(allocator, dl_phdr_info);
     }
 
-    // it = dyn_objects.iterator();
-    // while (it.next()) |entry| {
-    //     try dumpSegments(entry.value_ptr);
+    // for (dyn_objects.values()) |*dyn_obj| {
+    //     try dumpSegments(dyn_obj);
     // }
 
     return lib;
 }
 
-// TODO return how many DynObjects were loaded
+// TODO very inefficient
 fn loadRecursive(allocator: std.mem.Allocator, o_path: []const u8) !DynamicLibrary {
-    const lib = try loadDso(allocator, o_path);
+    var deferred_load = false;
+
+    loadDso(allocator, o_path) catch |err| switch (err) {
+        error.UnloadedDependency => {
+            deferred_load = true;
+        },
+        else => |e| return e,
+    };
 
     var hasUnloaded = true;
     while (hasUnloaded) {
@@ -1172,13 +1173,22 @@ fn loadRecursive(allocator: std.mem.Allocator, o_path: []const u8) !DynamicLibra
             hasUnloaded = true;
             const name = dyn_object.name;
 
-            _ = try loadDso(allocator, name);
+            loadDso(allocator, name) catch |err| switch (err) {
+                error.UnloadedDependency => continue,
+                else => |e| return e,
+            };
 
             break;
         }
     }
 
-    return lib;
+    if (deferred_load) {
+        try loadDso(allocator, o_path);
+    }
+
+    return .{
+        .index = dyn_objects.count() - 1,
+    };
 }
 
 // TODO mimic path resolution of linux-ld better
@@ -1221,7 +1231,7 @@ fn resolvePath(allocator: std.mem.Allocator, r_path: []const u8) ![]const u8 {
     return path orelse error.LibraryNotFound;
 }
 
-fn loadDso(allocator: std.mem.Allocator, o_path: []const u8) !DynamicLibrary {
+fn loadDso(allocator: std.mem.Allocator, o_path: []const u8) !void {
     const path: []const u8 = if (std.mem.startsWith(u8, o_path, "/")) try allocator.dupe(u8, o_path) else try resolvePath(allocator, o_path);
     defer allocator.free(path);
 
@@ -1239,6 +1249,7 @@ fn loadDso(allocator: std.mem.Allocator, o_path: []const u8) !DynamicLibrary {
         f.handle,
         0,
     );
+    errdefer std.posix.munmap(file_bytes);
 
     const file_addr = @intFromPtr(file_bytes.ptr);
 
@@ -1250,51 +1261,6 @@ fn loadDso(allocator: std.mem.Allocator, o_path: []const u8) !DynamicLibrary {
 
     const eh: *std.elf.Elf64_Ehdr = @ptrCast(file_bytes);
     if (!std.mem.eql(u8, eh.e_ident[0..4], std.elf.MAGIC)) return error.NotAnElfFile;
-
-    const do_entry = try dyn_objects.getOrPut(allocator, dyn_object_name);
-    defer if (do_entry.found_existing) {
-        allocator.free(dyn_object_name);
-    };
-
-    do_entry.value_ptr.* = .{
-        .name_is_key = false,
-        .name = try allocator.dupe(u8, dyn_object_name),
-        .path = try allocator.dupe(u8, path),
-        .file_handle = f.handle,
-        .mapped_at = file_addr,
-        .mapped_size = file_bytes.len,
-        .segments = .empty,
-        .tls_init_file_offset = 0,
-        .tls_init_file_size = 0,
-        .tls_init_mem_offset = 0,
-        .tls_init_mem_size = 0,
-        .tls_align = 0,
-        .tls_offset = 0,
-        .eh = eh,
-        .eh_init_file_offset = 0,
-        .eh_init_file_size = 0,
-        .eh_init_mem_offset = 0,
-        .eh_init_mem_size = 0,
-        .eh_align = 0,
-        .eh_offset = 0,
-        .syms = .empty,
-        .syms_array = .empty,
-        .relocs = .empty,
-        .dependencies = .empty,
-        .init_addr = 0,
-        .fini_addr = 0,
-        .init_array_addr = 0,
-        .init_array_size = 0,
-        .fini_array_addr = 0,
-        .fini_array_size = 0,
-        .loaded = false,
-        .loaded_at = null,
-        .loaded_size = 0,
-    };
-
-    const dyn_object = dyn_objects.getEntry(dyn_object_name).?.value_ptr;
-
-    const lib: DynamicLibrary = .{ .index = dyn_objects.entries.len - 1 };
 
     Logger.debug("elf type: {s}", .{@tagName(eh.e_type)});
 
@@ -1405,6 +1371,21 @@ fn loadDso(allocator: std.mem.Allocator, o_path: []const u8) !DynamicLibrary {
                 },
             }
         }
+    }
+
+    var syms_array: std.ArrayList(DynSym) = .empty;
+    var syms: DynSymList = .empty;
+    errdefer {
+        for (syms_array.items) |*sym| {
+            allocator.free(sym.name);
+            allocator.free(sym.version);
+        }
+        syms_array.deinit(allocator);
+
+        for (syms.values()) |*v| {
+            v.deinit(allocator);
+        }
+        syms.deinit(allocator);
     }
 
     if (versym_tab_addr) |vst_addr| {
@@ -1547,17 +1528,45 @@ fn loadDso(allocator: std.mem.Allocator, o_path: []const u8) !DynamicLibrary {
             .size = sym.st_size,
         };
 
-        const ent = try dyn_object.syms.getOrPut(allocator, s.name);
+        const ent = try syms.getOrPut(allocator, s.name);
         if (!ent.found_existing) {
             ent.value_ptr.* = .empty;
         }
 
-        try ent.value_ptr.append(allocator, dyn_object.syms_array.items.len);
-        try dyn_object.syms_array.append(allocator, s);
+        try ent.value_ptr.append(allocator, syms_array.items.len);
+        try syms_array.append(allocator, s);
     }
 
     Logger.debug("programs headers offset: 0x{x}", .{eh.e_phoff});
     Logger.debug("programs headers:", .{});
+
+    var segments: LoadSegmentList = .empty;
+    var dependencies: std.ArrayList(usize) = .empty;
+    var relocs: RelocList = .empty;
+    errdefer {
+        relocs.deinit(allocator);
+        dependencies.deinit(allocator);
+        segments.deinit(allocator);
+    }
+
+    var tls_init_file_offset: usize = 0;
+    var tls_init_file_size: usize = 0;
+    var tls_init_mem_offset: usize = 0;
+    var tls_init_mem_size: usize = 0;
+    var tls_align: usize = 0;
+
+    var eh_init_file_offset: usize = 0;
+    var eh_init_file_size: usize = 0;
+    var eh_init_mem_offset: usize = 0;
+    var eh_init_mem_size: usize = 0;
+    var eh_align: usize = 0;
+
+    var init_addr: usize = 0;
+    var fini_addr: usize = 0;
+    var init_array_addr: usize = 0;
+    var init_array_size: usize = 0;
+    var fini_array_addr: usize = 0;
+    var fini_array_size: usize = 0;
 
     var ph_addr: usize = file_addr + eh.e_phoff;
 
@@ -1601,9 +1610,9 @@ fn loadDso(allocator: std.mem.Allocator, o_path: []const u8) !DynamicLibrary {
                 .loaded_at = 0,
             };
 
-            try dyn_object.segments.put(allocator, segment.mem_offset, segment);
+            try segments.put(allocator, segment.mem_offset, segment);
         } else if (@as(PT, @enumFromInt(ph.p_type)) == .PT_GNU_RELRO) {
-            var segment = dyn_object.segments.get(ph.p_vaddr) orelse return error.SegmentNotFound;
+            var segment = segments.get(ph.p_vaddr) orelse return error.SegmentNotFound;
 
             std.debug.assert(segment.flags_last.mem_offset == segment.flags_first.mem_offset and segment.flags_last.mem_size == segment.flags_first.mem_size);
 
@@ -1615,19 +1624,19 @@ fn loadDso(allocator: std.mem.Allocator, o_path: []const u8) !DynamicLibrary {
                 .mem_size = ph.p_memsz,
             };
 
-            try dyn_object.segments.put(allocator, segment.mem_offset, segment);
+            try segments.put(allocator, segment.mem_offset, segment);
         } else if (@as(PT, @enumFromInt(ph.p_type)) == .PT_TLS) {
-            dyn_object.tls_init_file_offset = ph.p_offset;
-            dyn_object.tls_init_file_size = ph.p_filesz;
-            dyn_object.tls_init_mem_offset = ph.p_vaddr;
-            dyn_object.tls_init_mem_size = ph.p_memsz;
-            dyn_object.tls_align = ph.p_align;
+            tls_init_file_offset = ph.p_offset;
+            tls_init_file_size = ph.p_filesz;
+            tls_init_mem_offset = ph.p_vaddr;
+            tls_init_mem_size = ph.p_memsz;
+            tls_align = ph.p_align;
         } else if (@as(PT, @enumFromInt(ph.p_type)) == .PT_GNU_EH_FRAME) {
-            dyn_object.eh_init_file_offset = ph.p_offset;
-            dyn_object.eh_init_file_size = ph.p_filesz;
-            dyn_object.eh_init_mem_offset = ph.p_vaddr;
-            dyn_object.eh_init_mem_size = ph.p_memsz;
-            dyn_object.eh_align = ph.p_align;
+            eh_init_file_offset = ph.p_offset;
+            eh_init_file_size = ph.p_filesz;
+            eh_init_mem_offset = ph.p_vaddr;
+            eh_init_mem_size = ph.p_memsz;
+            eh_align = ph.p_align;
         } else if (@as(PT, @enumFromInt(ph.p_type)) == .PT_DYNAMIC) {
             const dyn_addr: usize = file_addr + ph.p_offset;
             const dyns: [*]std.elf.Dyn = @ptrFromInt(dyn_addr);
@@ -1656,7 +1665,7 @@ fn loadDso(allocator: std.mem.Allocator, o_path: []const u8) !DynamicLibrary {
 
                 if (dyns[j].d_tag == @intFromEnum(@as(DT, .DT_NEEDED_OR_ALPHA_NUM_OR_IA_64_NUM))) {
                     libName = @ptrFromInt(dyn_strtab_addr + dyns[j].d_val);
-                    Logger.debug("        => lib name: {s}", .{libName});
+                    Logger.debug("        => found dependency: {s} => {s}", .{ dyn_object_name, libName });
 
                     const libNameLen = std.mem.len(libName);
 
@@ -1682,7 +1691,6 @@ fn loadDso(allocator: std.mem.Allocator, o_path: []const u8) !DynamicLibrary {
                             .eh_init_mem_offset = 0,
                             .eh_init_mem_size = 0,
                             .eh_align = 0,
-                            .eh_offset = 0,
                             .syms = .empty,
                             .syms_array = .empty,
                             .relocs = .empty,
@@ -1697,10 +1705,18 @@ fn loadDso(allocator: std.mem.Allocator, o_path: []const u8) !DynamicLibrary {
                             .loaded_at = null,
                             .loaded_size = 0,
                         });
-                        try dyn_object.dependencies.append(allocator, dyn_objects.count() - 1);
+
+                        Logger.debug("        => {s} loading deferred", .{dyn_object_name});
+                        return error.UnloadedDependency;
                     } else {
-                        const idx = dyn_objects.getIndex(libName[0..libNameLen]).?;
-                        try dyn_object.dependencies.append(allocator, idx);
+                        const dep = dyn_objects.get(libName[0..libNameLen]).?;
+                        if (dep.mapped_at != 0) {
+                            Logger.debug("        => registering dependency: {s} => {s}", .{ dyn_object_name, libName });
+                            try dependencies.append(allocator, dyn_objects.getIndex(libName[0..libNameLen]).?);
+                        } else {
+                            Logger.debug("        => {s} loading deferred", .{dyn_object_name});
+                            return error.UnloadedDependency;
+                        }
                     }
                 } else if (dyns[j].d_tag == @intFromEnum(@as(DT, .DT_RUNPATH))) {
                     runpath = @ptrFromInt(dyn_strtab_addr + dyns[j].d_val);
@@ -1739,23 +1755,23 @@ fn loadDso(allocator: std.mem.Allocator, o_path: []const u8) !DynamicLibrary {
                     plt_got_addr = file_addr + dyns[j].d_val;
                     Logger.debug("        => plt got addr: 0x{x}", .{plt_got_addr});
                 } else if (dyns[j].d_tag == @intFromEnum(@as(DT, .DT_INIT_OR_VALNUM))) {
-                    dyn_object.init_addr = dyns[j].d_val;
-                    Logger.debug("        => init addr: 0x{x}", .{dyn_object.init_addr});
+                    init_addr = dyns[j].d_val;
+                    Logger.debug("        => init addr: 0x{x}", .{init_addr});
                 } else if (dyns[j].d_tag == @intFromEnum(@as(DT, .DT_FINI))) {
-                    dyn_object.fini_addr = dyns[j].d_val;
-                    Logger.debug("        => fini addr: 0x{x}", .{dyn_object.fini_addr});
+                    fini_addr = dyns[j].d_val;
+                    Logger.debug("        => fini addr: 0x{x}", .{fini_addr});
                 } else if (dyns[j].d_tag == @intFromEnum(@as(DT, .DT_INIT_ARRAY))) {
-                    dyn_object.init_array_addr = dyns[j].d_val;
-                    Logger.debug("        => init array addr: 0x{x}", .{dyn_object.init_array_addr});
+                    init_array_addr = dyns[j].d_val;
+                    Logger.debug("        => init array addr: 0x{x}", .{init_array_addr});
                 } else if (dyns[j].d_tag == @intFromEnum(@as(DT, .DT_INIT_ARRAYSZ))) {
-                    dyn_object.init_array_size = dyns[j].d_val;
-                    Logger.debug("        => init array size: 0x{x}", .{dyn_object.init_array_size});
+                    init_array_size = dyns[j].d_val;
+                    Logger.debug("        => init array size: 0x{x}", .{init_array_size});
                 } else if (dyns[j].d_tag == @intFromEnum(@as(DT, .DT_FINI_ARRAY))) {
-                    dyn_object.fini_array_addr = dyns[j].d_val;
-                    Logger.debug("        => fini array addr: 0x{x}", .{dyn_object.fini_array_addr});
+                    fini_array_addr = dyns[j].d_val;
+                    Logger.debug("        => fini array addr: 0x{x}", .{fini_array_addr});
                 } else if (dyns[j].d_tag == @intFromEnum(@as(DT, .DT_FINI_ARRAYSZ))) {
-                    dyn_object.fini_array_size = dyns[j].d_val;
-                    Logger.debug("        => fini array size: 0x{x}", .{dyn_object.fini_array_size});
+                    fini_array_size = dyns[j].d_val;
+                    Logger.debug("        => fini array size: 0x{x}", .{fini_array_size});
                 } else if (dyns[j].d_tag == @intFromEnum(@as(DT, .DT_FLAGS))) {
                     Logger.err("        => TODO: DT_FLAGS: 0x{x}", .{dyns[j].d_val});
                 } else if (dyns[j].d_tag == @intFromEnum(@as(DT, .DT_FLAGS_1))) {
@@ -1789,7 +1805,7 @@ fn loadDso(allocator: std.mem.Allocator, o_path: []const u8) !DynamicLibrary {
                         rela_reloc.r_addend,
                     });
 
-                    try dyn_object.relocs.append(allocator, .{
+                    try relocs.append(allocator, .{
                         .type = @as(std.elf.R_X86_64, @enumFromInt(rela_reloc.r_type())),
                         .is_relr = false,
                         .sym_idx = rela_reloc.r_sym(),
@@ -1823,7 +1839,7 @@ fn loadDso(allocator: std.mem.Allocator, o_path: []const u8) !DynamicLibrary {
                         plt_reloc.r_addend,
                     });
 
-                    try dyn_object.relocs.append(allocator, .{
+                    try relocs.append(allocator, .{
                         .type = @as(std.elf.R_X86_64, @enumFromInt(plt_reloc.r_type())),
                         .sym_idx = plt_reloc.r_sym(),
                         .is_relr = false,
@@ -1855,7 +1871,7 @@ fn loadDso(allocator: std.mem.Allocator, o_path: []const u8) !DynamicLibrary {
                             relr_reloc.*,
                             0,
                         });
-                        try dyn_object.relocs.append(allocator, .{
+                        try relocs.append(allocator, .{
                             .type = .RELATIVE,
                             .is_relr = true,
                             .sym_idx = 0,
@@ -1875,7 +1891,7 @@ fn loadDso(allocator: std.mem.Allocator, o_path: []const u8) !DynamicLibrary {
                                     next + sr * @sizeOf(std.elf.Elf64_Addr),
                                     0,
                                 });
-                                try dyn_object.relocs.append(allocator, .{
+                                try relocs.append(allocator, .{
                                     .type = .RELATIVE,
                                     .is_relr = true,
                                     .sym_idx = 0,
@@ -1894,9 +1910,52 @@ fn loadDso(allocator: std.mem.Allocator, o_path: []const u8) !DynamicLibrary {
         }
     }
 
+    const do_entry = try dyn_objects.getOrPut(allocator, dyn_object_name);
+    defer if (do_entry.found_existing) {
+        allocator.free(dyn_object_name);
+    };
+
+    do_entry.value_ptr.* = .{
+        .name_is_key = false,
+        .name = try allocator.dupe(u8, dyn_object_name),
+        .path = try allocator.dupe(u8, path),
+        .file_handle = f.handle,
+        .mapped_at = file_addr,
+        .mapped_size = file_bytes.len,
+        .segments = segments,
+        .tls_init_file_offset = tls_init_file_offset,
+        .tls_init_file_size = tls_init_file_size,
+        .tls_init_mem_offset = tls_init_mem_offset,
+        .tls_init_mem_size = tls_init_mem_size,
+        .tls_align = tls_align,
+        .tls_offset = 0,
+        .eh = eh,
+        .eh_init_file_offset = eh_init_file_offset,
+        .eh_init_file_size = eh_init_file_size,
+        .eh_init_mem_offset = eh_init_mem_offset,
+        .eh_init_mem_size = eh_init_mem_size,
+        .eh_align = eh_align,
+        .syms = syms,
+        .syms_array = syms_array,
+        .relocs = relocs,
+        .dependencies = dependencies,
+        .init_addr = init_addr,
+        .fini_addr = fini_addr,
+        .init_array_addr = init_array_addr,
+        .init_array_size = init_array_size,
+        .fini_array_addr = fini_array_addr,
+        .fini_array_size = fini_array_size,
+        .loaded = false,
+        .loaded_at = null,
+        .loaded_size = 0,
+    };
+
+    const dyn_object = dyn_objects.getEntry(dyn_object_name).?.value_ptr;
+    try dyn_objects_sorted_indices.append(allocator, dyn_objects.getIndex(dyn_object_name).?);
+
     try mapSegments(dyn_object, file_bytes);
 
-    return lib;
+    Logger.debug("{s} loaded", .{dyn_object_name});
 }
 
 fn mapSegments(dyn_object: *DynObject, file_bytes: []const u8) !void {
@@ -2079,6 +2138,9 @@ fn computeTcbOffset(dyn_object: *DynObject) void {
     const new_abi_tcb_offset = new_area_size;
     dyn_object.tls_offset = new_abi_tcb_offset;
 }
+var initial_tls_init_file_size: usize = undefined;
+var initial_tls_init_mem_size: usize = undefined;
+var initial_tls_offset: usize = undefined;
 
 fn mapTlsBlock(dyn_object: *DynObject) !void {
     Logger.debug("mapping tls block of library {s}", .{dyn_object.name});
@@ -2102,6 +2164,14 @@ fn mapTlsBlock(dyn_object: *DynObject) !void {
     new_area_size += @sizeOf(Dtv);
 
     std.debug.assert(new_abi_tcb_offset == dyn_object.tls_offset);
+    std.debug.assert(current_tls_area_desc.abi_tcb.offset - current_tls_area_desc.block.offset == new_abi_tcb_offset - prev_block_offset);
+
+    Logger.debug("TLS: ({s}) block size: 0x{x}", .{ dyn_object.name, dyn_object.tls_init_mem_size });
+    Logger.debug("TLS: ({s}) current block size: 0x{x}", .{ dyn_object.name, current_tls_area_desc.block.size });
+    Logger.debug("TLS: ({s}) prev area size: 0x{x}, new area size: 0x{x}", .{ dyn_object.name, current_tls_area_desc.size, new_area_size });
+    Logger.debug("TLS: ({s}) prev block offset: 0x{x}, prev abi tcb offset: 0x{x}", .{ dyn_object.name, current_tls_area_desc.block.offset, current_tls_area_desc.abi_tcb.offset });
+    Logger.debug("TLS: ({s}) new prev block offset: 0x{x}", .{ dyn_object.name, prev_block_offset });
+    Logger.debug("TLS: ({s}) new block offset: 0x{x}, new abi tcb offset: 0x{x}", .{ dyn_object.name, new_block_offset, new_abi_tcb_offset });
 
     const sizeof_pthread: usize = sp: {
         const sym = resolveSymbolByName("_thread_db_sizeof_pthread") catch {
@@ -2132,6 +2202,24 @@ fn mapTlsBlock(dyn_object: *DynObject) !void {
 
     if (current_tls_area_desc.gdt_entry_number != @as(usize, @bitCast(@as(isize, -1)))) {
         @memcpy(new_area[new_abi_tcb_offset .. new_area_size + sizeof_pthread], @as([*]u8, @ptrFromInt(old_tp)));
+    } else {
+        initial_tls_init_file_size = current_tls_area_desc.size - current_tls_area_desc.abi_tcb.offset;
+        initial_tls_init_mem_size = current_tls_area_desc.size;
+        initial_tls_offset = current_tls_area_desc.block.offset;
+
+        @memcpy(new_area[new_abi_tcb_offset .. new_abi_tcb_offset + current_tls_area_desc.size - current_tls_area_desc.abi_tcb.offset], @as([*]u8, @ptrFromInt(old_tp)));
+    }
+
+    if (initial_tls_init_file_size != initial_tls_init_mem_size) {
+        Logger.debug("TLS: zeroing initial tbss: from 0x{x} to 0x{x} (size: 0x{x})", .{ new_abi_tcb_offset - initial_tls_offset, new_abi_tcb_offset - initial_tls_offset + initial_tls_init_file_size, initial_tls_init_file_size });
+        @memset(new_area[new_abi_tcb_offset - initial_tls_offset ..][initial_tls_init_file_size..initial_tls_init_mem_size], 0);
+    }
+
+    for (dyn_objects.values()) |*do| {
+        if (do.tls_init_file_size != do.tls_init_mem_size) {
+            Logger.debug("TLS: zeroing {s} tbss: from 0x{x} to 0x{x} (size: 0x{x})", .{ do.name, new_abi_tcb_offset - initial_tls_offset, new_abi_tcb_offset - initial_tls_offset + initial_tls_init_file_size, initial_tls_init_file_size });
+            @memset(new_area[new_abi_tcb_offset - do.tls_offset ..][do.tls_init_file_size..do.tls_init_mem_size], 0);
+        }
     }
 
     const new_block_init = new_area[0..new_abi_tcb_offset];
@@ -2204,27 +2292,30 @@ fn mapTlsBlock(dyn_object: *DynObject) !void {
     dyn_object.tls_offset = new_abi_tcb_offset;
     Logger.debug("tls offset: {d}", .{new_abi_tcb_offset});
 
-    const is_libc_so = if (std.mem.find(u8, dyn_object.name, "libc.so")) |_| true else false;
-    if (is_libc_so) {
-        const maybe_rtld_global_ro = resolveSymbolByName("_rtld_global_ro") catch null;
+    const maybe_rtld_global_ro = resolveSymbolByName("_rtld_global_ro") catch null;
 
-        if (maybe_rtld_global_ro) |rtld_global_ro| {
-            Logger.debug("rtld_global_ro: 0x{x}", .{rtld_global_ro.address});
+    if (maybe_rtld_global_ro) |rtld_global_ro| {
+        Logger.debug("rtld_global_ro: 0x{x}", .{rtld_global_ro.address});
 
-            // TODO: we should find a way to get those field offsets at runtime
-            const dl_tls_static_size: *usize = @ptrFromInt(rtld_global_ro.address + 704);
-            const dl_tls_static_align: *usize = @ptrFromInt(rtld_global_ro.address + 712);
+        const seg_infos = try findDynObjectSegmentForLoadedAddr(rtld_global_ro.address);
 
-            // TODO: these values should be set every time a new library is loaded
-            // It implies switching related segment permissions
-            dl_tls_static_size.* = new_tls_area_desc.block.size;
-            dl_tls_static_align.* = new_tls_area_desc.alignment;
-        }
+        // TODO we should find a way to get those field offsets at runtime
+        const dl_tls_static_size: *volatile usize = @ptrFromInt(rtld_global_ro.address + 704);
+        const dl_tls_static_align: *volatile usize = @ptrFromInt(rtld_global_ro.address + 712);
+
+        try unprotectSegment(seg_infos.dyn_object, seg_infos.segment_index);
+
+        dl_tls_static_size.* = new_tls_area_desc.block.size;
+        dl_tls_static_align.* = new_tls_area_desc.alignment;
+
+        try reprotectSegment(seg_infos.dyn_object, seg_infos.segment_index);
     }
 }
 
 fn processRelocations(dyn_object: *DynObject) !void {
-    Logger.debug("processing {d} relocations for {s}", .{ dyn_object.relocs.items.len, dyn_object.name });
+    Logger.debug("processing relocations for {s}", .{dyn_object.name});
+
+    var reloc_count: usize = 0;
 
     for (dyn_object.relocs.items) |reloc| {
         const reloc_addr = try vAddressToLoadedAddress(dyn_object, reloc.offset);
@@ -2234,12 +2325,14 @@ fn processRelocations(dyn_object: *DynObject) !void {
 
         switch (reloc.type) {
             .RELATIVE => {
+                reloc_count += 1;
                 // R_X86_64_RELATIVE: B + A
                 const value = try vAddressToLoadedAddress(dyn_object, @as(usize, @intCast(reloc.addend)) + if (reloc.addend == 0) ptr.* else 0);
                 Logger.debug("  RELATIVE: 0x{x} (0x{x}): 0x{x} -> 0x{x} (addend: 0x{x}, relr: {})", .{ reloc_addr, reloc.offset, ptr.*, value, reloc.addend, reloc.is_relr });
                 ptr.* = value;
             },
             .@"64" => {
+                reloc_count += 1;
                 // R_X86_64_64: S + A
                 const sym = try resolveSymbol(dyn_object, reloc.sym_idx);
                 const value = sym.address + @as(usize, @intCast(reloc.addend));
@@ -2247,6 +2340,7 @@ fn processRelocations(dyn_object: *DynObject) !void {
                 ptr.* = value;
             },
             .GLOB_DAT => {
+                reloc_count += 1;
                 // R_X86_64_GLOB_DAT: S
                 const sym = try resolveSymbol(dyn_object, reloc.sym_idx);
                 const value = sym.address;
@@ -2254,6 +2348,7 @@ fn processRelocations(dyn_object: *DynObject) !void {
                 ptr.* = value;
             },
             .JUMP_SLOT => {
+                reloc_count += 1;
                 // R_X86_64_JUMP_SLOT: S
                 const sym = try resolveSymbol(dyn_object, reloc.sym_idx);
                 const value = if (getSubstituteAddress(sym)) |a| a else sym.address;
@@ -2261,6 +2356,7 @@ fn processRelocations(dyn_object: *DynObject) !void {
                 ptr.* = value;
             },
             .TPOFF64 => {
+                reloc_count += 1;
                 // R_X86_64_TPOFF64: S + A (TLS offset)
                 const sym = try resolveSymbol(dyn_object, reloc.sym_idx);
                 const value = @as(isize, @intCast(sym.value)) + reloc.addend - @as(isize, @intCast(dyn_object.tls_offset));
@@ -2289,11 +2385,13 @@ fn processRelocations(dyn_object: *DynObject) !void {
         }
     }
 
-    Logger.debug("processed relocations for {s}", .{dyn_object.name});
+    Logger.debug("processed relocations {d} for {s}", .{ reloc_count, dyn_object.name });
 }
 
 fn processIRelativeRelocations(allocator: std.mem.Allocator, dyn_object: *DynObject) !void {
     Logger.debug("processing IRELATIVE relocations for {s}", .{dyn_object.name});
+
+    var reloc_count: usize = 0;
 
     for (dyn_object.relocs.items) |reloc| {
         const reloc_addr = try vAddressToLoadedAddress(dyn_object, reloc.offset);
@@ -2309,6 +2407,7 @@ fn processIRelativeRelocations(allocator: std.mem.Allocator, dyn_object: *DynObj
             .TPOFF64,
             => {},
             .IRELATIVE => {
+                reloc_count += 1;
                 const resolver_addr = try vAddressToLoadedAddress(dyn_object, @intCast(reloc.addend));
                 const resolver: *const fn () callconv(.c) usize = @ptrFromInt(resolver_addr);
                 Logger.debug("  IRELATIVE: calling resolver at 0x{x} (0x{x})", .{ resolver_addr, reloc.addend });
@@ -2328,7 +2427,7 @@ fn processIRelativeRelocations(allocator: std.mem.Allocator, dyn_object: *DynObj
         }
     }
 
-    Logger.debug("processed IRELATIVE relocations for {s}", .{dyn_object.name});
+    Logger.debug("processed {d} IRELATIVE relocations for {s}", .{ reloc_count, dyn_object.name });
 }
 
 // TODO Should receive a *DynObject, which should contain links to dependencies,
@@ -2539,6 +2638,86 @@ fn updateSegmentsPermissions(dyn_object: *DynObject) !void {
     Logger.debug("successfully updated {d} segments for {s}", .{ dyn_object.segments.count(), dyn_object.name });
 }
 
+fn unprotectSegment(dyn_object: *DynObject, segment_index: usize) !void {
+    const segment = dyn_object.segments.values()[segment_index];
+
+    const aligned_start = std.mem.alignBackward(usize, segment.loaded_at, std.heap.pageSize());
+    const aligned_end = std.mem.alignForward(usize, segment.loaded_at + segment.mem_size, std.heap.pageSize());
+    const prot: u32 = std.posix.PROT.READ | std.posix.PROT.WRITE;
+
+    Logger.debug("{s}: unprotecting segment {d}: from 0x{x} to 0x{x}, prot: 0x{x}", .{ dyn_object.name, segment_index, aligned_start, aligned_end, prot });
+
+    const segment_slice = @as([*]align(std.heap.pageSize()) u8, @ptrFromInt(aligned_start))[0 .. aligned_end - aligned_start];
+    std.posix.mprotect(segment_slice, prot) catch |err| {
+        Logger.err("failed to update segment permissions: {s}", .{@errorName(err)});
+        return err;
+    };
+
+    Logger.debug("successfully unprotected segment {d} for {s}", .{ segment_index, dyn_object.name });
+}
+
+fn reprotectSegment(dyn_object: *DynObject, segment_index: usize) !void {
+    const segment = dyn_object.segments.values()[segment_index];
+
+    var aligned_start = std.mem.alignBackward(usize, segment.loaded_at, std.heap.pageSize());
+    var aligned_end = std.mem.alignForward(usize, segment.loaded_at + segment.mem_size, std.heap.pageSize());
+
+    var prot: u32 = std.posix.PROT.NONE;
+    if (segment.flags_first.read) prot |= std.posix.PROT.READ;
+    if (segment.flags_first.write) prot |= std.posix.PROT.WRITE;
+    if (segment.flags_first.exec) prot |= std.posix.PROT.EXEC;
+
+    Logger.debug("{s}: reprotecting segment {d}: from 0x{x} to 0x{x}, prot: 0x{x}", .{ dyn_object.name, segment_index, aligned_start, aligned_end, prot });
+
+    var segment_slice = @as([*]align(std.heap.pageSize()) u8, @ptrFromInt(aligned_start))[0 .. aligned_end - aligned_start];
+    std.posix.mprotect(segment_slice, prot) catch |err| {
+        Logger.err("failed to update segment permissions: {s}", .{@errorName(err)});
+        return err;
+    };
+
+    if (dyn_object.loaded) {
+        prot = std.posix.PROT.NONE;
+        if (segment.flags_last.read) prot |= std.posix.PROT.READ;
+        if (segment.flags_last.write) prot |= std.posix.PROT.WRITE;
+        if (segment.flags_last.exec) prot |= std.posix.PROT.EXEC;
+
+        aligned_start = std.mem.alignBackward(usize, segment.loaded_at + (segment.flags_last.mem_offset - segment.mem_offset), std.heap.pageSize());
+        aligned_end = std.mem.alignForward(usize, segment.loaded_at + (segment.flags_last.mem_offset - segment.mem_offset) + segment.flags_last.mem_size, std.heap.pageSize());
+
+        Logger.debug("{s}: reapplying segment {d} permissions: from 0x{x} to 0x{x}, prot: 0x{x}", .{ dyn_object.name, segment_index, aligned_start, aligned_end, prot });
+
+        segment_slice = @as([*]align(std.heap.pageSize()) u8, @ptrFromInt(aligned_start))[0 .. aligned_end - aligned_start];
+        std.posix.mprotect(segment_slice, prot) catch |err| {
+            Logger.err("failed to update segment permissions: {s}", .{@errorName(err)});
+            return err;
+        };
+    }
+
+    Logger.debug("successfully reprotected segment {d} for {s}", .{ segment_index, dyn_object.name });
+}
+
+const DynObjectSegmentResult = struct {
+    dyn_object: *DynObject,
+    segment_index: usize,
+};
+
+fn findDynObjectSegmentForLoadedAddr(addr: usize) !DynObjectSegmentResult {
+    for (dyn_objects.values()) |*dyn_object| {
+        for (dyn_object.segments.values(), 0..) |*s, s_idx| {
+            const segment_start = s.loaded_at;
+            const segment_end = segment_start + s.mem_size;
+            if (addr >= segment_start and addr < segment_end) {
+                return .{
+                    .dyn_object = dyn_object,
+                    .segment_index = s_idx,
+                };
+            }
+        }
+    }
+
+    return error.LoadedAddressNotMapped;
+}
+
 fn vAddressToLoadedAddress(dyn_object: *DynObject, addr: usize) !usize {
     var containing_segment: ?*LoadSegment = null;
     for (dyn_object.segments.values()) |*s| {
@@ -2605,6 +2784,7 @@ fn callInitFunctions(dyn_obj: *DynObject) !void {
         maybe_sym = resolveSymbolByName("__libc_early_init") catch null;
         if (maybe_sym) |sym| {
             Logger.info("libc: found early init: 0x{x}", .{sym.address});
+            Logger.info("calling libc early_init at 0x{x}", .{sym.address});
             const early_init: *const fn (bool) callconv(.c) void = @ptrFromInt(sym.address);
             early_init(false);
         }
