@@ -860,6 +860,7 @@ const DynObject = struct {
     tls_init_mem_size: usize,
     tls_align: usize,
     tls_offset: usize,
+    tls_mapped_at: usize,
     eh: *std.elf.Elf64_Ehdr,
     eh_init_file_offset: usize,
     eh_init_file_size: usize,
@@ -1011,6 +1012,11 @@ pub fn deinit(allocator: std.mem.Allocator) void {
     irel_resolved_addrs.clearAndFree(allocator);
     irel_resolved_targets.clearAndFree(allocator);
 
+    const current_tls_area_desc = std.os.linux.tls.area_desc;
+    if (current_tls_area_desc.gdt_entry_number != @as(usize, @bitCast(@as(isize, -1)))) {
+        allocator.free(current_tls_area_desc.block.init);
+    }
+
     CustomSelfInfo.clearExtraElfs(allocator);
 
     // TODO
@@ -1104,7 +1110,7 @@ pub fn load(allocator: std.mem.Allocator, f_path: []const u8) !DynamicLibrary {
 
         computeTcbOffset(dyn_obj);
         try processRelocations(dyn_obj);
-        try mapTlsBlock(dyn_obj);
+        try mapTlsBlock(allocator, dyn_obj);
         _dl_debug_state();
         try processIRelativeRelocations(allocator, dyn_obj);
     }
@@ -1685,6 +1691,7 @@ fn loadDso(allocator: std.mem.Allocator, o_path: []const u8) !void {
                             .tls_init_mem_size = 0,
                             .tls_align = 0,
                             .tls_offset = 0,
+                            .tls_mapped_at = 0,
                             .eh = undefined,
                             .eh_init_file_offset = 0,
                             .eh_init_file_size = 0,
@@ -1928,6 +1935,7 @@ fn loadDso(allocator: std.mem.Allocator, o_path: []const u8) !void {
         .tls_init_mem_offset = tls_init_mem_offset,
         .tls_init_mem_size = tls_init_mem_size,
         .tls_align = tls_align,
+        .tls_mapped_at = 0,
         .tls_offset = 0,
         .eh = eh,
         .eh_init_file_offset = eh_init_file_offset,
@@ -2138,14 +2146,16 @@ fn computeTcbOffset(dyn_object: *DynObject) void {
     const new_abi_tcb_offset = new_area_size;
     dyn_object.tls_offset = new_abi_tcb_offset;
 }
+
 var initial_tls_init_file_size: usize = undefined;
 var initial_tls_init_mem_size: usize = undefined;
 var initial_tls_offset: usize = undefined;
+var initial_tls_init_block: []const u8 = undefined;
 
-fn mapTlsBlock(dyn_object: *DynObject) !void {
+fn mapTlsBlock(allocator: std.mem.Allocator, dyn_object: *DynObject) !void {
     Logger.debug("mapping tls block of library {s}", .{dyn_object.name});
 
-    const mapped_bytes: []const u8 = @as([*]u8, @ptrFromInt(dyn_object.loaded_at.?))[0..dyn_object.loaded_size];
+    // const mapped_bytes: []const u8 = @as([*]u8, @ptrFromInt(dyn_object.loaded_at.?))[0..dyn_object.loaded_size];
 
     const current_tls_area_desc = std.os.linux.tls.area_desc;
 
@@ -2166,12 +2176,8 @@ fn mapTlsBlock(dyn_object: *DynObject) !void {
     std.debug.assert(new_abi_tcb_offset == dyn_object.tls_offset);
     std.debug.assert(current_tls_area_desc.abi_tcb.offset - current_tls_area_desc.block.offset == new_abi_tcb_offset - prev_block_offset);
 
-    Logger.debug("TLS: ({s}) block size: 0x{x}", .{ dyn_object.name, dyn_object.tls_init_mem_size });
-    Logger.debug("TLS: ({s}) current block size: 0x{x}", .{ dyn_object.name, current_tls_area_desc.block.size });
-    Logger.debug("TLS: ({s}) prev area size: 0x{x}, new area size: 0x{x}", .{ dyn_object.name, current_tls_area_desc.size, new_area_size });
-    Logger.debug("TLS: ({s}) prev block offset: 0x{x}, prev abi tcb offset: 0x{x}", .{ dyn_object.name, current_tls_area_desc.block.offset, current_tls_area_desc.abi_tcb.offset });
-    Logger.debug("TLS: ({s}) new prev block offset: 0x{x}", .{ dyn_object.name, prev_block_offset });
-    Logger.debug("TLS: ({s}) new block offset: 0x{x}, new abi tcb offset: 0x{x}", .{ dyn_object.name, new_block_offset, new_abi_tcb_offset });
+    Logger.debug("TLS: ({s}) tdata size: 0x{x}", .{ dyn_object.name, dyn_object.tls_init_file_size });
+    Logger.debug("TLS: ({s}) tbss size: 0x{x}", .{ dyn_object.name, dyn_object.tls_init_mem_size - dyn_object.tls_init_file_size });
 
     const sizeof_pthread: usize = sp: {
         const sym = resolveSymbolByName("_thread_db_sizeof_pthread") catch {
@@ -2181,15 +2187,21 @@ fn mapTlsBlock(dyn_object: *DynObject) !void {
         const sizeof_pthread_ptr: *u32 = @ptrFromInt(sym.address);
         break :sp sizeof_pthread_ptr.*;
     };
-    Logger.debug("size of pthread struct: 0x{x} ({d})", .{ sizeof_pthread, sizeof_pthread });
+    Logger.debug("TLS: size of pthread struct: 0x{x} ({d})", .{ sizeof_pthread, sizeof_pthread });
 
+    Logger.debug("TLS: mapping new area: size: 0x{x} + 0x{x}", .{ new_area_size, sizeof_pthread });
     const new_area = std.posix.mmap(null, new_area_size + sizeof_pthread, std.posix.PROT.READ | std.posix.PROT.WRITE, .{ .TYPE = .PRIVATE, .ANONYMOUS = true }, -1, 0) catch |err| {
         Logger.err("failed to allocate tls space: {s}", .{@errorName(err)});
         return err;
     };
 
     if (dyn_object.tls_init_file_size > 0) {
-        @memcpy(new_area[0..dyn_object.tls_init_file_size], mapped_bytes[dyn_object.tls_init_mem_offset .. dyn_object.tls_init_mem_offset + dyn_object.tls_init_file_size]);
+        Logger.debug("TLS: copying new block data: from 0x{x} to 0x{x} (size: 0x{x})", .{
+            0,
+            dyn_object.tls_init_file_size,
+            dyn_object.tls_init_file_size,
+        });
+        @memcpy(new_area[0..dyn_object.tls_init_file_size], @as([*]u8, @ptrFromInt(try vAddressToLoadedAddress(dyn_object, dyn_object.tls_init_mem_offset))));
     }
 
     var old_tp: usize = undefined;
@@ -2197,32 +2209,90 @@ fn mapTlsBlock(dyn_object: *DynObject) !void {
     std.debug.assert(e_get_fs == 0);
 
     if (current_tls_area_desc.block.size > 0) {
+        Logger.debug("TLS: copying previous area block data: from 0x{x} to 0x{x} (size: 0x{x})", .{
+            prev_block_offset,
+            prev_block_offset + current_tls_area_desc.block.size,
+            current_tls_area_desc.block.size,
+        });
         @memcpy(new_area[prev_block_offset .. prev_block_offset + current_tls_area_desc.block.size], @as([*]u8, @ptrFromInt(old_tp - current_tls_area_desc.block.size)));
     }
 
     if (current_tls_area_desc.gdt_entry_number != @as(usize, @bitCast(@as(isize, -1)))) {
+        Logger.debug("TLS: copying previous pthread data: from 0x{x} to 0x{x} (size: 0x{x})", .{
+            new_abi_tcb_offset,
+            new_area_size + sizeof_pthread,
+            new_area_size + sizeof_pthread - new_abi_tcb_offset,
+        });
         @memcpy(new_area[new_abi_tcb_offset .. new_area_size + sizeof_pthread], @as([*]u8, @ptrFromInt(old_tp)));
     } else {
-        initial_tls_init_file_size = current_tls_area_desc.size - current_tls_area_desc.abi_tcb.offset;
-        initial_tls_init_mem_size = current_tls_area_desc.size;
-        initial_tls_offset = current_tls_area_desc.block.offset;
+        initial_tls_init_file_size = current_tls_area_desc.block.init.len;
+        initial_tls_init_mem_size = current_tls_area_desc.block.size;
+        initial_tls_offset = current_tls_area_desc.abi_tcb.offset;
+        initial_tls_init_block = current_tls_area_desc.block.init;
 
-        @memcpy(new_area[new_abi_tcb_offset .. new_abi_tcb_offset + current_tls_area_desc.size - current_tls_area_desc.abi_tcb.offset], @as([*]u8, @ptrFromInt(old_tp)));
+        Logger.debug("TLS: copying previous area metadata: from 0x{x} to 0x{x} (size: 0x{x})", .{
+            new_abi_tcb_offset,
+            new_abi_tcb_offset + current_tls_area_desc.size - current_tls_area_desc.abi_tcb.offset,
+            current_tls_area_desc.size - current_tls_area_desc.abi_tcb.offset,
+        });
+        @memcpy(new_area[new_abi_tcb_offset..][0 .. current_tls_area_desc.size - current_tls_area_desc.abi_tcb.offset], @as([*]u8, @ptrFromInt(old_tp)));
     }
 
+    Logger.debug("TLS: allocating new init block: size: 0x{x}", .{new_abi_tcb_offset});
+    const new_initial_block = try allocator.alloc(u8, new_abi_tcb_offset);
+
     if (initial_tls_init_file_size != initial_tls_init_mem_size) {
-        Logger.debug("TLS: zeroing initial tbss: from 0x{x} to 0x{x} (size: 0x{x})", .{ new_abi_tcb_offset - initial_tls_offset, new_abi_tcb_offset - initial_tls_offset + initial_tls_init_file_size, initial_tls_init_file_size });
-        @memset(new_area[new_abi_tcb_offset - initial_tls_offset ..][initial_tls_init_file_size..initial_tls_init_mem_size], 0);
+        Logger.debug("TLS: copying initial tdata: from 0x{x} to 0x{x} (size: 0x{x})", .{
+            new_abi_tcb_offset - initial_tls_offset,
+            new_abi_tcb_offset - initial_tls_offset + initial_tls_init_file_size,
+            initial_tls_init_file_size,
+        });
+        @memcpy(new_initial_block[new_abi_tcb_offset - initial_tls_offset ..][0..initial_tls_init_file_size], initial_tls_init_block);
+        Logger.debug("TLS: zeroing initial tbss: from 0x{x} to 0x{x} (size: 0x{x})", .{
+            new_abi_tcb_offset - initial_tls_offset + initial_tls_init_file_size,
+            new_abi_tcb_offset - initial_tls_offset + initial_tls_init_mem_size,
+            initial_tls_init_mem_size - initial_tls_init_file_size,
+        });
+        @memset(new_initial_block[new_abi_tcb_offset - initial_tls_offset + initial_tls_init_file_size ..][0 .. initial_tls_init_mem_size - initial_tls_init_file_size], 0);
     }
 
     for (dyn_objects.values()) |*do| {
-        if (do.tls_init_file_size != do.tls_init_mem_size) {
-            Logger.debug("TLS: zeroing {s} tbss: from 0x{x} to 0x{x} (size: 0x{x})", .{ do.name, new_abi_tcb_offset - initial_tls_offset, new_abi_tcb_offset - initial_tls_offset + initial_tls_init_file_size, initial_tls_init_file_size });
-            @memset(new_area[new_abi_tcb_offset - do.tls_offset ..][do.tls_init_file_size..do.tls_init_mem_size], 0);
+        if (do.tls_mapped_at != 0 and do.tls_init_file_size != do.tls_init_mem_size) {
+            Logger.debug("TLS: copying {s} tdata: from 0x{x} to 0x{x} (size: 0x{x})", .{
+                do.name,
+                new_abi_tcb_offset - do.tls_offset,
+                new_abi_tcb_offset - do.tls_offset + do.tls_init_file_size,
+                do.tls_init_file_size,
+            });
+            @memcpy(new_initial_block[new_abi_tcb_offset - do.tls_offset ..][0..do.tls_init_file_size], @as([*]u8, @ptrFromInt(try vAddressToLoadedAddress(do, do.tls_init_mem_offset))));
+            Logger.debug("TLS: zeroing {s} tbss: from 0x{x} to 0x{x} (size: 0x{x})", .{
+                do.name,
+                new_abi_tcb_offset - do.tls_offset + do.tls_init_file_size,
+                new_abi_tcb_offset - do.tls_offset + do.tls_init_mem_size,
+                do.tls_init_mem_size - do.tls_init_file_size,
+            });
+            @memset(new_initial_block[new_abi_tcb_offset - do.tls_offset + initial_tls_init_file_size ..][0 .. do.tls_init_mem_size - do.tls_init_file_size], 0);
         }
     }
 
-    const new_block_init = new_area[0..new_abi_tcb_offset];
+    if (dyn_object.tls_init_file_size != dyn_object.tls_init_mem_size) {
+        Logger.debug("TLS: copying {s} tdata: from 0x{x} to 0x{x} (size: 0x{x})", .{
+            dyn_object.name,
+            0,
+            dyn_object.tls_init_file_size,
+            dyn_object.tls_init_file_size,
+        });
+        @memcpy(new_initial_block[0..dyn_object.tls_init_file_size], @as([*]u8, @ptrFromInt(try vAddressToLoadedAddress(dyn_object, dyn_object.tls_init_mem_offset))));
+        Logger.debug("TLS: zeroing {s} tbss: from 0x{x} to 0x{x} (size: 0x{x})", .{
+            dyn_object.name,
+            dyn_object.tls_init_file_size,
+            dyn_object.tls_init_mem_size,
+            dyn_object.tls_init_mem_size - dyn_object.tls_init_file_size,
+        });
+        @memset(new_initial_block[dyn_object.tls_init_file_size..dyn_object.tls_init_mem_size], 0);
+    }
+
+    const new_block_init = new_initial_block;
     const new_block_size = new_block_init.len;
 
     const new_align_factor = @max(dyn_object.tls_align, current_tls_area_desc.alignment);
@@ -2268,6 +2338,10 @@ fn mapTlsBlock(dyn_object: *DynObject) !void {
         .gdt_entry_number = 1,
     };
 
+    if (current_tls_area_desc.gdt_entry_number != @as(usize, @bitCast(@as(isize, -1)))) {
+        allocator.free(current_tls_area_desc.block.init);
+    }
+
     std.os.linux.tls.area_desc = new_tls_area_desc;
 
     // const new_tp = std.os.linux.tls.prepareArea(new_area);
@@ -2284,18 +2358,18 @@ fn mapTlsBlock(dyn_object: *DynObject) !void {
     new_dtv.tls_block = new_area.ptr;
     new_dtv.len = new_tp;
 
-    Logger.debug("tls space mapped, new TP: 0x{x}", .{new_tp});
+    Logger.debug("TLS: tls space mapped, new TP: 0x{x}", .{new_tp});
 
     const e_set_fs = std.os.linux.syscall2(.arch_prctl, std.os.linux.ARCH.SET_FS, new_tp);
     std.debug.assert(e_set_fs == 0);
 
     dyn_object.tls_offset = new_abi_tcb_offset;
-    Logger.debug("tls offset: {d}", .{new_abi_tcb_offset});
+    Logger.debug("TLS: tls offset: 0x{x}", .{new_abi_tcb_offset});
 
     const maybe_rtld_global_ro = resolveSymbolByName("_rtld_global_ro") catch null;
 
     if (maybe_rtld_global_ro) |rtld_global_ro| {
-        Logger.debug("rtld_global_ro: 0x{x}", .{rtld_global_ro.address});
+        Logger.debug("TLS: rtld_global_ro: 0x{x}", .{rtld_global_ro.address});
 
         const seg_infos = try findDynObjectSegmentForLoadedAddr(rtld_global_ro.address);
 
@@ -2310,6 +2384,8 @@ fn mapTlsBlock(dyn_object: *DynObject) !void {
 
         try reprotectSegment(seg_infos.dyn_object, seg_infos.segment_index);
     }
+
+    dyn_object.tls_mapped_at = @as(usize, @intFromPtr(new_area.ptr)) - dyn_object.tls_offset;
 }
 
 fn processRelocations(dyn_object: *DynObject) !void {
