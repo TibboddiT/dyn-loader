@@ -26,13 +26,20 @@ pub fn build(b: *std.Build) void {
     addExecutable(b, dll_mod, target, optimize, "vulkan_advanced_musl", "src/examples/vulkan_advanced/vulkan_musl.zig");
     addExecutable(b, dll_mod, target, optimize, "x11_window", "src/examples/x11_window.zig");
 
-    // const check = b.addExecutable(.{
-    //     .name = "DynLoader",
-    //     .root_module = exe_mod,
-    // });
+    const check = b.addExecutable(.{
+        .name = "check",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/examples/printf.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "dll", .module = dll_mod },
+            },
+        }),
+    });
 
-    // const check_step = b.step("check", "check");
-    // check_step.dependOn(&check.step);
+    const check_step = b.step("check", "check");
+    check_step.dependOn(&check.step);
 }
 
 fn addExecutable(b: *std.Build, mod: *std.Build.Module, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, name: []const u8, root_source_file: []const u8) void {
