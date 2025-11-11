@@ -1,6 +1,6 @@
 ## Loading dynamic libraries from non libc static executable - Proof of concept
 
-Lots of TODOs remaining.
+Prototype quality: lots of bugs, lots of TODOs remaining.
 
 Tested on `x86_64-linux-gnu` with glibc 2.41.
 Works with a lightly patched musl for now.
