@@ -24,6 +24,7 @@ pub fn build(b: *std.Build) void {
     addExecutable(b, dll_mod, target, optimize, "vulkan_advanced", "src/examples/vulkan_advanced/vulkan.zig");
     addExecutable(b, dll_mod, target, optimize, "vulkan_musl", "src/examples/vulkan_musl.zig");
     addExecutable(b, dll_mod, target, optimize, "vulkan_advanced_musl", "src/examples/vulkan_advanced/vulkan_musl.zig");
+    addExecutable(b, dll_mod, target, optimize, "x11_window", "src/examples/x11_window.zig");
 
     // const check = b.addExecutable(.{
     //     .name = "DynLoader",
