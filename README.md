@@ -22,7 +22,7 @@ pub fn main() !void {
     const allocator = gpa.allocator();
     defer if (gpa.deinit() != .ok) @panic("Memory check failed");
 
-    try dll.init(.{ .debug = false });
+    try dll.init(.{});
     defer dll.deinit(allocator);
 
     const lib_c = try dll.load(allocator, "libc.so.6");
