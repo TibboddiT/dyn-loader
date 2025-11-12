@@ -42,13 +42,10 @@ fn addExecutable(b: *std.Build, check_step: *std.Build.Step, mod: *std.Build.Mod
         }),
         .use_llvm = true,
     });
-
     b.installArtifact(exe);
 
     const run_cmd = b.addRunArtifact(exe);
-
     run_cmd.step.dependOn(b.getInstallStep());
-
     if (b.args) |args| {
         run_cmd.addArgs(args);
     }
@@ -57,7 +54,6 @@ fn addExecutable(b: *std.Build, check_step: *std.Build.Step, mod: *std.Build.Mod
     run_step.dependOn(&run_cmd.step);
 
     const check_name = std.fmt.allocPrint(b.allocator, "check-{s}", .{name}) catch unreachable;
-
     const check = b.addExecutable(.{
         .name = check_name,
         .root_module = b.createModule(.{
