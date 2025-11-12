@@ -19,30 +19,17 @@ pub fn build(b: *std.Build) void {
 
     b.getInstallStep().dependOn(&resources_dir.step);
 
-    addExecutable(b, dll_mod, target, optimize, "printf", "src/examples/printf.zig");
-    addExecutable(b, dll_mod, target, optimize, "vulkan", "src/examples/vulkan.zig");
-    addExecutable(b, dll_mod, target, optimize, "vulkan_advanced", "src/examples/vulkan_advanced/vulkan.zig");
-    addExecutable(b, dll_mod, target, optimize, "vulkan_musl", "src/examples/vulkan_musl.zig");
-    addExecutable(b, dll_mod, target, optimize, "vulkan_advanced_musl", "src/examples/vulkan_advanced/vulkan_musl.zig");
-    addExecutable(b, dll_mod, target, optimize, "x11_window", "src/examples/x11_window.zig");
+    const check_step = b.step("check", "Check");
 
-    const check = b.addExecutable(.{
-        .name = "check",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/examples/printf.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{
-                .{ .name = "dll", .module = dll_mod },
-            },
-        }),
-    });
-
-    const check_step = b.step("check", "check");
-    check_step.dependOn(&check.step);
+    addExecutable(b, check_step, dll_mod, target, optimize, "printf", "src/examples/printf.zig");
+    addExecutable(b, check_step, dll_mod, target, optimize, "vulkan", "src/examples/vulkan.zig");
+    addExecutable(b, check_step, dll_mod, target, optimize, "vulkan_advanced", "src/examples/vulkan_advanced/vulkan.zig");
+    addExecutable(b, check_step, dll_mod, target, optimize, "vulkan_musl", "src/examples/vulkan_musl.zig");
+    addExecutable(b, check_step, dll_mod, target, optimize, "vulkan_advanced_musl", "src/examples/vulkan_advanced/vulkan_musl.zig");
+    addExecutable(b, check_step, dll_mod, target, optimize, "x11_window", "src/examples/x11_window.zig");
 }
 
-fn addExecutable(b: *std.Build, mod: *std.Build.Module, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, name: []const u8, root_source_file: []const u8) void {
+fn addExecutable(b: *std.Build, check_step: *std.Build.Step, mod: *std.Build.Module, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, name: []const u8, root_source_file: []const u8) void {
     const exe = b.addExecutable(.{
         .name = name,
         .root_module = b.createModule(.{
@@ -53,6 +40,7 @@ fn addExecutable(b: *std.Build, mod: *std.Build.Module, target: std.Build.Resolv
                 .{ .name = "dll", .module = mod },
             },
         }),
+        .use_llvm = true,
     });
 
     b.installArtifact(exe);
@@ -67,4 +55,20 @@ fn addExecutable(b: *std.Build, mod: *std.Build.Module, target: std.Build.Resolv
 
     const run_step = b.step(std.fmt.allocPrint(b.allocator, "run-{s}", .{name}) catch unreachable, "Run");
     run_step.dependOn(&run_cmd.step);
+
+    const check_name = std.fmt.allocPrint(b.allocator, "check-{s}", .{name}) catch unreachable;
+
+    const check = b.addExecutable(.{
+        .name = check_name,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path(root_source_file),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "dll", .module = mod },
+            },
+        }),
+    });
+
+    check_step.dependOn(&check.step);
 }
