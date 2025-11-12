@@ -911,30 +911,42 @@ var dyn_objects: DynObjectList = .empty;
 var dyn_objects_sorted_indices: std.ArrayList(usize) = .empty;
 
 const Logger = struct {
+    const Level = enum {
+        debug,
+        info,
+        warn,
+        err,
+        none,
+    };
+
     const inner_logger = std.log.scoped(.dynamic_library_loader);
-    var active = false;
+    var level: Level = .none;
 
     fn debug(comptime format: []const u8, args: anytype) void {
-        if (Logger.active) {
-            inner_logger.debug(format, args);
+        switch (level) {
+            .debug => inner_logger.debug(format, args),
+            else => {},
         }
     }
 
     fn info(comptime format: []const u8, args: anytype) void {
-        if (Logger.active) {
-            inner_logger.info(format, args);
+        switch (level) {
+            .debug, .info => inner_logger.info(format, args),
+            else => {},
         }
     }
 
     fn warn(comptime format: []const u8, args: anytype) void {
-        if (Logger.active) {
-            inner_logger.warn(format, args);
+        switch (level) {
+            .debug, .info, .warn => inner_logger.warn(format, args),
+            else => {},
         }
     }
 
     fn err(comptime format: []const u8, args: anytype) void {
-        if (Logger.active) {
-            inner_logger.err(format, args);
+        switch (level) {
+            .debug, .info, .warn, .err => inner_logger.err(format, args),
+            else => {},
         }
     }
 };
@@ -954,7 +966,7 @@ pub export var r_debug: RDebug = .{
 var initialized: bool = false;
 
 const InitOptions = struct {
-    debug: bool = false,
+    log_level: Logger.Level = .none,
 };
 
 // TODO thread safety
@@ -963,9 +975,7 @@ pub fn init(options: InitOptions) !void {
         return error.AlreadyInitialized;
     }
 
-    if (options.debug) {
-        Logger.active = true;
-    }
+    Logger.level = options.log_level;
 
     r_debug.r_brk = @intFromPtr(&_dl_debug_state);
 
@@ -1025,62 +1035,60 @@ pub fn deinit(allocator: std.mem.Allocator) void {
 }
 
 fn logSummary() void {
-    if (Logger.active) {
-        var buf: [16]u8 = undefined;
+    var buf: [16]u8 = undefined;
 
-        for (dyn_objects.values()) |*dyn_object| {
-            if (dyn_object.loaded) {
-                continue;
-            }
+    for (dyn_objects.values()) |*dyn_object| {
+        if (dyn_object.loaded) {
+            continue;
+        }
 
-            Logger.info("name: {s}", .{dyn_object.name});
-            Logger.info("  path: {s}", .{dyn_object.path});
-            Logger.info("  mapped_at: 0x{x}", .{dyn_object.mapped_at});
-            Logger.info("  segments:", .{});
-            Logger.info("    {d} segments loaded", .{dyn_object.segments.count()});
-            for (dyn_object.segments.values(), 1..) |segment, s| {
-                Logger.info("    - {d}:", .{s});
-                Logger.info("      file_offset: 0x{x}", .{segment.file_offset});
-                Logger.info("      file_size: 0x{x}", .{segment.file_size});
-                Logger.info("      mem_offset: 0x{x}", .{segment.mem_offset});
-                Logger.info("      mem_size: 0x{x}", .{segment.mem_size});
-                Logger.info("      mem_align: 0x{x}", .{segment.mem_align});
-                Logger.info("      loadedAt: 0x{x}", .{segment.loaded_at});
-                Logger.info("      flags_first: {s}", .{segment.flags_first.toStr(&buf) catch unreachable});
-                Logger.info("      flags_last: {s}", .{segment.flags_last.toStr(&buf) catch unreachable});
-            }
-            Logger.info("  tls_init_file_offset: 0x{x}", .{dyn_object.tls_init_file_offset});
-            Logger.info("  tls_init_file_size: 0x{x}", .{dyn_object.tls_init_file_size});
-            Logger.info("  tls_init_mem_offset: 0x{x}", .{dyn_object.tls_init_mem_offset});
-            Logger.info("  tls_init_mem_size: 0x{x}", .{dyn_object.tls_init_mem_size});
-            Logger.info("  init/fini:", .{});
-            Logger.info("    init_addr: 0x{x}", .{dyn_object.init_addr});
-            Logger.info("    fini_addr: 0x{x}", .{dyn_object.fini_addr});
-            Logger.info("    init_array_addr: 0x{x}, size: 0x{x}", .{ dyn_object.init_array_addr, dyn_object.init_array_size });
-            Logger.info("    fini_array_addr: 0x{x}, size: 0x{x}", .{ dyn_object.fini_array_addr, dyn_object.fini_array_size });
-            Logger.info("  symbols:", .{});
-            Logger.info("    {d} / {d} symbols", .{ dyn_object.syms.count(), dyn_object.syms_array.items.len });
-            for (dyn_object.syms_array.items, 0..) |sym, s| {
-                Logger.debug("    - index: {d}:", .{s});
-                Logger.debug("      name: {s}", .{sym.name});
-                Logger.debug("      version: {s}", .{sym.version});
-                Logger.debug("      hidden: {}", .{sym.hidden});
-                Logger.debug("      offset: 0x{x}", .{sym.offset});
-                Logger.debug("      type: {s}", .{@tagName(sym.type)});
-                Logger.debug("      bind: {s}", .{@tagName(sym.bind)});
-                Logger.debug("      shidx: {s}", .{sym.shidx.nameOrValue(&buf) catch unreachable});
-                Logger.debug("      value: 0x{x}", .{sym.value});
-                Logger.debug("      size: 0x{x}", .{sym.size});
-            }
-            Logger.info("  relocs:", .{});
-            Logger.info("    {d} relocs", .{dyn_object.relocs.items.len});
-            for (dyn_object.relocs.items, 1..) |reloc, s| {
-                Logger.debug("    - {d}:", .{s});
-                Logger.debug("      type: {s}", .{@tagName(reloc.type)});
-                Logger.debug("      sym_idx: 0x{x}", .{reloc.sym_idx});
-                Logger.debug("      offset: 0x{x}", .{reloc.offset});
-                Logger.debug("      addend: 0x{x}", .{reloc.addend});
-            }
+        Logger.info("name: {s}", .{dyn_object.name});
+        Logger.info("  path: {s}", .{dyn_object.path});
+        Logger.info("  mapped_at: 0x{x}", .{dyn_object.mapped_at});
+        Logger.info("  segments:", .{});
+        Logger.info("    {d} segments loaded", .{dyn_object.segments.count()});
+        for (dyn_object.segments.values(), 1..) |segment, s| {
+            Logger.info("    - {d}:", .{s});
+            Logger.info("      file_offset: 0x{x}", .{segment.file_offset});
+            Logger.info("      file_size: 0x{x}", .{segment.file_size});
+            Logger.info("      mem_offset: 0x{x}", .{segment.mem_offset});
+            Logger.info("      mem_size: 0x{x}", .{segment.mem_size});
+            Logger.info("      mem_align: 0x{x}", .{segment.mem_align});
+            Logger.info("      loadedAt: 0x{x}", .{segment.loaded_at});
+            Logger.info("      flags_first: {s}", .{segment.flags_first.toStr(&buf) catch unreachable});
+            Logger.info("      flags_last: {s}", .{segment.flags_last.toStr(&buf) catch unreachable});
+        }
+        Logger.info("  tls_init_file_offset: 0x{x}", .{dyn_object.tls_init_file_offset});
+        Logger.info("  tls_init_file_size: 0x{x}", .{dyn_object.tls_init_file_size});
+        Logger.info("  tls_init_mem_offset: 0x{x}", .{dyn_object.tls_init_mem_offset});
+        Logger.info("  tls_init_mem_size: 0x{x}", .{dyn_object.tls_init_mem_size});
+        Logger.info("  init/fini:", .{});
+        Logger.info("    init_addr: 0x{x}", .{dyn_object.init_addr});
+        Logger.info("    fini_addr: 0x{x}", .{dyn_object.fini_addr});
+        Logger.info("    init_array_addr: 0x{x}, size: 0x{x}", .{ dyn_object.init_array_addr, dyn_object.init_array_size });
+        Logger.info("    fini_array_addr: 0x{x}, size: 0x{x}", .{ dyn_object.fini_array_addr, dyn_object.fini_array_size });
+        Logger.info("  symbols:", .{});
+        Logger.info("    {d} / {d} symbols", .{ dyn_object.syms.count(), dyn_object.syms_array.items.len });
+        for (dyn_object.syms_array.items, 0..) |sym, s| {
+            Logger.debug("    - index: {d}:", .{s});
+            Logger.debug("      name: {s}", .{sym.name});
+            Logger.debug("      version: {s}", .{sym.version});
+            Logger.debug("      hidden: {}", .{sym.hidden});
+            Logger.debug("      offset: 0x{x}", .{sym.offset});
+            Logger.debug("      type: {s}", .{@tagName(sym.type)});
+            Logger.debug("      bind: {s}", .{@tagName(sym.bind)});
+            Logger.debug("      shidx: {s}", .{sym.shidx.nameOrValue(&buf) catch unreachable});
+            Logger.debug("      value: 0x{x}", .{sym.value});
+            Logger.debug("      size: 0x{x}", .{sym.size});
+        }
+        Logger.info("  relocs:", .{});
+        Logger.info("    {d} relocs", .{dyn_object.relocs.items.len});
+        for (dyn_object.relocs.items, 1..) |reloc, s| {
+            Logger.debug("    - {d}:", .{s});
+            Logger.debug("      type: {s}", .{@tagName(reloc.type)});
+            Logger.debug("      sym_idx: 0x{x}", .{reloc.sym_idx});
+            Logger.debug("      offset: 0x{x}", .{reloc.offset});
+            Logger.debug("      addend: 0x{x}", .{reloc.addend});
         }
     }
 }
@@ -2141,9 +2149,11 @@ fn computeTcbOffset(dyn_object: *DynObject) void {
     var new_area_size: usize = 0;
     new_area_size += dyn_object.tls_init_mem_size;
     new_area_size = if (new_area_size > 0) std.mem.alignForward(usize, new_area_size, dyn_object.tls_align) else new_area_size;
+    new_area_size = if (new_area_size > 0) std.mem.alignForward(usize, new_area_size, current_tls_area_desc.alignment) else new_area_size;
     new_area_size += current_tls_area_desc.block.size;
     new_area_size = if (new_area_size > 0) std.mem.alignForward(usize, new_area_size, current_tls_area_desc.alignment) else new_area_size;
     const new_abi_tcb_offset = new_area_size;
+
     dyn_object.tls_offset = new_abi_tcb_offset;
 }
 
@@ -2155,14 +2165,13 @@ var initial_tls_init_block: []const u8 = undefined;
 fn mapTlsBlock(allocator: std.mem.Allocator, dyn_object: *DynObject) !void {
     Logger.debug("mapping tls block of library {s}", .{dyn_object.name});
 
-    // const mapped_bytes: []const u8 = @as([*]u8, @ptrFromInt(dyn_object.loaded_at.?))[0..dyn_object.loaded_size];
-
     const current_tls_area_desc = std.os.linux.tls.area_desc;
 
     var new_area_size: usize = 0;
     const new_block_offset: usize = 0;
     new_area_size += dyn_object.tls_init_mem_size;
     new_area_size = if (new_area_size > 0) std.mem.alignForward(usize, new_area_size, dyn_object.tls_align) else new_area_size;
+    new_area_size = if (new_area_size > 0) std.mem.alignForward(usize, new_area_size, current_tls_area_desc.alignment) else new_area_size;
     const prev_block_offset = new_area_size;
     new_area_size += current_tls_area_desc.block.size;
     new_area_size = if (new_area_size > 0) std.mem.alignForward(usize, new_area_size, current_tls_area_desc.alignment) else new_area_size;
@@ -2175,6 +2184,7 @@ fn mapTlsBlock(allocator: std.mem.Allocator, dyn_object: *DynObject) !void {
 
     std.debug.assert(new_abi_tcb_offset == dyn_object.tls_offset);
     std.debug.assert(current_tls_area_desc.abi_tcb.offset - current_tls_area_desc.block.offset == new_abi_tcb_offset - prev_block_offset);
+    std.debug.assert(prev_block_offset % current_tls_area_desc.alignment == 0);
 
     Logger.debug("TLS: ({s}) tdata size: 0x{x}", .{ dyn_object.name, dyn_object.tls_init_file_size });
     Logger.debug("TLS: ({s}) tbss size: 0x{x}", .{ dyn_object.name, dyn_object.tls_init_mem_size - dyn_object.tls_init_file_size });
@@ -2208,13 +2218,15 @@ fn mapTlsBlock(allocator: std.mem.Allocator, dyn_object: *DynObject) !void {
     const e_get_fs = std.os.linux.syscall2(.arch_prctl, std.os.linux.ARCH.GET_FS, @intFromPtr(&old_tp));
     std.debug.assert(e_get_fs == 0);
 
+    Logger.debug("TLS: old_tp: 0x{x}", .{old_tp});
+
     if (current_tls_area_desc.block.size > 0) {
         Logger.debug("TLS: copying previous area block data: from 0x{x} to 0x{x} (size: 0x{x})", .{
             prev_block_offset,
             prev_block_offset + current_tls_area_desc.block.size,
             current_tls_area_desc.block.size,
         });
-        @memcpy(new_area[prev_block_offset .. prev_block_offset + current_tls_area_desc.block.size], @as([*]u8, @ptrFromInt(old_tp - current_tls_area_desc.block.size)));
+        @memcpy(new_area[prev_block_offset .. prev_block_offset + current_tls_area_desc.block.size], @as([*]u8, @ptrFromInt(old_tp - (new_abi_tcb_offset - prev_block_offset))));
     }
 
     if (current_tls_area_desc.gdt_entry_number != @as(usize, @bitCast(@as(isize, -1)))) {

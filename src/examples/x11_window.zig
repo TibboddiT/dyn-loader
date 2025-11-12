@@ -3,6 +3,13 @@ const builtin = @import("builtin");
 
 const dll = @import("dll");
 
+// pub const std_options: std.Options = .{
+//     .log_scope_levels = &.{.{
+//         .scope = .dynamic_library_loader,
+//         .level = .debug,
+//     }},
+// };
+
 pub const debug = struct {
     pub const SelfInfo = dll.CustomSelfInfo;
 };
@@ -33,13 +40,12 @@ pub fn main() !void {
     defer threaded.deinit();
     const io = threaded.io();
 
-    try dll.init(.{ .debug = builtin.mode == .Debug });
+    try dll.init(.{});
     defer dll.deinit(allocator);
 
     std.log.info("Loading 'libX11.so.6'...", .{});
 
     const lib_x11 = try dll.load(allocator, "libX11.so.6");
-    // _ = lib_x11;
 
     const xOpenDisplay: *Xlib.XOpenDisplay = @ptrFromInt((try lib_x11.getSymbol("XOpenDisplay")).addr);
     const xDefaultScreen: *Xlib.XDefaultScreen = @ptrFromInt((try lib_x11.getSymbol("XDefaultScreen")).addr);

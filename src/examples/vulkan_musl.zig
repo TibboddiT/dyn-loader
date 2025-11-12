@@ -3,6 +3,13 @@ const builtin = @import("builtin");
 
 const dll = @import("dll");
 
+// pub const std_options: std.Options = .{
+//     .log_scope_levels = &.{.{
+//         .scope = .dynamic_library_loader,
+//         .level = .debug,
+//     }},
+// };
+
 pub const debug = struct {
     pub const SelfInfo = dll.CustomSelfInfo;
 };
@@ -12,7 +19,7 @@ pub fn main() !void {
     const allocator = gpa.allocator();
     defer if (gpa.deinit() != .ok) @panic("Memory check failed");
 
-    try dll.init(.{ .debug = builtin.mode == .Debug });
+    try dll.init(.{});
     defer dll.deinit(allocator);
 
     var cwd_buf: [1024]u8 = undefined;
