@@ -2934,17 +2934,6 @@ fn callInitFunctions(dyn_obj: *DynObject) !void {
 fn getSubstituteAddress(sym: ResolvedSymbol) ?usize {
     var addr: ?usize = null;
 
-    // TODO
-    // - void *(*dlopen) (const char *file, int mode, void *dl_caller);
-    // - int (*dlclose) (void *handle);
-    // - void *(*dlsym) (void *handle, const char *name, void *dl_caller);
-    // - char *(*dlerror) (void);
-    // - int (*dladdr) (const void *address, Dl_info *info);
-    // - void *(*dlvsym) (void *handle, const char *name, const char *version, void *dl_caller);
-    // - int (*dladdr1) (const void *address, Dl_info *info, void **extra_info, int flags);
-    // - int (*dlinfo) (void *handle, int request, void *arg);
-    // - void *(*dlmopen) (Lmid_t nsid, const char *file, int mode, void *dl_caller);
-
     if (std.mem.eql(u8, sym.name, "dlopen")) {
         addr = @intFromPtr(&dlopenSubstitute);
     } else if (std.mem.eql(u8, sym.name, "dlclose")) {

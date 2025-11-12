@@ -1,5 +1,5 @@
 .{
-    .name = .DynLoader,
+    .name = .dynamic_library_loader,
     .version = "0.0.0",
     .dependencies = .{},
     .paths = .{
@@ -8,5 +8,5 @@
         "src",
         "resources",
     },
-    .fingerprint = 0x4dcad45191d0dac,
+    .fingerprint = 0xa78f1b5f7c564109,
 }
