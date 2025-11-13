@@ -19,8 +19,8 @@ pub fn main() !void {
     const allocator = gpa.allocator();
     defer if (gpa.deinit() != .ok) @panic("Memory check failed");
 
-    try dll.init(.{});
-    defer dll.deinit(allocator);
+    try dll.init(.{ .allocator = allocator });
+    defer dll.deinit();
 
     var cwd_buf: [1024]u8 = undefined;
     const cwd = try std.fs.selfExeDirPath(&cwd_buf);
@@ -31,13 +31,13 @@ pub fn main() !void {
 
     std.log.info("Loading '{s}'...", .{lib_c_path});
 
-    const lib_c = try dll.load(allocator, lib_c_path);
+    const lib_c = try dll.load(lib_c_path);
 
     const lib_vulkan_path = try std.fmt.bufPrint(&lib_path, "{s}/{s}", .{ cwd, "resources/musl/libvulkan.so.1" });
 
     std.log.info("Loading '{s}'...", .{lib_vulkan_path});
 
-    const lib_vulkan = try dll.load(allocator, lib_vulkan_path);
+    const lib_vulkan = try dll.load(lib_vulkan_path);
 
     std.log.info("Testing libc printf...", .{});
 

@@ -19,12 +19,12 @@ pub fn main() !void {
     const allocator = gpa.allocator();
     defer if (gpa.deinit() != .ok) @panic("Memory check failed");
 
-    try dll.init(.{});
-    defer dll.deinit(allocator);
+    try dll.init(.{ .allocator = allocator });
+    defer dll.deinit();
 
     std.log.info("Loading 'libc.so.6'...", .{});
 
-    const lib_c = try dll.load(allocator, "libc.so.6");
+    const lib_c = try dll.load("libc.so.6");
 
     std.log.info("Testing libc printf...", .{});
 

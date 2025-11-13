@@ -22,10 +22,10 @@ pub fn main() !void {
     const allocator = gpa.allocator();
     defer if (gpa.deinit() != .ok) @panic("Memory check failed");
 
-    try dll.init(.{});
-    defer dll.deinit(allocator);
+    try dll.init(.{ .allocator = allocator });
+    defer dll.deinit();
 
-    const lib_c = try dll.load(allocator, "libc.so.6");
+    const lib_c = try dll.load("libc.so.6");
 
     const printf_sym = try lib_c.getSymbol("printf");
     const printf_addr = printf_sym.addr;

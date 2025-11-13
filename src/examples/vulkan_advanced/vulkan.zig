@@ -38,12 +38,12 @@ pub fn main() !void {
     const allocator = gpa.allocator();
     defer if (gpa.deinit() != .ok) @panic("Memory check failed");
 
-    try dll.init(.{});
-    defer dll.deinit(allocator);
+    try dll.init(.{ .allocator = allocator });
+    defer dll.deinit();
 
     std.log.info("Loading 'libvulkan.so.1'...", .{});
 
-    const lib_vulkan = try dll.load(allocator, "libvulkan.so.1");
+    const lib_vulkan = try dll.load("libvulkan.so.1");
 
     VulkanProcResolver.lib_vulkan = lib_vulkan;
 

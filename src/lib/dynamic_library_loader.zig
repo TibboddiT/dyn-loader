@@ -899,13 +899,11 @@ pub const DynamicLibrary = struct {
         };
     }
 
-    // pub fn unload(lib: DynamicLibrary, allocator: std.mem.Allocator) void {
+    // pub fn unload(lib: DynamicLibrary, ) void {
     //     const dyn_obj = &dyn_objects.values()[lib.index];
     //     unloadDso(dyn_obj, allocator);
     // }
 };
-
-const stack_memory_size = 16 * 1024 * 1024;
 
 var dyn_objects: DynObjectList = .empty;
 var dyn_objects_sorted_indices: std.ArrayList(usize) = .empty;
@@ -964,8 +962,10 @@ pub export var r_debug: RDebug = .{
 };
 
 var initialized: bool = false;
+var allocator: std.mem.Allocator = undefined;
 
 const InitOptions = struct {
+    allocator: std.mem.Allocator,
     log_level: Logger.Level = .warn,
 };
 
@@ -975,6 +975,7 @@ pub fn init(options: InitOptions) !void {
         return error.AlreadyInitialized;
     }
 
+    allocator = options.allocator;
     Logger.level = options.log_level;
 
     r_debug.r_brk = @intFromPtr(&_dl_debug_state);
@@ -989,7 +990,7 @@ pub fn init(options: InitOptions) !void {
 }
 
 // TODO thread safety
-pub fn deinit(allocator: std.mem.Allocator) void {
+pub fn deinit() void {
     for (dyn_objects.values()) |*dyn_object| {
         for (dyn_object.syms_array.items) |*sym| {
             allocator.free(sym.name);
@@ -1008,8 +1009,8 @@ pub fn deinit(allocator: std.mem.Allocator) void {
 
         if (!dyn_object.name_is_key) {
             allocator.free(dyn_object.name);
+            allocator.free(dyn_object.path);
         }
-        allocator.free(dyn_object.path);
     }
 
     for (dyn_objects.keys()) |k| {
@@ -1093,7 +1094,7 @@ fn logSummary() void {
 
 // TODO thread safety
 // TODO handle errors gracefully
-pub fn load(allocator: std.mem.Allocator, f_path: []const u8) !DynamicLibrary {
+pub fn load(f_path: []const u8) !DynamicLibrary {
     if (!initialized) {
         return error.Unitialized;
     }
@@ -1103,7 +1104,7 @@ pub fn load(allocator: std.mem.Allocator, f_path: []const u8) !DynamicLibrary {
     // - rpath
     // - LD_* env vars
 
-    const lib = try loadRecursive(allocator, f_path);
+    const lib = try loadDepTree(f_path);
 
     logSummary();
 
@@ -1116,9 +1117,9 @@ pub fn load(allocator: std.mem.Allocator, f_path: []const u8) !DynamicLibrary {
 
         computeTcbOffset(dyn_obj);
         try processRelocations(dyn_obj);
-        try mapTlsBlock(allocator, dyn_obj);
+        try mapTlsBlock(dyn_obj);
         _dl_debug_state();
-        try processIRelativeRelocations(allocator, dyn_obj);
+        try processIRelativeRelocations(dyn_obj);
     }
 
     for (dyn_objects_sorted_indices.items) |idx| {
@@ -1159,52 +1160,61 @@ pub fn load(allocator: std.mem.Allocator, f_path: []const u8) !DynamicLibrary {
     return lib;
 }
 
-// TODO very inefficient
-fn loadRecursive(allocator: std.mem.Allocator, o_path: []const u8) !DynamicLibrary {
-    var deferred_load = false;
+// TODO inefficient strategy
+fn loadDepTree(o_path: []const u8) !DynamicLibrary {
+    Logger.debug("dep tree: checking {s}", .{o_path});
 
-    loadDso(allocator, o_path) catch |err| switch (err) {
+    const lib: DynamicLibrary = .{
+        .index = dyn_objects.count(),
+    };
+
+    loadDso(o_path) catch |err| switch (err) {
         error.UnloadedDependency => {
-            deferred_load = true;
+            Logger.debug("dep tree: {s} has unloaded dependencies", .{o_path});
         },
         else => |e| return e,
     };
 
-    var hasUnloaded = true;
-    while (hasUnloaded) {
-        hasUnloaded = false;
+    var has_unloaded = true;
+    while (has_unloaded) {
+        has_unloaded = false;
 
-        var it = dyn_objects.iterator();
-        while (it.next()) |entry| {
-            const dyn_object = entry.value_ptr;
+        const do_count = dyn_objects.count();
 
-            if (dyn_object.mapped_at != 0) {
-                continue;
+        for (0..do_count) |idx| {
+            const dyn_object_idx = do_count - 1 - idx;
+            const dyn_object_name = dyn_objects.values()[dyn_object_idx].name;
+
+            {
+                const dyn_object = &dyn_objects.values()[dyn_object_idx];
+
+                Logger.debug("dep tree: {d}: checking {s}", .{ dyn_object_idx, dyn_object.name });
+
+                if (dyn_object.mapped_at != 0) {
+                    Logger.debug("dep tree: {s} is mapped", .{dyn_object.name});
+                    continue;
+                }
             }
 
-            hasUnloaded = true;
-            const name = dyn_object.name;
+            has_unloaded = true;
 
-            loadDso(allocator, name) catch |err| switch (err) {
-                error.UnloadedDependency => continue,
+            loadDso(dyn_object_name) catch |err| switch (err) {
+                error.UnloadedDependency => {
+                    Logger.debug("dep tree: {s} has unloaded dependencies", .{dyn_object_name});
+                    break;
+                },
                 else => |e| return e,
             };
 
-            break;
+            Logger.debug("dep tree: {s} has been mapped", .{dyn_object_name});
         }
     }
 
-    if (deferred_load) {
-        try loadDso(allocator, o_path);
-    }
-
-    return .{
-        .index = dyn_objects.count() - 1,
-    };
+    return lib;
 }
 
 // TODO mimic path resolution of linux-ld better
-fn resolvePath(allocator: std.mem.Allocator, r_path: []const u8) ![]const u8 {
+fn resolvePath(r_path: []const u8) ![]const u8 {
     const lib_dirs = [_][]const u8{
         "/usr/local/lib/x86_64-linux-gnu",
         "/lib/x86_64-linux-gnu",
@@ -1243,8 +1253,8 @@ fn resolvePath(allocator: std.mem.Allocator, r_path: []const u8) ![]const u8 {
     return path orelse error.LibraryNotFound;
 }
 
-fn loadDso(allocator: std.mem.Allocator, o_path: []const u8) !void {
-    const path: []const u8 = if (std.mem.startsWith(u8, o_path, "/")) try allocator.dupe(u8, o_path) else try resolvePath(allocator, o_path);
+fn loadDso(o_path: []const u8) !void {
+    const path: []const u8 = if (std.mem.startsWith(u8, o_path, "/")) try allocator.dupe(u8, o_path) else try resolvePath(o_path);
     defer allocator.free(path);
 
     Logger.debug("loading: {s} [{s}]", .{ o_path, path });
@@ -1268,8 +1278,44 @@ fn loadDso(allocator: std.mem.Allocator, o_path: []const u8) !void {
     const dyn_object_name = try allocator.dupe(u8, std.fs.path.basename(path));
     errdefer allocator.free(dyn_object_name);
 
-    // TODO check how many new dyn_object will be needed
-    try dyn_objects.ensureUnusedCapacity(allocator, 10);
+    if (!dyn_objects.contains(dyn_object_name)) {
+        const key = try std.fmt.allocPrint(allocator, "{s}", .{dyn_object_name});
+        try dyn_objects.putNoClobber(allocator, key, .{
+            .name_is_key = true,
+            .name = key,
+            .path = key,
+            .file_handle = -1,
+            .mapped_at = 0,
+            .mapped_size = 0,
+            .segments = .empty,
+            .tls_init_file_offset = 0,
+            .tls_init_file_size = 0,
+            .tls_init_mem_offset = 0,
+            .tls_init_mem_size = 0,
+            .tls_align = 0,
+            .tls_offset = 0,
+            .tls_mapped_at = 0,
+            .eh = undefined,
+            .eh_init_file_offset = 0,
+            .eh_init_file_size = 0,
+            .eh_init_mem_offset = 0,
+            .eh_init_mem_size = 0,
+            .eh_align = 0,
+            .syms = .empty,
+            .syms_array = .empty,
+            .relocs = .empty,
+            .dependencies = .empty,
+            .init_addr = 0,
+            .fini_addr = 0,
+            .init_array_addr = 0,
+            .init_array_size = 0,
+            .fini_array_addr = 0,
+            .fini_array_size = 0,
+            .loaded = false,
+            .loaded_at = null,
+            .loaded_size = 0,
+        });
+    }
 
     const eh: *std.elf.Elf64_Ehdr = @ptrCast(file_bytes);
     if (!std.mem.eql(u8, eh.e_ident[0..4], std.elf.MAGIC)) return error.NotAnElfFile;
@@ -1683,10 +1729,10 @@ fn loadDso(allocator: std.mem.Allocator, o_path: []const u8) !void {
 
                     if (!dyn_objects.contains(libName[0..libNameLen])) {
                         const key = try std.fmt.allocPrint(allocator, "{s}", .{libName[0..libNameLen]});
-                        dyn_objects.putAssumeCapacityNoClobber(key, .{
+                        try dyn_objects.putNoClobber(allocator, key, .{
                             .name_is_key = true,
                             .name = key,
-                            .path = undefined,
+                            .path = key,
                             .file_handle = -1,
                             .mapped_at = 0,
                             .mapped_size = 0,
@@ -1718,7 +1764,6 @@ fn loadDso(allocator: std.mem.Allocator, o_path: []const u8) !void {
                             .loaded_at = null,
                             .loaded_size = 0,
                         });
-
                         Logger.debug("        => {s} loading deferred", .{dyn_object_name});
                         return error.UnloadedDependency;
                     } else {
@@ -2024,7 +2069,7 @@ fn mapSegments(dyn_object: *DynObject, file_bytes: []const u8) !void {
         segment.loaded_at = base_addr + segment.mem_offset;
         segment.mapped_from_file = true;
 
-        Logger.debug("  segment {d}: mapping: aligned foff: 0x{x}, from 0x{x} to 0x{x}, size: 0x{x}", .{ s, aligned_file_offset, @as(usize, @intFromPtr(aligned_ptr)), aligned_end, aligned_size });
+        Logger.debug("  segment {d}: mapping: foff: 0x{x}, aligned foff: 0x{x}, from 0x{x} to 0x{x}, size: 0x{x}", .{ s, segment.file_offset, aligned_file_offset, @as(usize, @intFromPtr(aligned_ptr)), aligned_end, aligned_size });
         Logger.debug("  segment {d}: data: from 0x{x} to 0x{x}, size: 0x{x}", .{ s, segment.loaded_at, segment.loaded_at + segment.mem_size, segment.mem_size });
 
         _ = try std.posix.mmap(
@@ -2048,10 +2093,12 @@ fn mapSegments(dyn_object: *DynObject, file_bytes: []const u8) !void {
                 segment.loaded_at + segment.mem_size,
             });
 
-            const zero_start = std.mem.alignForward(usize, segment.loaded_at + segment.file_size, segment.mem_align);
+            const zero_start = std.mem.alignForward(usize, segment.loaded_at + segment.file_size, std.heap.pageSize());
             const zero_ptr: [*]align(std.heap.pageSize()) u8 = @ptrFromInt(zero_start);
-            const zero_end: usize = std.mem.alignForward(usize, segment.loaded_at + segment.mem_size, segment.mem_align);
-            const zero_size = zero_end - @intFromPtr(zero_ptr);
+            const zero_end: usize = std.mem.alignForward(usize, segment.loaded_at + segment.mem_size, std.heap.pageSize());
+            const zero_size = zero_end - zero_start;
+
+            std.debug.assert(zero_end <= base_addr + total_mem_size);
 
             if (zero_start > segment.loaded_at + segment.file_size) {
                 const zero_sub_size = zero_start - (segment.loaded_at + segment.file_size);
@@ -2160,7 +2207,7 @@ var initial_tls_init_mem_size: usize = undefined;
 var initial_tls_offset: usize = undefined;
 var initial_tls_init_block: []const u8 = undefined;
 
-fn mapTlsBlock(allocator: std.mem.Allocator, dyn_object: *DynObject) !void {
+fn mapTlsBlock(dyn_object: *DynObject) !void {
     Logger.debug("mapping tls block of library {s}", .{dyn_object.name});
 
     const current_tls_area_desc = std.os.linux.tls.area_desc;
@@ -2474,7 +2521,7 @@ fn processRelocations(dyn_object: *DynObject) !void {
     Logger.debug("processed relocations {d} for {s}", .{ reloc_count, dyn_object.name });
 }
 
-fn processIRelativeRelocations(allocator: std.mem.Allocator, dyn_object: *DynObject) !void {
+fn processIRelativeRelocations(dyn_object: *DynObject) !void {
     Logger.debug("processing IRELATIVE relocations for {s}", .{dyn_object.name});
 
     var reloc_count: usize = 0;
@@ -2961,7 +3008,32 @@ fn getSubstituteAddress(sym: ResolvedSymbol) ?usize {
     return addr;
 }
 
+var extra_bytes: std.ArrayList([]const u8) = .empty;
+var last_dl_error: ?[:0]const u8 = null;
+
 fn dlopenSubstitute(path: ?[*:0]const u8, flags: c_int) callconv(.c) ?*anyopaque {
+    // if (path == null) {
+    //     return null;
+    // }
+
+    // Logger.info("dlopen(\"{s}\", 0x{x})", .{ path.?, flags });
+
+    // const owned_path = allocator.dupe(u8, std.mem.span(path.?)) catch @panic("OOM");
+    // extra_bytes.append(allocator, owned_path) catch @panic("OOM");
+
+    // const lib = load(owned_path) catch |err| {
+    //     if (last_dl_error != null) {
+    //         allocator.free(last_dl_error.?);
+    //     }
+    //     last_dl_error = std.fmt.allocPrintSentinel(allocator, "unable to load library {s}:  {}", .{ owned_path, err }, 0) catch @panic("OOM");
+
+    //     Logger.err("dlopen(\"{s}\", 0x{x}) failed: {}", .{ owned_path, flags, err });
+
+    //     return null;
+    // };
+
+    // return @ptrFromInt(lib.index + 1);
+
     // TODO real implementation
     Logger.warn("unimplemented: dlopen(\"{s}\", 0x{x})", .{ path orelse "NULL", flags });
     return null;

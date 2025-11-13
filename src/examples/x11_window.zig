@@ -41,12 +41,12 @@ pub fn main() !void {
     defer threaded.deinit();
     const io = threaded.io();
 
-    try dll.init(.{});
-    defer dll.deinit(allocator);
+    try dll.init(.{ .allocator = allocator });
+    defer dll.deinit();
 
     std.log.info("Loading 'libX11.so.6'...", .{});
 
-    const lib_x11 = try dll.load(allocator, "libX11.so.6");
+    const lib_x11 = try dll.load("libX11.so.6");
 
     std.log.info("Testing X11...", .{});
 
