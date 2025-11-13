@@ -880,6 +880,44 @@ const DynObject = struct {
     loaded: bool,
     loaded_at: ?usize,
     loaded_size: usize,
+
+    fn init(key: []const u8) DynObject {
+        return .{
+            .name_is_key = true,
+            .name = key,
+            .path = key,
+            .file_handle = -1,
+            .mapped_at = 0,
+            .mapped_size = 0,
+            .segments = .empty,
+            .tls_init_file_offset = 0,
+            .tls_init_file_size = 0,
+            .tls_init_mem_offset = 0,
+            .tls_init_mem_size = 0,
+            .tls_align = 0,
+            .tls_offset = 0,
+            .tls_mapped_at = 0,
+            .eh = undefined,
+            .eh_init_file_offset = 0,
+            .eh_init_file_size = 0,
+            .eh_init_mem_offset = 0,
+            .eh_init_mem_size = 0,
+            .eh_align = 0,
+            .syms = .empty,
+            .syms_array = .empty,
+            .relocs = .empty,
+            .dependencies = .empty,
+            .init_addr = 0,
+            .fini_addr = 0,
+            .init_array_addr = 0,
+            .init_array_size = 0,
+            .fini_array_addr = 0,
+            .fini_array_size = 0,
+            .loaded = false,
+            .loaded_at = null,
+            .loaded_size = 0,
+        };
+    }
 };
 
 const DynObjectList = std.StringArrayHashMapUnmanaged(DynObject);
@@ -1026,6 +1064,15 @@ pub fn deinit() void {
     const current_tls_area_desc = std.os.linux.tls.area_desc;
     if (current_tls_area_desc.gdt_entry_number != @as(usize, @bitCast(@as(isize, -1)))) {
         allocator.free(current_tls_area_desc.block.init);
+    }
+
+    for (extra_bytes.items) |e| {
+        allocator.free(e);
+    }
+    extra_bytes.deinit(allocator);
+
+    if (last_dl_error) |dle| {
+        allocator.free(dle);
     }
 
     CustomSelfInfo.clearExtraElfs(allocator);
@@ -1181,8 +1228,7 @@ fn loadDepTree(o_path: []const u8) !DynamicLibrary {
 
         const do_count = dyn_objects.count();
 
-        for (0..do_count) |idx| {
-            const dyn_object_idx = do_count - 1 - idx;
+        for (0..do_count) |dyn_object_idx| {
             const dyn_object_name = dyn_objects.values()[dyn_object_idx].name;
 
             {
@@ -1201,7 +1247,7 @@ fn loadDepTree(o_path: []const u8) !DynamicLibrary {
             loadDso(dyn_object_name) catch |err| switch (err) {
                 error.UnloadedDependency => {
                     Logger.debug("dep tree: {s} has unloaded dependencies", .{dyn_object_name});
-                    break;
+                    continue;
                 },
                 else => |e| return e,
             };
@@ -1280,41 +1326,7 @@ fn loadDso(o_path: []const u8) !void {
 
     if (!dyn_objects.contains(dyn_object_name)) {
         const key = try std.fmt.allocPrint(allocator, "{s}", .{dyn_object_name});
-        try dyn_objects.putNoClobber(allocator, key, .{
-            .name_is_key = true,
-            .name = key,
-            .path = key,
-            .file_handle = -1,
-            .mapped_at = 0,
-            .mapped_size = 0,
-            .segments = .empty,
-            .tls_init_file_offset = 0,
-            .tls_init_file_size = 0,
-            .tls_init_mem_offset = 0,
-            .tls_init_mem_size = 0,
-            .tls_align = 0,
-            .tls_offset = 0,
-            .tls_mapped_at = 0,
-            .eh = undefined,
-            .eh_init_file_offset = 0,
-            .eh_init_file_size = 0,
-            .eh_init_mem_offset = 0,
-            .eh_init_mem_size = 0,
-            .eh_align = 0,
-            .syms = .empty,
-            .syms_array = .empty,
-            .relocs = .empty,
-            .dependencies = .empty,
-            .init_addr = 0,
-            .fini_addr = 0,
-            .init_array_addr = 0,
-            .init_array_size = 0,
-            .fini_array_addr = 0,
-            .fini_array_size = 0,
-            .loaded = false,
-            .loaded_at = null,
-            .loaded_size = 0,
-        });
+        try dyn_objects.putNoClobber(allocator, key, .init(key));
     }
 
     const eh: *std.elf.Elf64_Ehdr = @ptrCast(file_bytes);
@@ -1338,6 +1350,15 @@ fn loadDso(o_path: []const u8) !void {
 
     var dyn_symtab_addr: usize = undefined;
     var dyn_symtab_size: usize = undefined;
+
+    var segments: LoadSegmentList = .empty;
+    var dependencies: std.ArrayList(usize) = .empty;
+    var relocs: RelocList = .empty;
+    errdefer {
+        relocs.deinit(allocator);
+        dependencies.deinit(allocator);
+        segments.deinit(allocator);
+    }
 
     Logger.debug("sections headers:", .{});
 
@@ -1428,6 +1449,57 @@ fn loadDso(o_path: []const u8) !void {
                     Logger.debug("    == TODO: {t}: {s}", .{ t, name });
                 },
             }
+        }
+    }
+
+    var ph_addr: usize = file_addr + eh.e_phoff;
+
+    i = 0;
+    while (i < eh.e_phnum) : ({
+        i += 1;
+        ph_addr += eh.e_phentsize;
+    }) {
+        const ph: *std.elf.Phdr = @ptrFromInt(ph_addr);
+
+        const dyn_addr: usize = file_addr + ph.p_offset;
+        const dyns: [*]std.elf.Dyn = @ptrFromInt(dyn_addr);
+
+        var libName: [*:0]u8 = undefined;
+
+        if (@as(PT, @enumFromInt(ph.p_type)) == .PT_DYNAMIC) {
+            var has_unloaded_deps = false;
+            var j: usize = 0;
+            while (dyns[j].d_tag != 0) : (j += 1) {
+                if (dyns[j].d_tag == @intFromEnum(@as(DT, .DT_NEEDED_OR_ALPHA_NUM_OR_IA_64_NUM))) {
+                    libName = @ptrFromInt(dyn_strtab_addr + dyns[j].d_val);
+
+                    Logger.debug("dep tree: found dependency: {s} => {s}", .{ dyn_object_name, libName });
+
+                    const libNameLen = std.mem.len(libName);
+
+                    if (!dyn_objects.contains(libName[0..libNameLen])) {
+                        const key = try std.fmt.allocPrint(allocator, "{s}", .{libName[0..libNameLen]});
+                        try dyn_objects.putNoClobber(allocator, key, .init(key));
+                        Logger.debug("dep tree: {s} loading deferred", .{dyn_object_name});
+                        has_unloaded_deps = true;
+                    } else {
+                        const dep = dyn_objects.get(libName[0..libNameLen]).?;
+                        if (dep.mapped_at != 0) {
+                            Logger.debug("dep tree: registering dependency: {s} => {s}", .{ dyn_object_name, libName });
+                            try dependencies.append(allocator, dyn_objects.getIndex(libName[0..libNameLen]).?);
+                        } else {
+                            Logger.debug("dep tree: {s} loading deferred", .{dyn_object_name});
+                            has_unloaded_deps = true;
+                        }
+                    }
+                }
+            }
+
+            if (has_unloaded_deps) {
+                return error.UnloadedDependency;
+            }
+
+            break;
         }
     }
 
@@ -1598,15 +1670,6 @@ fn loadDso(o_path: []const u8) !void {
     Logger.debug("programs headers offset: 0x{x}", .{eh.e_phoff});
     Logger.debug("programs headers:", .{});
 
-    var segments: LoadSegmentList = .empty;
-    var dependencies: std.ArrayList(usize) = .empty;
-    var relocs: RelocList = .empty;
-    errdefer {
-        relocs.deinit(allocator);
-        dependencies.deinit(allocator);
-        segments.deinit(allocator);
-    }
-
     var tls_init_file_offset: usize = 0;
     var tls_init_file_size: usize = 0;
     var tls_init_mem_offset: usize = 0;
@@ -1626,7 +1689,7 @@ fn loadDso(o_path: []const u8) !void {
     var fini_array_addr: usize = 0;
     var fini_array_size: usize = 0;
 
-    var ph_addr: usize = file_addr + eh.e_phoff;
+    ph_addr = file_addr + eh.e_phoff;
 
     i = 0;
     while (i < eh.e_phnum) : ({
@@ -1699,7 +1762,6 @@ fn loadDso(o_path: []const u8) !void {
             const dyn_addr: usize = file_addr + ph.p_offset;
             const dyns: [*]std.elf.Dyn = @ptrFromInt(dyn_addr);
 
-            var libName: [*:0]u8 = undefined;
             var runpath: [*:0]u8 = undefined;
 
             var rela_reloc_tbl_addr: usize = 0;
@@ -1721,62 +1783,7 @@ fn loadDso(o_path: []const u8) !void {
             while (dyns[j].d_tag != 0) : (j += 1) {
                 Logger.debug("      {s}: 0x{x}", .{ @tagName(@as(DT, @enumFromInt(dyns[j].d_tag))), dyns[j].d_val });
 
-                if (dyns[j].d_tag == @intFromEnum(@as(DT, .DT_NEEDED_OR_ALPHA_NUM_OR_IA_64_NUM))) {
-                    libName = @ptrFromInt(dyn_strtab_addr + dyns[j].d_val);
-                    Logger.debug("        => found dependency: {s} => {s}", .{ dyn_object_name, libName });
-
-                    const libNameLen = std.mem.len(libName);
-
-                    if (!dyn_objects.contains(libName[0..libNameLen])) {
-                        const key = try std.fmt.allocPrint(allocator, "{s}", .{libName[0..libNameLen]});
-                        try dyn_objects.putNoClobber(allocator, key, .{
-                            .name_is_key = true,
-                            .name = key,
-                            .path = key,
-                            .file_handle = -1,
-                            .mapped_at = 0,
-                            .mapped_size = 0,
-                            .segments = .empty,
-                            .tls_init_file_offset = 0,
-                            .tls_init_file_size = 0,
-                            .tls_init_mem_offset = 0,
-                            .tls_init_mem_size = 0,
-                            .tls_align = 0,
-                            .tls_offset = 0,
-                            .tls_mapped_at = 0,
-                            .eh = undefined,
-                            .eh_init_file_offset = 0,
-                            .eh_init_file_size = 0,
-                            .eh_init_mem_offset = 0,
-                            .eh_init_mem_size = 0,
-                            .eh_align = 0,
-                            .syms = .empty,
-                            .syms_array = .empty,
-                            .relocs = .empty,
-                            .dependencies = .empty,
-                            .init_addr = 0,
-                            .fini_addr = 0,
-                            .init_array_addr = 0,
-                            .init_array_size = 0,
-                            .fini_array_addr = 0,
-                            .fini_array_size = 0,
-                            .loaded = false,
-                            .loaded_at = null,
-                            .loaded_size = 0,
-                        });
-                        Logger.debug("        => {s} loading deferred", .{dyn_object_name});
-                        return error.UnloadedDependency;
-                    } else {
-                        const dep = dyn_objects.get(libName[0..libNameLen]).?;
-                        if (dep.mapped_at != 0) {
-                            Logger.debug("        => registering dependency: {s} => {s}", .{ dyn_object_name, libName });
-                            try dependencies.append(allocator, dyn_objects.getIndex(libName[0..libNameLen]).?);
-                        } else {
-                            Logger.debug("        => {s} loading deferred", .{dyn_object_name});
-                            return error.UnloadedDependency;
-                        }
-                    }
-                } else if (dyns[j].d_tag == @intFromEnum(@as(DT, .DT_RUNPATH))) {
+                if (dyns[j].d_tag == @intFromEnum(@as(DT, .DT_RUNPATH))) {
                     runpath = @ptrFromInt(dyn_strtab_addr + dyns[j].d_val);
                     Logger.debug("        => lib rpath: {s}", .{runpath});
                 } else if (dyns[j].d_tag == @intFromEnum(@as(DT, .DT_RELA))) {
@@ -1838,7 +1845,7 @@ fn loadDso(o_path: []const u8) !void {
                     Logger.debug("        => TODO: DT_VERDEFNUM: 0x{x}", .{dyns[j].d_val});
                 } else {
                     switch (@as(DT, @enumFromInt(dyns[j].d_tag))) {
-                        .DT_STRTAB, .DT_SYMTAB, .DT_STRSZ => {},
+                        .DT_NEEDED_OR_ALPHA_NUM_OR_IA_64_NUM, .DT_STRTAB, .DT_SYMTAB, .DT_STRSZ => {},
                         else => {
                             Logger.debug("        == TODO: {s}: 0x{x}", .{ @tagName(@as(DT, @enumFromInt(dyns[j].d_tag))), dyns[j].d_val });
                         },
@@ -3012,31 +3019,27 @@ var extra_bytes: std.ArrayList([]const u8) = .empty;
 var last_dl_error: ?[:0]const u8 = null;
 
 fn dlopenSubstitute(path: ?[*:0]const u8, flags: c_int) callconv(.c) ?*anyopaque {
-    // if (path == null) {
-    //     return null;
-    // }
+    if (path == null) {
+        return null;
+    }
 
-    // Logger.info("dlopen(\"{s}\", 0x{x})", .{ path.?, flags });
+    Logger.info("intercepted call: dlopen(\"{s}\", 0x{x})", .{ path.?, flags });
 
-    // const owned_path = allocator.dupe(u8, std.mem.span(path.?)) catch @panic("OOM");
-    // extra_bytes.append(allocator, owned_path) catch @panic("OOM");
+    const owned_path = allocator.dupe(u8, std.mem.span(path.?)) catch @panic("OOM");
+    extra_bytes.append(allocator, owned_path) catch @panic("OOM");
 
-    // const lib = load(owned_path) catch |err| {
-    //     if (last_dl_error != null) {
-    //         allocator.free(last_dl_error.?);
-    //     }
-    //     last_dl_error = std.fmt.allocPrintSentinel(allocator, "unable to load library {s}:  {}", .{ owned_path, err }, 0) catch @panic("OOM");
+    const lib = load(owned_path) catch |err| {
+        if (last_dl_error != null) {
+            allocator.free(last_dl_error.?);
+        }
+        last_dl_error = std.fmt.allocPrintSentinel(allocator, "unable to load library {s}:  {}", .{ owned_path, err }, 0) catch @panic("OOM");
 
-    //     Logger.err("dlopen(\"{s}\", 0x{x}) failed: {}", .{ owned_path, flags, err });
+        Logger.err("dlopen(\"{s}\", 0x{x}) failed: {}", .{ owned_path, flags, err });
 
-    //     return null;
-    // };
+        return null;
+    };
 
-    // return @ptrFromInt(lib.index + 1);
-
-    // TODO real implementation
-    Logger.warn("unimplemented: dlopen(\"{s}\", 0x{x})", .{ path orelse "NULL", flags });
-    return null;
+    return @ptrFromInt(lib.index + 1);
 }
 
 fn dlcloseSubstitute(lib: *anyopaque) callconv(.c) c_int {
@@ -3071,13 +3074,13 @@ fn dladdrSubstitute(addr: *anyopaque, dl_info: *DlInfo) callconv(.c) c_int {
     return 0;
 }
 
-fn dlerrorSubstitute() callconv(.c) [*:0]const u8 {
-    // TODO real implementation
-    Logger.warn("unimplemented: dlerror()", .{});
-    return "";
+fn dlerrorSubstitute() callconv(.c) ?[*:0]const u8 {
+    Logger.info("intercepted call: dlerror()", .{});
+
+    return if (last_dl_error) |e| e.ptr else null;
 }
 
-fn dlvsymSubstitute(lib: *anyopaque, sym_name: [*:0]const u8, caller: ?*anyopaque) ?*anyopaque {
+fn dlvsymSubstitute(lib: *anyopaque, sym_name: [*:0]const u8, caller: ?*anyopaque) callconv(.c) ?*anyopaque {
     // TODO real implementation
     Logger.warn("unimplemented: dlvsym(0x{x}, \"{s}\", 0x{x})", .{ @intFromPtr(lib), sym_name, if (caller != null) @intFromPtr(caller) else 0 });
     return null;
