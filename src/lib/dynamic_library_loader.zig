@@ -697,17 +697,6 @@ const DT = enum(i64) {
     DT_MIPS_RLD_MAP_REL = 0x70000035,
 };
 
-const STB = enum(u4) {
-    STB_LOCAL = 0,
-    STB_GLOBAL = 1,
-    STB_WEAK = 2,
-    STB_NUM = 3,
-    STB_LOOS_OR_GNU_UNIQUE = 10,
-    STB_HIOS = 12,
-    STB_LOPROC_OR_MIPS_SPLIT_COMMON = 13,
-    STB_HIPROC = 15,
-};
-
 const SHN = enum(u16) {
     SHN_UNDEF = 0,
     SHN_LORESERVE_OR_LOPROC = 0xff00,
@@ -731,22 +720,6 @@ const SHN = enum(u16) {
             _ => try std.fmt.bufPrint(buf, "0x{x}", .{@intFromEnum(shn)}),
         };
     }
-};
-
-const STT = enum(u4) {
-    STT_NOTYPE = 0,
-    STT_OBJECT = 1,
-    STT_FUNC = 2,
-    STT_SECTION = 3,
-    STT_FILE = 4,
-    STT_COMMON = 5,
-    STT_TLS = 6,
-    STT_NUM = 7,
-    STT_LOOS_OR_GNU_IFUNC = 10,
-    STT_HIOS_OR_HP_STUB = 12,
-    STT_LOPROC_OR_SPARC_REGISTER_OR_PARISC_MILLICODE_OR_ARM_TFUNC = 13,
-    STT_HIPROC_OR_ARM_16BIT = 15,
-    STT_HP_OPAQUE = 11,
 };
 
 const LinkMap = extern struct {
@@ -817,8 +790,8 @@ const DynSym = struct {
     version: []const u8,
     hidden: bool,
     offset: usize,
-    type: STT,
-    bind: STB,
+    type: std.elf.STT,
+    bind: std.elf.STB,
     shidx: SHN,
     value: usize,
     size: usize,
@@ -870,6 +843,7 @@ const DynObject = struct {
     syms: DynSymList,
     syms_array: std.ArrayList(DynSym),
     dependencies: std.ArrayList(usize),
+    deps_breadth_first: std.ArrayList(usize),
     relocs: RelocList,
     init_addr: usize,
     fini_addr: usize,
@@ -907,6 +881,7 @@ const DynObject = struct {
             .syms_array = .empty,
             .relocs = .empty,
             .dependencies = .empty,
+            .deps_breadth_first = .empty,
             .init_addr = 0,
             .fini_addr = 0,
             .init_array_addr = 0,
@@ -931,7 +906,7 @@ pub const DynamicLibrary = struct {
 
     pub fn getSymbol(lib: DynamicLibrary, sym_name: []const u8) !Symbol {
         const dyn_obj = &dyn_objects.values()[lib.index];
-        const sym = try getResolvedSymbol(dyn_obj, sym_name);
+        const sym = try getResolvedSymbolByName(dyn_obj, sym_name);
         return .{
             .addr = sym.address,
         };
@@ -1043,6 +1018,7 @@ pub fn deinit() void {
 
         dyn_object.relocs.deinit(allocator);
         dyn_object.dependencies.deinit(allocator);
+        dyn_object.deps_breadth_first.deinit(allocator);
         dyn_object.segments.deinit(allocator);
 
         if (!dyn_object.name_is_key) {
@@ -1083,6 +1059,10 @@ pub fn deinit() void {
 }
 
 fn logSummary() void {
+    if (Logger.level != .debug) {
+        return;
+    }
+
     var buf: [16]u8 = undefined;
 
     for (dyn_objects.values()) |*dyn_object| {
@@ -1122,8 +1102,16 @@ fn logSummary() void {
             Logger.debug("    version: {s}", .{sym.version});
             Logger.debug("    hidden: {}", .{sym.hidden});
             Logger.debug("    offset: 0x{x}", .{sym.offset});
-            Logger.debug("    type: {s}", .{@tagName(sym.type)});
-            Logger.debug("    bind: {s}", .{@tagName(sym.bind)});
+            if (@intFromEnum(sym.type) <= 6) {
+                Logger.debug("    type: {s}", .{@tagName(sym.type)});
+            } else {
+                Logger.debug("    type: {d}", .{@intFromEnum(sym.type)});
+            }
+            if (@intFromEnum(sym.bind) <= 2) {
+                Logger.debug("    bind: {s}", .{@tagName(sym.bind)});
+            } else {
+                Logger.debug("    bind: {d}", .{@intFromEnum(sym.bind)});
+            }
             Logger.debug("    shidx: {s}", .{sym.shidx.nameOrValue(&buf) catch unreachable});
             Logger.debug("    value: 0x{x}", .{sym.value});
             Logger.debug("    size: 0x{x}", .{sym.size});
@@ -1255,6 +1243,8 @@ fn loadDepTree(o_path: []const u8) !DynamicLibrary {
             Logger.debug("dep tree: {s} has been mapped", .{dyn_object_name});
         }
     }
+
+    try logDepTree(&dyn_objects.values()[lib.index]);
 
     return lib;
 }
@@ -1527,43 +1517,41 @@ fn loadDso(o_path: []const u8) !void {
     Logger.debug("dynamic string table addr: 0x{x}", .{dyn_strtab_addr});
     Logger.debug("dynamic sym table addr: 0x{x}", .{dyn_symtab_addr});
 
-    Logger.debug("symbols: ", .{});
+    Logger.debug("{s}: symbols: ", .{dyn_object_name});
 
     for (0..dyn_symtab_size / @sizeOf(std.elf.Sym)) |j| {
-        const sym: *std.elf.Sym = @ptrFromInt(dyn_symtab_addr + j * @sizeOf(std.elf.Sym));
+        const sym: *std.elf.Elf64.Sym = @ptrFromInt(dyn_symtab_addr + j * @sizeOf(std.elf.Elf64.Sym));
 
         // TODO max len of sym name / aux name ?
         var buf_str: [2048]u8 = @splat(0);
         const strs: [*]u8 = @ptrFromInt(dyn_strtab_addr);
         var k: usize = 0;
-        while (strs[k + sym.st_name] != 0) : (k += 1) {
-            buf_str[k] = strs[k + sym.st_name];
+        while (strs[k + sym.name] != 0) : (k += 1) {
+            buf_str[k] = strs[k + sym.name];
         }
 
         const name = try std.fmt.allocPrint(allocator, "{s}", .{buf_str[0..k]});
 
+        const hidden = sym.other.visibility != .DEFAULT;
+
         var version: []const u8 = "";
         var ver_sym: ?std.elf.Versym = null;
         var ver_idx: ?u15 = null;
-        var hidden = false;
 
         if (versym_table != null) {
             ver_sym = @bitCast(versym_table.?[j]);
             ver_idx = ver_sym.?.VERSION;
-            hidden = ver_sym.?.HIDDEN;
 
             if (ver_sym == std.elf.Versym.GLOBAL) {
                 version = try allocator.dupe(u8, "GLOBAL");
             } else if (ver_sym == std.elf.Versym.LOCAL) {
                 version = try allocator.dupe(u8, "LOCAL");
             } else {
-                if (sym.st_shndx == @intFromEnum(@as(SHN, .SHN_UNDEF))) {
+                if (sym.shndx == @intFromEnum(@as(SHN, .SHN_UNDEF))) {
                     const ver_table_addr = verneed_tab_addr;
 
                     var ver_table_cursor = ver_table_addr;
                     var curr_def: *std.elf.Elf64_Verneed = @ptrFromInt(ver_table_cursor);
-
-                    // logger.debug("searching ver_idx: {d}", .{ver_idx});
 
                     outer: while (true) {
                         var aux: *std.elf.Vernaux = @ptrFromInt(ver_table_cursor + curr_def.vn_aux);
@@ -1578,13 +1566,9 @@ fn loadDso(o_path: []const u8) !void {
                                 break :outer;
                             }
 
-                            // logger.debug("skipping ver_idx: {d}", .{aux.other});
-
                             if (aux.next == 0) {
                                 break;
                             }
-
-                            // logger.debug("next aux offset: {d}", .{aux.next});
                             aux = @ptrFromInt(@intFromPtr(aux) + aux.next);
                         }
 
@@ -1594,7 +1578,6 @@ fn loadDso(o_path: []const u8) !void {
                         }
 
                         ver_table_cursor += curr_def.vn_next;
-                        // logger.debug("ver table_cursor: 0x{x}: {d}", .{ ver_table_cursor, curr_def.vn_next });
                         curr_def = @ptrFromInt(ver_table_cursor);
                     }
                 } else {
@@ -1602,8 +1585,6 @@ fn loadDso(o_path: []const u8) !void {
 
                     var ver_table_cursor = ver_table_addr;
                     var curr_def: *std.elf.Verdef = @ptrFromInt(ver_table_cursor);
-
-                    // logger.debug("searching ver_idx: {d}", .{ver_idx});
 
                     while (true) {
                         if (curr_def.ndx == @as(std.elf.VER_NDX, @enumFromInt(ver_idx.?))) {
@@ -1623,39 +1604,44 @@ fn loadDso(o_path: []const u8) !void {
                             return error.SymbolVersionNotFound;
                         }
 
-                        // logger.debug("skipping ver_idx: {d}", .{@intFromEnum(curr_def.ndx)});
-
                         ver_table_cursor += curr_def.next;
-                        // logger.debug("ver table_cursor: 0x{x}: {d}", .{ ver_table_cursor, curr_def.next });
                         curr_def = @ptrFromInt(ver_table_cursor);
                     }
                 }
             }
         }
 
-        Logger.debug("  - {d}:", .{j});
-        Logger.debug("    name: {s}", .{name});
-        Logger.debug("    ver idx: {?d}", .{if (ver_sym) |vs| vs.VERSION else null});
-        Logger.debug("    version: {s}", .{version});
-        Logger.debug("    hidden: {}", .{hidden});
-        Logger.debug("    raw type: 0x{x}", .{sym.st_type()});
-        Logger.debug("    type: {s}", .{@tagName(@as(STT, @enumFromInt(sym.st_type())))});
-        Logger.debug("    bind: {s}", .{@tagName(@as(STB, @enumFromInt(sym.st_bind())))});
-        Logger.debug("    value: 0x{x}", .{sym.st_value});
-        Logger.debug("    sh idx: 0x{x}", .{sym.st_shndx});
-        Logger.debug("    size: 0x{x}", .{sym.st_size});
-        Logger.debug("    info: 0x{x}", .{sym.st_info});
+        if (Logger.level == .debug) {
+            Logger.debug("{s}  - {d}:", .{ dyn_object_name, j });
+            Logger.debug("{s}    name: {s}", .{ dyn_object_name, name });
+            Logger.debug("{s}    ver idx: {?d}", .{ dyn_object_name, if (ver_sym) |vs| vs.VERSION else null });
+            Logger.debug("{s}    version: {s}", .{ dyn_object_name, version });
+            Logger.debug("{s}    hidden: {}", .{ dyn_object_name, hidden });
+            if (@intFromEnum(sym.info.type) <= 6) {
+                Logger.debug("{s}    type: {s}", .{ dyn_object_name, @tagName(sym.info.type) });
+            } else {
+                Logger.debug("{s}    type: {d}", .{ dyn_object_name, @intFromEnum(sym.info.type) });
+            }
+            if (@intFromEnum(sym.info.bind) <= 2) {
+                Logger.debug("{s}    bind: {s}", .{ dyn_object_name, @tagName(sym.info.bind) });
+            } else {
+                Logger.debug("{s}    bind: {d}", .{ dyn_object_name, @intFromEnum(sym.info.bind) });
+            }
+            Logger.debug("{s}    value: 0x{x}", .{ dyn_object_name, sym.value });
+            Logger.debug("{s}    sh idx: 0x{x}", .{ dyn_object_name, sym.shndx });
+            Logger.debug("{s}    size: 0x{x}", .{ dyn_object_name, sym.size });
+        }
 
         const s: DynSym = .{
             .name = name,
             .version = version,
             .hidden = hidden,
             .offset = j * @sizeOf(std.elf.Sym),
-            .type = @as(STT, @enumFromInt(sym.st_type())),
-            .bind = @as(STB, @enumFromInt(sym.st_bind())),
-            .shidx = @as(SHN, @enumFromInt(sym.st_shndx)),
-            .value = sym.st_value,
-            .size = sym.st_size,
+            .type = sym.info.type,
+            .bind = sym.info.bind,
+            .shidx = @enumFromInt(sym.shndx),
+            .value = sym.value,
+            .size = sym.size,
         };
 
         const ent = try syms.getOrPut(allocator, s.name);
@@ -2005,6 +1991,7 @@ fn loadDso(o_path: []const u8) !void {
         .syms_array = syms_array,
         .relocs = relocs,
         .dependencies = dependencies,
+        .deps_breadth_first = .empty,
         .init_addr = init_addr,
         .fini_addr = fini_addr,
         .init_array_addr = init_array_addr,
@@ -2021,7 +2008,69 @@ fn loadDso(o_path: []const u8) !void {
 
     try mapSegments(dyn_object, file_bytes);
 
+    try collectDepsBreadthFirst(dyn_object);
+
     Logger.info("{s} loaded => {s}", .{ dyn_object_name, dyn_object.path });
+}
+
+fn collectDepsBreadthFirst(dyn_object: *DynObject) !void {
+    var queue: std.ArrayList(usize) = .empty;
+    defer queue.deinit(allocator);
+
+    try queue.append(allocator, dyn_objects.getIndex(dyn_object.name).?);
+
+    while (queue.items.len > 0) {
+        const dep_idx = queue.orderedRemove(0);
+        if (std.mem.findScalar(usize, dyn_object.deps_breadth_first.items, dep_idx)) |_| {} else try dyn_object.deps_breadth_first.append(allocator, dep_idx);
+        const dep = &dyn_objects.values()[dep_idx];
+        for (dep.dependencies.items) |sdep_idx| {
+            if (std.mem.findScalar(usize, queue.items, sdep_idx)) |_| continue;
+            try queue.append(allocator, sdep_idx);
+        }
+    }
+
+    if (dyn_object.deps_breadth_first.items.len > 0) {
+        Logger.debug("deps breadth first: {s} => {s}", .{ dyn_object.name, dyn_object.path });
+        for (dyn_object.deps_breadth_first.items) |dep_idx| {
+            const dep = &dyn_objects.values()[dep_idx];
+            Logger.debug("deps breadth first:   - {s} => {s}", .{ dep.name, dyn_object.path });
+        }
+    }
+}
+
+var indent_buf: [64]u8 = @splat(' ');
+
+fn logDepTree(dyn_object: *DynObject) !void {
+    if (Logger.level != .debug) {
+        return;
+    }
+
+    var already_visited: std.ArrayList(usize) = .empty;
+    defer already_visited.deinit(allocator);
+
+    try logDepTreeInner(dyn_object, 0, &already_visited);
+}
+
+fn logDepTreeInner(dyn_object: *DynObject, level: usize, already_visited: *std.ArrayList(usize)) !void {
+    std.debug.assert(level < 32);
+
+    Logger.debug("loaded dep tree:{s} - {s} => {s}", .{ indent_buf[0 .. 2 * level], dyn_object.name, dyn_object.path });
+
+    if (std.mem.findScalar(usize, already_visited.items, dyn_objects.getIndex(dyn_object.name).?)) |_| {
+        return;
+    }
+
+    try already_visited.append(allocator, dyn_objects.getIndex(dyn_object.name).?);
+
+    if (dyn_object.dependencies.items.len > 0) {
+        for (dyn_object.dependencies.items) |dep_idx| {
+            const dep = &dyn_objects.values()[dep_idx];
+            try logDepTreeInner(dep, level + 1, already_visited);
+        }
+    }
+
+    // const jdx = already_visited.pop().?;
+    // std.debug.assert(jdx == dyn_objects.getIndex(dyn_object.name).?);
 }
 
 fn mapSegments(dyn_object: *DynObject, file_bytes: []const u8) !void {
@@ -2570,8 +2619,7 @@ fn processIRelativeRelocations(dyn_object: *DynObject) !void {
     Logger.debug("processed {d} IRELATIVE relocations for {s}", .{ reloc_count, dyn_object.name });
 }
 
-// TODO Should receive a *DynObject, which should contain links to dependencies,
-// and only look in those.
+// TODO Should receive a string that must be contained in dso name (like `libc.so`)
 fn resolveSymbolByName(sym_name: []const u8) !ResolvedSymbol {
     var it = dyn_objects.iterator();
     while (it.next()) |entry| {
@@ -2610,14 +2658,10 @@ fn resolveSymbolByName(sym_name: []const u8) !ResolvedSymbol {
     return error.UnresolvedSymbol;
 }
 
-// TODO we should only look into dyn_object dependencies, in order
 // TODO thread safety (called from Symbol)
-fn getResolvedSymbol(dyn_object: *DynObject, sym_name: []const u8) !ResolvedSymbol {
-    _ = dyn_object;
-
-    var it = dyn_objects.iterator();
-    while (it.next()) |entry| {
-        const dep_object = entry.value_ptr;
+fn getResolvedSymbolByName(dyn_object: *DynObject, sym_name: []const u8) !ResolvedSymbol {
+    for (dyn_object.deps_breadth_first.items) |dep_idx| {
+        const dep_object = &dyn_objects.values()[dep_idx];
 
         if (dep_object.syms.get(sym_name)) |dep_sym_list| {
             for (dep_sym_list.items) |dep_sym_idx| {
@@ -2658,7 +2702,6 @@ fn getResolvedSymbol(dyn_object: *DynObject, sym_name: []const u8) !ResolvedSymb
     return error.UnresolvedSymbol;
 }
 
-// TODO we should only look in dyn_object dependencies, in order
 // TODO rules for symbol resolution should be rigorously implemented
 fn resolveSymbol(dyn_object: *DynObject, sym_idx: usize) !ResolvedSymbol {
     if (sym_idx >= dyn_object.syms_array.items.len) {
@@ -2668,7 +2711,7 @@ fn resolveSymbol(dyn_object: *DynObject, sym_idx: usize) !ResolvedSymbol {
     const sym = dyn_object.syms_array.items[sym_idx];
 
     if (sym_idx == 0 or sym.shidx != .SHN_UNDEF) {
-        if (sym.bind == .STB_WEAK) {
+        if (sym.bind == .WEAK) {
             Logger.debug("WARNING: WEAK SYMBOL: {s}", .{if (sym_idx == 0) "ZERO" else sym.name});
         }
 
@@ -2692,20 +2735,18 @@ fn resolveSymbol(dyn_object: *DynObject, sym_idx: usize) !ResolvedSymbol {
         };
     }
 
-    var it = dyn_objects.iterator();
-    while (it.next()) |entry| {
-        const dep_name = entry.key_ptr.*;
-        const dep_object = entry.value_ptr;
+    for (dyn_object.deps_breadth_first.items) |dep_idx| {
+        const dep_object = &dyn_objects.values()[dep_idx];
 
-        if (std.mem.eql(u8, dep_name, dyn_object.name)) {
+        if (std.mem.eql(u8, dep_object.name, dyn_object.name)) {
             continue;
         }
 
         if (dep_object.syms.get(sym.name)) |dep_sym_list| {
             for (dep_sym_list.items) |dep_sym_idx| {
                 const dep_sym = dep_object.syms_array.items[dep_sym_idx];
-                if (dep_sym.shidx != .SHN_UNDEF and std.mem.eql(u8, dep_sym.version, sym.version) and !dep_sym.hidden) {
-                    if (dep_sym.bind == .STB_WEAK) {
+                if (dep_sym.shidx != .SHN_UNDEF and (std.mem.eql(u8, dep_sym.version, "GLOBAL") or std.mem.eql(u8, dep_sym.version, sym.version)) and !dep_sym.hidden) {
+                    if (dep_sym.bind == .WEAK) {
                         Logger.debug("WARNING: WEAK SYMBOL from dep: {s}", .{if (sym_idx == 0) "ZERO" else dep_sym.name});
                     }
 
@@ -2729,14 +2770,14 @@ fn resolveSymbol(dyn_object: *DynObject, sym_idx: usize) !ResolvedSymbol {
                     };
                 }
 
-                if (dep_sym.shidx != .SHN_UNDEF and std.mem.eql(u8, dep_sym.version, sym.version) and dep_sym.hidden) {
-                    Logger.debug("WARNING: HIDDEN SYMBOL from dep: {s}", .{dep_sym.name});
-                }
+                if (dep_sym.shidx == .SHN_UNDEF) Logger.debug("WARNING: SKIPPING UNDEF SYMBOL from dep: {s} | {s}@{s}", .{ dep_object.name, dep_sym.name, dep_sym.version });
+                if (dep_sym.hidden) Logger.debug("WARNING: SKIPPING HIDDEN SYMBOL from dep: {s} | {s}@{s}", .{ dep_object.name, dep_sym.name, dep_sym.version });
+                if (!std.mem.eql(u8, dep_sym.version, "GLOBAL") and !std.mem.eql(u8, dep_sym.version, sym.version)) Logger.debug("WARNING: SKIPPING MISVERSIONED SYMBOL from dep: {s} | {s} ({s} vs {s})", .{ dep_object.name, dep_sym.name, sym.version, dep_sym.version });
             }
         }
     }
 
-    if (sym.bind == .STB_WEAK) {
+    if (sym.bind == .WEAK) {
         Logger.debug("WARNING: UNRESOLVED WEAK SYMBOL: {s}", .{if (sym_idx == 0) "ZERO" else sym.name});
 
         if (sym.shidx == .SHN_ABS) {
@@ -2752,6 +2793,11 @@ fn resolveSymbol(dyn_object: *DynObject, sym_idx: usize) !ResolvedSymbol {
     }
 
     Logger.err("unresolved symbol: {s} in {s}", .{ sym.name, dyn_object.name });
+    Logger.err("searched:", .{});
+    for (dyn_object.deps_breadth_first.items) |dep_idx| {
+        const dep_object = &dyn_objects.values()[dep_idx];
+        Logger.err("  - {s}", .{dep_object.name});
+    }
     return error.UnresolvedSymbol;
 }
 
