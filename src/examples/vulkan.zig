@@ -15,18 +15,18 @@ pub const debug = struct {
 };
 
 pub fn main() !void {
-    var gpa: std.heap.DebugAllocator(.{ .stack_trace_frames = 10 }) = .init;
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
     const allocator = gpa.allocator();
-    defer if (gpa.deinit() != .ok) @panic("Memory check failed");
+    defer if (gpa.deinit() != .ok) @panic("memory check failed");
 
     try dll.init(.{ .allocator = allocator });
     defer dll.deinit();
 
-    std.log.info("Loading 'libvulkan.so.1'...", .{});
+    std.log.info("loading 'libvulkan.so.1'...", .{});
 
     const lib_vulkan = try dll.load("libvulkan.so.1");
 
-    std.log.info("Testing vulkan...", .{});
+    std.log.info("testing vulkan...", .{});
 
     const vkEnumerateInstanceVersion_sym = try lib_vulkan.getSymbol("vkEnumerateInstanceVersion");
     const vkEnumerateInstanceVersion_addr = vkEnumerateInstanceVersion_sym.addr;

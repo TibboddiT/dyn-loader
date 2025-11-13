@@ -73,9 +73,9 @@ pub const EGL = struct {
 };
 
 pub fn main() !void {
-    var gpa: std.heap.DebugAllocator(.{ .stack_trace_frames = 10 }) = .init;
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
     const allocator = gpa.allocator();
-    defer if (gpa.deinit() != .ok) @panic("Memory check failed");
+    defer if (gpa.deinit() != .ok) @panic("memory check failed");
 
     var threaded: std.Io.Threaded = .init(allocator);
     defer threaded.deinit();
@@ -84,13 +84,13 @@ pub fn main() !void {
     try dll.init(.{ .allocator = allocator });
     defer dll.deinit();
 
-    std.log.info("Loading 'libX11.so.6'...", .{});
+    std.log.info("loading 'libX11.so.6'...", .{});
     const lib_x11 = try dll.load("libX11.so.6");
 
-    std.log.info("Loading 'libEGL.so'...", .{});
+    std.log.info("loading 'libEGL.so'...", .{});
     const lib_egl = try dll.load("libEGL.so");
 
-    std.log.info("Testing X11 + EGL...", .{});
+    std.log.info("testing X11 + EGL...", .{});
 
     const xOpenDisplay: *Xlib.XOpenDisplay = @ptrFromInt((try lib_x11.getSymbol("XOpenDisplay")).addr);
     const xDefaultScreen: *Xlib.XDefaultScreen = @ptrFromInt((try lib_x11.getSymbol("XDefaultScreen")).addr);
@@ -182,7 +182,7 @@ pub fn main() !void {
         return error.EGLMakeCurrentError;
     }
 
-    std.log.info("The window will be closed in 3 seconds", .{});
+    std.log.info("the window will be closed in 3 seconds", .{});
 
     try std.Io.sleep(io, .fromSeconds(3), .awake);
 }

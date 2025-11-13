@@ -15,9 +15,9 @@ pub const debug = struct {
 };
 
 pub fn main() !void {
-    var gpa: std.heap.DebugAllocator(.{ .stack_trace_frames = 10 }) = .init;
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
     const allocator = gpa.allocator();
-    defer if (gpa.deinit() != .ok) @panic("Memory check failed");
+    defer if (gpa.deinit() != .ok) @panic("memory check failed");
 
     try dll.init(.{ .allocator = allocator });
     defer dll.deinit();
@@ -29,17 +29,17 @@ pub fn main() !void {
 
     const lib_c_path = try std.fmt.bufPrint(&lib_path, "{s}/{s}", .{ cwd, "resources/musl/libc.so" });
 
-    std.log.info("Loading '{s}'...", .{lib_c_path});
+    std.log.info("loading '{s}'...", .{lib_c_path});
 
     const lib_c = try dll.load(lib_c_path);
 
     const lib_vulkan_path = try std.fmt.bufPrint(&lib_path, "{s}/{s}", .{ cwd, "resources/musl/libvulkan.so.1" });
 
-    std.log.info("Loading '{s}'...", .{lib_vulkan_path});
+    std.log.info("loading '{s}'...", .{lib_vulkan_path});
 
     const lib_vulkan = try dll.load(lib_vulkan_path);
 
-    std.log.info("Testing libc printf...", .{});
+    std.log.info("testing libc printf...", .{});
 
     const printf_sym = try lib_c.getSymbol("printf");
     const printf_addr = printf_sym.addr;
@@ -52,7 +52,7 @@ pub fn main() !void {
 
     _ = printf("Hello, %s!\n", world.ptr);
 
-    std.log.info("Testing vulkan...", .{});
+    std.log.info("testing vulkan...", .{});
 
     const vkEnumerateInstanceVersion_sym = try lib_vulkan.getSymbol("vkEnumerateInstanceVersion");
     const vkEnumerateInstanceVersion_addr = vkEnumerateInstanceVersion_sym.addr;

@@ -21,6 +21,7 @@ pub fn build(b: *std.Build) void {
 
     const check_step = b.step("check", "Check");
 
+    addExecutable(b, check_step, dll_mod, target, optimize, "load_lib", "src/examples/load_lib.zig");
     addExecutable(b, check_step, dll_mod, target, optimize, "printf", "src/examples/printf.zig");
     addExecutable(b, check_step, dll_mod, target, optimize, "vulkan", "src/examples/vulkan.zig");
     addExecutable(b, check_step, dll_mod, target, optimize, "vulkan_advanced", "src/examples/vulkan_advanced/vulkan.zig");

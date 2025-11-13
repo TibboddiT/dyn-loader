@@ -19,23 +19,22 @@ pub fn main() !void {
     const allocator = gpa.allocator();
     defer if (gpa.deinit() != .ok) @panic("memory check failed");
 
-    try dll.init(.{ .allocator = allocator });
+    try dll.init(.{ .allocator = allocator, .log_level = .debug });
     defer dll.deinit();
 
-    std.log.info("loading 'libc.so.6'...", .{});
+    const args = try std.process.argsAlloc(allocator);
+    defer std.process.argsFree(allocator, args);
 
-    const lib_c = try dll.load("libc.so.6");
+    if (args.len <= 1) {
+        std.log.err("missing mandatory lib name", .{});
+        return error.MissingLibName;
+    }
 
-    std.log.info("testing libc printf...", .{});
+    const lib_name = args[1];
 
-    const printf_sym = try lib_c.getSymbol("printf");
-    const printf_addr = printf_sym.addr;
-    const printf: *const fn ([*:0]const u8, ...) callconv(.c) c_int = @ptrFromInt(printf_addr);
+    std.log.info("loading '{s}'...", .{lib_name});
 
-    var world: [:0]u8 = try allocator.dupeZ(u8, "World");
-    defer allocator.free(world);
+    _ = try dll.load(lib_name);
 
-    world.ptr[0] = 'w';
-
-    _ = printf("Hello, %s!\n", world.ptr);
+    std.log.info("success", .{});
 }

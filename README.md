@@ -18,11 +18,11 @@ pub const debug = struct {
 };
 
 pub fn main() !void {
-    var gpa: std.heap.DebugAllocator(.{ .stack_trace_frames = 10 }) = .init;
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
     const allocator = gpa.allocator();
-    defer if (gpa.deinit() != .ok) @panic("Memory check failed");
+    defer if (gpa.deinit() != .ok) @panic("memory check failed");
 
-    try dll.init(.{ .allocator = allocator });
+    try dll.init(.{ .allocator = allocator, .log_level = .warn });
     defer dll.deinit();
 
     const lib_c = try dll.load("libc.so.6");

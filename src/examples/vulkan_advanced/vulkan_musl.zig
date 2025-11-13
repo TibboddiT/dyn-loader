@@ -28,15 +28,15 @@ const VulkanProcResolver = struct {
             return @ptrFromInt(sym.addr);
         }
 
-        std.log.warn("Vulkan symbol not found", .{});
+        std.log.warn("vulkan symbol not found", .{});
         return null;
     }
 };
 
 pub fn main() !void {
-    var gpa: std.heap.DebugAllocator(.{ .stack_trace_frames = 10 }) = .init;
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
     const allocator = gpa.allocator();
-    defer if (gpa.deinit() != .ok) @panic("Memory check failed");
+    defer if (gpa.deinit() != .ok) @panic("memory check failed");
 
     try dll.init(.{ .allocator = allocator });
     defer dll.deinit();
@@ -48,14 +48,14 @@ pub fn main() !void {
 
     const lib_c_path = try std.fmt.bufPrint(&lib_path, "{s}/{s}", .{ cwd, "resources/musl/libc.so" });
 
-    std.log.info("Loading '{s}'...", .{lib_c_path});
+    std.log.info("loading '{s}'...", .{lib_c_path});
 
     const lib_c = try dll.load(lib_c_path);
     _ = lib_c;
 
     const lib_vulkan_path = try std.fmt.bufPrint(&lib_path, "{s}/{s}", .{ cwd, "resources/musl/libvulkan.so.1" });
 
-    std.log.info("Loading '{s}'...", .{lib_vulkan_path});
+    std.log.info("loading '{s}'...", .{lib_vulkan_path});
 
     const lib_vulkan = try dll.load(lib_vulkan_path);
 
@@ -70,11 +70,11 @@ pub fn main() !void {
 
     const vkb = BaseWrapper.load(&VulkanProcResolver.resolver);
 
-    std.log.info("Getting vulkan version...", .{});
+    std.log.info("getting vulkan version...", .{});
     const version = try vkb.enumerateInstanceVersion();
-    std.log.info("Got vulkan version: {d}.{d}.{d}", .{ version >> 22, (version >> 12) & 0x3ff, (version & 0xfff) });
+    std.log.info("got vulkan version: {d}.{d}.{d}", .{ version >> 22, (version >> 12) & 0x3ff, (version & 0xfff) });
 
-    std.log.info("Creating vulkan instance (will get error.IncompatibleDriver if dlopen is not yet implemented)...", .{});
+    std.log.info("creating vulkan instance (will get error.IncompatibleDriver if dlopen is not yet implemented)...", .{});
 
     const app_name = "Test";
 
