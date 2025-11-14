@@ -23,9 +23,9 @@ pub fn build(b: *std.Build) void {
 
     addExecutable(b, check_step, dll_mod, target, optimize, "load_lib", "src/examples/load_lib.zig");
     addExecutable(b, check_step, dll_mod, target, optimize, "printf", "src/examples/printf.zig");
-    addExecutable(b, check_step, dll_mod, target, optimize, "vulkan", "src/examples/vulkan.zig");
+    addExecutable(b, check_step, dll_mod, target, optimize, "vulkan_version", "src/examples/vulkan_version.zig");
     addExecutable(b, check_step, dll_mod, target, optimize, "vulkan_advanced", "src/examples/vulkan_advanced/vulkan.zig");
-    addExecutable(b, check_step, dll_mod, target, optimize, "vulkan_musl", "src/examples/vulkan_musl.zig");
+    addExecutable(b, check_step, dll_mod, target, optimize, "vulkan_version_musl", "src/examples/vulkan_version_musl.zig");
     addExecutable(b, check_step, dll_mod, target, optimize, "vulkan_advanced_musl", "src/examples/vulkan_advanced/vulkan_musl.zig");
     addExecutable(b, check_step, dll_mod, target, optimize, "x11_window", "src/examples/x11_window.zig");
     addExecutable(b, check_step, dll_mod, target, optimize, "x11_egl", "src/examples/x11_egl.zig");

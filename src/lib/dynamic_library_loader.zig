@@ -465,11 +465,11 @@ pub const CustomSelfInfo = struct {
 
             // Populate `build_id` and `gnu_eh_frame`
             for (info.phdr[0..info.phnum]) |phdr| {
-                switch (phdr.p_type) {
-                    std.elf.PT_NOTE => {
+                switch (phdr.type) {
+                    std.elf.PT.NOTE => {
                         // Look for .note.gnu.build-id
-                        const segment_ptr: [*]const u8 = @ptrFromInt(info.addr + phdr.p_vaddr);
-                        var r: std.Io.Reader = .fixed(segment_ptr[0..phdr.p_memsz]);
+                        const segment_ptr: [*]const u8 = @ptrFromInt(info.addr + phdr.vaddr);
+                        var r: std.Io.Reader = .fixed(segment_ptr[0..phdr.memsz]);
                         const name_size = r.takeInt(u32, builtin.target.cpu.arch.endian()) catch continue;
                         const desc_size = r.takeInt(u32, builtin.target.cpu.arch.endian()) catch continue;
                         const note_type = r.takeInt(u32, builtin.target.cpu.arch.endian()) catch continue;
@@ -479,9 +479,9 @@ pub const CustomSelfInfo = struct {
                         const desc = r.take(desc_size) catch continue;
                         build_id = desc;
                     },
-                    std.elf.PT_GNU_EH_FRAME => {
-                        const segment_ptr: [*]const u8 = @ptrFromInt(info.addr + phdr.p_vaddr);
-                        gnu_eh_frame = segment_ptr[0..phdr.p_memsz];
+                    std.elf.PT.GNU_EH_FRAME => {
+                        const segment_ptr: [*]const u8 = @ptrFromInt(info.addr + phdr.vaddr);
+                        gnu_eh_frame = segment_ptr[0..phdr.memsz];
                     },
                     else => {},
                 }
@@ -502,11 +502,11 @@ pub const CustomSelfInfo = struct {
             });
 
             for (info.phdr[0..info.phnum]) |phdr| {
-                if (phdr.p_type != std.elf.PT_LOAD) continue;
+                if (phdr.type != std.elf.PT.LOAD) continue;
                 try context.si.ranges.append(gpa, .{
                     // Overflowing addition handles VSDOs having p_vaddr = 0xffffffffff700000
-                    .start = info.addr +% phdr.p_vaddr,
-                    .len = phdr.p_memsz,
+                    .start = info.addr +% phdr.vaddr,
+                    .len = phdr.memsz,
                     .module_index = module_index,
                 });
             }
@@ -514,244 +514,6 @@ pub const CustomSelfInfo = struct {
     };
 
     const SelfInfo = @This();
-};
-
-const PT = enum(u32) {
-    PT_NULL = 0,
-    PT_LOAD = 1,
-    PT_DYNAMIC = 2,
-    PT_INTERP = 3,
-    PT_NOTE = 4,
-    PT_SHLIB = 5,
-    PT_PHDR = 6,
-    PT_TLS = 7,
-    PT_NUM = 8,
-    PT_LOOS = 0x60000000,
-    PT_GNU_EH_FRAME = 0x6474e550,
-    PT_GNU_STACK = 0x6474e551,
-    PT_GNU_RELRO = 0x6474e552,
-    PT_GNU_PROPERTY = 0x6474e553,
-    PT_GNU_SFRAME = 0x6474e554,
-    PT_LOSUNW_OR_PT_SUNWBSS = 0x6ffffffa, // PT_SUNWBSS = 0x6ffffffa,
-    PT_SUNWSTACK = 0x6ffffffb,
-    PT_HISUNW_OR_PT_HIOS = 0x6fffffff, // PT_HIOS = 0x6fffffff,
-    PT_LOPROC = 0x70000000,
-    PT_HIPROC = 0x7fffffff,
-};
-
-const SHT = enum(u32) {
-    SHT_NULL = 0,
-    SHT_PROGBITS = 1,
-    SHT_SYMTAB = 2,
-    SHT_STRTAB = 3,
-    SHT_RELA = 4,
-    SHT_HASH = 5,
-    SHT_DYNAMIC = 6,
-    SHT_NOTE = 7,
-    SHT_NOBITS = 8,
-    SHT_REL = 9,
-    SHT_SHLIB = 10,
-    SHT_DYNSYM = 11,
-    SHT_INIT_ARRAY = 14,
-    SHT_FINI_ARRAY = 15,
-    SHT_PREINIT_ARRAY = 16,
-    SHT_GROUP = 17,
-    SHT_SYMTAB_SHNDX = 18,
-    SHT_RELR = 19,
-    SHT_LOOS = 0x60000000,
-    SHT_LLVM_ADDRSIG = 0x6fff4c03,
-    SHT_GNU_SFRAME = 0x6ffffff4,
-    SHT_GNU_HASH = 0x6ffffff6,
-    SHT_GNU_VERDEF = 0x6ffffffd,
-    SHT_GNU_VERNEED = 0x6ffffffe,
-    SHT_GNU_VERSYM_OR_HIOS = 0x6fffffff,
-    SHT_LOPROC = 0x70000000,
-    SHT_X86_64_UNWIND = 0x70000001,
-    SHT_HIPROC = 0x7fffffff,
-    SHT_LOUSER = 0x80000000,
-    SHT_HIUSER = 0xffffffff,
-};
-
-const DT = enum(i64) {
-    DT_NULL = 0,
-    DT_NEEDED_OR_ALPHA_NUM_OR_IA_64_NUM = 1,
-    DT_PLTRELSZ_OR_SPARC_NUM_OR_PPC_NUM = 2,
-    DT_PLTGOT_OR_EXTRANUM = 3,
-    DT_HASH_OR_PPC64_NUM = 4,
-    DT_STRTAB = 5,
-    DT_SYMTAB = 6,
-    DT_RELA = 7,
-    DT_RELASZ = 8,
-    DT_RELAENT = 9,
-    DT_STRSZ = 10,
-    DT_SYMENT_OR_ADDRNUM = 11,
-    DT_INIT_OR_VALNUM = 12,
-    DT_FINI = 13,
-    DT_SONAME = 14,
-    DT_RPATH = 15,
-    DT_SYMBOLI_OR_VERSIONTAGNUM = 16,
-    DT_REL = 17,
-    DT_RELSZ = 18,
-    DT_RELENT = 19,
-    DT_PLTREL = 20,
-    DT_DEBUG = 21,
-    DT_TEXTREL = 22,
-    DT_JMPREL = 23,
-    DT_BIND_NOW = 24,
-    DT_INIT_ARRAY = 25,
-    DT_FINI_ARRAY = 26,
-    DT_INIT_ARRAYSZ = 27,
-    DT_FINI_ARRAYSZ = 28,
-    DT_RUNPATH = 29,
-    DT_FLAGS = 30,
-    DT_ENCODING_OR_PREINIT_ARRAY = 32,
-    DT_PREINIT_ARRAYSZ = 33,
-    DT_SYMTAB_SHNDX = 34,
-    DT_RELRSZ = 35,
-    DT_RELR = 36,
-    DT_RELRENT = 37,
-    DT_NUM = 38,
-    DT_LOOS = 0x6000000d,
-    DT_HIOS = 0x6ffff000,
-    DT_LOPROC_OR_ALPHA_PLTRO_OR_PPC_GOT_OR_PPC64_GLINK_OR_IA_64_PLT_RESERVE = 0x70000000,
-    DT_HIPROC_OR_FILTER = 0x7fffffff,
-    DT_PROCNUM_OR_MIPS_NUM = 0x36,
-    DT_VALRNGLO = 0x6ffffd00,
-    DT_GNU_PRELINKED = 0x6ffffdf5,
-    DT_GNU_CONFLICTSZ = 0x6ffffdf6,
-    DT_GNU_LIBLISTSZ = 0x6ffffdf7,
-    DT_CHECKSUM = 0x6ffffdf8,
-    DT_PLTPADSZ = 0x6ffffdf9,
-    DT_MOVEENT = 0x6ffffdfa,
-    DT_MOVESZ = 0x6ffffdfb,
-    DT_FEATURE_1 = 0x6ffffdfc,
-    DT_POSFLAG_1 = 0x6ffffdfd,
-    DT_SYMINSZ = 0x6ffffdfe,
-    DT_SYMINENT_OR_VALRNGHI = 0x6ffffdff,
-    DT_ADDRRNGLO = 0x6ffffe00,
-    DT_GNU_HASH = 0x6ffffef5,
-    DT_TLSDESC_PLT = 0x6ffffef6,
-    DT_TLSDESC_GOT = 0x6ffffef7,
-    DT_GNU_CONFLICT = 0x6ffffef8,
-    DT_GNU_LIBLIST = 0x6ffffef9,
-    DT_CONFIG = 0x6ffffefa,
-    DT_DEPAUDIT = 0x6ffffefb,
-    DT_AUDIT = 0x6ffffefc,
-    DT_PLTPAD = 0x6ffffefd,
-    DT_MOVETAB = 0x6ffffefe,
-    DT_SYMINFO_OR_ADDRRNGHI = 0x6ffffeff,
-    DT_VERSYM = 0x6ffffff0,
-    DT_RELACOUNT = 0x6ffffff9,
-    DT_RELCOUNT = 0x6ffffffa,
-    DT_FLAGS_1 = 0x6ffffffb,
-    DT_VERDEF = 0x6ffffffc,
-    DT_VERDEFNUM = 0x6ffffffd,
-    DT_VERNEED = 0x6ffffffe,
-    DT_VERNEEDNUM = 0x6fffffff,
-    DT_AUXILIARY = 0x7ffffffd,
-    DT_SPARC_REGISTER_OR_MIPS_RLD_VERSION_OR_PPC_OPT_OR_PPC64_OPD = 0x70000001,
-    DT_MIPS_TIME_STAMP_OR_PPC64_OPDSZ_OR_NIOS2_GP = 0x70000002,
-    DT_MIPS_ICHECKSUM_OR_PPC64_OPT = 0x70000003,
-    DT_MIPS_IVERSION = 0x70000004,
-    DT_MIPS_FLAGS = 0x70000005,
-    DT_MIPS_BASE_ADDRESS = 0x70000006,
-    DT_MIPS_MSYM = 0x70000007,
-    DT_MIPS_CONFLICT = 0x70000008,
-    DT_MIPS_LIBLIST = 0x70000009,
-    DT_MIPS_LOCAL_GOTNO = 0x7000000a,
-    DT_MIPS_CONFLICTNO = 0x7000000b,
-    DT_MIPS_LIBLISTNO = 0x70000010,
-    DT_MIPS_SYMTABNO = 0x70000011,
-    DT_MIPS_UNREFEXTNO = 0x70000012,
-    DT_MIPS_GOTSYM = 0x70000013,
-    DT_MIPS_HIPAGENO = 0x70000014,
-    DT_MIPS_RLD_MAP = 0x70000016,
-    DT_MIPS_DELTA_CLASS = 0x70000017,
-    DT_MIPS_DELTA_CLASS_NO = 0x70000018,
-    DT_MIPS_DELTA_INSTANCE = 0x70000019,
-    DT_MIPS_DELTA_INSTANCE_NO = 0x7000001a,
-    DT_MIPS_DELTA_RELOC = 0x7000001b,
-    DT_MIPS_DELTA_RELOC_NO = 0x7000001c,
-    DT_MIPS_DELTA_SYM = 0x7000001d,
-    DT_MIPS_DELTA_SYM_NO = 0x7000001e,
-    DT_MIPS_DELTA_CLASSSYM = 0x70000020,
-    DT_MIPS_DELTA_CLASSSYM_NO = 0x70000021,
-    DT_MIPS_CXX_FLAGS = 0x70000022,
-    DT_MIPS_PIXIE_INIT = 0x70000023,
-    DT_MIPS_SYMBOL_LIB = 0x70000024,
-    DT_MIPS_LOCALPAGE_GOTIDX = 0x70000025,
-    DT_MIPS_LOCAL_GOTIDX = 0x70000026,
-    DT_MIPS_HIDDEN_GOTIDX = 0x70000027,
-    DT_MIPS_PROTECTED_GOTIDX = 0x70000028,
-    DT_MIPS_OPTIONS = 0x70000029,
-    DT_MIPS_INTERFACE = 0x7000002a,
-    DT_MIPS_DYNSTR_ALIGN = 0x7000002b,
-    DT_MIPS_INTERFACE_SIZE = 0x7000002c,
-    DT_MIPS_RLD_TEXT_RESOLVE_ADDR = 0x7000002d,
-    DT_MIPS_PERF_SUFFIX = 0x7000002e,
-    DT_MIPS_COMPACT_SIZE = 0x7000002f,
-    DT_MIPS_GP_VALUE = 0x70000030,
-    DT_MIPS_AUX_DYNAMIC = 0x70000031,
-    DT_MIPS_PLTGOT = 0x70000032,
-    DT_MIPS_RWPLT = 0x70000034,
-    DT_MIPS_RLD_MAP_REL = 0x70000035,
-};
-
-const SHN = enum(u16) {
-    SHN_UNDEF = 0,
-    SHN_LORESERVE_OR_LOPROC = 0xff00,
-    SHN_HIPROC = 0xff1f,
-    SHN_LIVEPATCH = 0xff20,
-    SHN_ABS = 0xfff1,
-    SHN_COMMON = 0xfff2,
-    SHN_HIRESERVE = 0xffff,
-    _,
-
-    fn nameOrValue(shn: SHN, buf: []u8) ![]const u8 {
-        return switch (shn) {
-            .SHN_UNDEF,
-            .SHN_LORESERVE_OR_LOPROC,
-            .SHN_HIPROC,
-            .SHN_LIVEPATCH,
-            .SHN_ABS,
-            .SHN_COMMON,
-            .SHN_HIRESERVE,
-            => @tagName(shn),
-            _ => try std.fmt.bufPrint(buf, "0x{x}", .{@intFromEnum(shn)}),
-        };
-    }
-};
-
-const LinkMap = extern struct {
-    l_addr: usize,
-    l_name: [*:0]const u8,
-    l_ld: ?*std.elf.Dyn,
-    l_next: ?*LinkMap,
-    l_prev: ?*LinkMap,
-
-    pub const Iterator = struct {
-        current: ?*LinkMap,
-
-        pub fn end(self: *Iterator) bool {
-            return self.current == null;
-        }
-
-        pub fn next(self: *Iterator) ?*LinkMap {
-            if (self.current) |it| {
-                self.current = it.l_next;
-                return it;
-            }
-            return null;
-        }
-    };
-};
-
-const RDebug = extern struct {
-    r_version: i32,
-    r_map: ?*LinkMap,
-    r_brk: usize,
-    r_state: enum(u8) { RT_CONSISTENT, RT_ADD, RT_DELETE },
-    r_ldbase: usize,
 };
 
 const LoadSegmentFlags = struct {
@@ -792,9 +554,22 @@ const DynSym = struct {
     offset: usize,
     type: std.elf.STT,
     bind: std.elf.STB,
-    shidx: SHN,
+    shidx: std.elf.Section,
     value: usize,
     size: usize,
+
+    fn sectionNameOrValue(self: DynSym, buf: []u8) ![]const u8 {
+        return switch (self.shidx) {
+            std.elf.SHN_UNDEF => try std.fmt.bufPrint(buf, "UNDEF", .{}),
+            std.elf.SHN_LORESERVE => try std.fmt.bufPrint(buf, "LORESERVE/LOPROC ", .{}),
+            std.elf.SHN_HIPROC => try std.fmt.bufPrint(buf, "HIPROC ", .{}),
+            std.elf.SHN_LIVEPATCH => try std.fmt.bufPrint(buf, "LIVEPATCH ", .{}),
+            std.elf.SHN_ABS => try std.fmt.bufPrint(buf, "ABS ", .{}),
+            std.elf.SHN_COMMON => try std.fmt.bufPrint(buf, "COMMON ", .{}),
+            std.elf.SHN_HIRESERVE => try std.fmt.bufPrint(buf, "HIRESERVE ", .{}),
+            else => |shidx| try std.fmt.bufPrint(buf, "0x{x}", .{shidx}),
+        };
+    }
 };
 
 const DynSymList = std.StringArrayHashMapUnmanaged(std.ArrayList(usize));
@@ -967,14 +742,6 @@ export fn _dl_debug_state() callconv(.c) void {
     Logger.debug("_dl_debug_state called", .{});
 }
 
-pub export var r_debug: RDebug = .{
-    .r_version = 1,
-    .r_brk = 0,
-    .r_map = null,
-    .r_state = .RT_CONSISTENT,
-    .r_ldbase = 0,
-};
-
 var initialized: bool = false;
 var allocator: std.mem.Allocator = undefined;
 
@@ -992,10 +759,8 @@ pub fn init(options: InitOptions) !void {
     allocator = options.allocator;
     Logger.level = options.log_level;
 
-    r_debug.r_brk = @intFromPtr(&_dl_debug_state);
-
     // TODO
-    // - restructure TLS
+    // - pre restructure TLS
     // - assert linux x86_64 gnu
     // - assert statically linked
     // - assert only one thread
@@ -1113,7 +878,7 @@ fn logSummary() void {
             } else {
                 Logger.debug("    bind: {d}", .{@intFromEnum(sym.bind)});
             }
-            Logger.debug("    shidx: {s}", .{sym.shidx.nameOrValue(&buf) catch unreachable});
+            Logger.debug("    shidx: {s}", .{sym.sectionNameOrValue(&buf) catch unreachable});
             Logger.debug("    value: 0x{x}", .{sym.value});
             Logger.debug("    size: 0x{x}", .{sym.size});
         }
@@ -1360,29 +1125,29 @@ fn loadDso(o_path: []const u8) !void {
         i += 1;
         sh_addr += eh.e_shentsize;
     }) {
-        const sh: *std.elf.Shdr = @ptrFromInt(sh_addr);
-        const name: [*:0]const u8 = @ptrFromInt(sh_strtab_addr + sh.sh_name);
+        const sh: *std.elf.Elf64.Shdr = @ptrFromInt(sh_addr);
+        const name: [*:0]const u8 = @ptrFromInt(sh_strtab_addr + sh.name);
         Logger.debug("  - {d}:", .{i});
         Logger.debug("    name: {s}", .{name});
-        Logger.debug("    link: {d}", .{sh.sh_link});
-        Logger.debug("    type: 0x{x}", .{sh.sh_type});
-        Logger.debug("    type: {s}", .{@tagName(@as(SHT, @enumFromInt(sh.sh_type)))});
-        Logger.debug("    flags: {b}", .{sh.sh_flags});
-        Logger.debug("    offset: 0x{x}", .{sh.sh_offset});
-        Logger.debug("    size: 0x{x}", .{sh.sh_size});
+        Logger.debug("    link: {d}", .{sh.link});
+        Logger.debug("    type: 0x{x}", .{sh.type});
+        Logger.debug("    type: {t}", .{sh.type});
+        Logger.debug("    flags: {b}", .{@as(std.elf.Word, @bitCast(sh.flags.shf))});
+        Logger.debug("    offset: 0x{x}", .{sh.offset});
+        Logger.debug("    size: 0x{x}", .{sh.size});
 
-        if (@as(SHT, @enumFromInt(sh.sh_type)) == .SHT_STRTAB) {
+        if (sh.type == .STRTAB) {
             Logger.debug("    content:", .{});
 
-            const strtab_addr: usize = file_addr + sh.sh_offset;
+            const strtab_addr: usize = file_addr + sh.offset;
             const strs: [*]u8 = @ptrFromInt(strtab_addr);
 
             var j: usize = 0;
-            while (j < sh.sh_size) : (j += 1) {
+            while (j < sh.size) : (j += 1) {
                 // TODO max len of section name ?
                 var buf: [2048]u8 = [_]u8{0} ** 2048;
                 var k: usize = 0;
-                while (j < sh.sh_size) : ({
+                while (j < sh.size) : ({
                     k += 1;
                     j += 1;
                 }) {
@@ -1397,44 +1162,44 @@ fn loadDso(o_path: []const u8) !void {
             }
 
             if (std.mem.eql(u8, std.mem.sliceTo(name, 0), ".dynstr")) {
-                dyn_strtab_addr = file_addr + sh.sh_offset;
+                dyn_strtab_addr = file_addr + sh.offset;
             } else if (!std.mem.eql(u8, std.mem.sliceTo(name, 0), ".shstrtab")) {
                 Logger.debug("    == TODO: STRTAB: {s}", .{std.mem.sliceTo(name, 0)});
             }
-        } else if (@as(SHT, @enumFromInt(sh.sh_type)) == .SHT_DYNSYM) {
+        } else if (sh.type == .DYNSYM) {
             if (std.mem.eql(u8, std.mem.sliceTo(name, 0), ".dynsym")) {
-                dyn_symtab_addr = file_addr + sh.sh_offset;
-                dyn_symtab_size = sh.sh_size;
+                dyn_symtab_addr = file_addr + sh.offset;
+                dyn_symtab_size = sh.size;
             } else {
                 Logger.debug("    == TODO: DYNSYM: {s}", .{std.mem.sliceTo(name, 0)});
             }
-        } else if (@as(SHT, @enumFromInt(sh.sh_type)) == .SHT_GNU_VERSYM_OR_HIOS) {
+        } else if (sh.type == std.elf.SHT.GNU_VERSYM) {
             if (std.mem.eql(u8, std.mem.sliceTo(name, 0), ".gnu.version")) {
-                versym_tab_addr = file_addr + sh.sh_offset;
+                versym_tab_addr = file_addr + sh.offset;
             } else {
                 Logger.debug("    == TODO: GNU_VERSYM: {s}", .{std.mem.sliceTo(name, 0)});
             }
-        } else if (@as(SHT, @enumFromInt(sh.sh_type)) == .SHT_GNU_VERDEF) {
+        } else if (sh.type == std.elf.SHT.GNU_VERDEF) {
             if (std.mem.eql(u8, std.mem.sliceTo(name, 0), ".gnu.version_d")) {
-                verdef_tab_addr = file_addr + sh.sh_offset;
+                verdef_tab_addr = file_addr + sh.offset;
             } else {
                 Logger.debug("    == TODO: GNU_VERDEF: {s}", .{std.mem.sliceTo(name, 0)});
             }
-        } else if (@as(SHT, @enumFromInt(sh.sh_type)) == .SHT_GNU_VERNEED) {
+        } else if (sh.type == std.elf.SHT.GNU_VERNEED) {
             if (std.mem.eql(u8, std.mem.sliceTo(name, 0), ".gnu.version_r")) {
-                verneed_tab_addr = file_addr + sh.sh_offset;
+                verneed_tab_addr = file_addr + sh.offset;
             } else {
                 Logger.debug("    == TODO: GNU_VERDEF: {s}", .{std.mem.sliceTo(name, 0)});
             }
         } else {
-            switch (@as(SHT, @enumFromInt(sh.sh_type))) {
-                .SHT_NULL,
-                .SHT_PROGBITS,
-                .SHT_INIT_ARRAY,
-                .SHT_NOBITS,
-                .SHT_RELA,
-                .SHT_RELR,
-                .SHT_DYNAMIC,
+            switch (sh.type) {
+                .NULL,
+                .PROGBITS,
+                .INIT_ARRAY,
+                .NOBITS,
+                .RELA,
+                .RELR,
+                .DYNAMIC,
                 => {},
                 else => |t| {
                     Logger.debug("    == TODO: {t}: {s}", .{ t, name });
@@ -1450,18 +1215,18 @@ fn loadDso(o_path: []const u8) !void {
         i += 1;
         ph_addr += eh.e_phentsize;
     }) {
-        const ph: *std.elf.Phdr = @ptrFromInt(ph_addr);
+        const ph: *std.elf.Elf64.Phdr = @ptrFromInt(ph_addr);
 
-        const dyn_addr: usize = file_addr + ph.p_offset;
+        const dyn_addr: usize = file_addr + ph.offset;
         const dyns: [*]std.elf.Dyn = @ptrFromInt(dyn_addr);
 
         var libName: [*:0]u8 = undefined;
 
-        if (@as(PT, @enumFromInt(ph.p_type)) == .PT_DYNAMIC) {
+        if (ph.type == .DYNAMIC) {
             var has_unloaded_deps = false;
             var j: usize = 0;
             while (dyns[j].d_tag != 0) : (j += 1) {
-                if (dyns[j].d_tag == @intFromEnum(@as(DT, .DT_NEEDED_OR_ALPHA_NUM_OR_IA_64_NUM))) {
+                if (dyns[j].d_tag == std.elf.DT_NEEDED) {
                     libName = @ptrFromInt(dyn_strtab_addr + dyns[j].d_val);
 
                     Logger.debug("dep tree: found dependency: {s} => {s}", .{ dyn_object_name, libName });
@@ -1548,7 +1313,7 @@ fn loadDso(o_path: []const u8) !void {
             } else if (ver_sym == std.elf.Versym.LOCAL) {
                 version = try allocator.dupe(u8, "LOCAL");
             } else {
-                if (sym.shndx == @intFromEnum(@as(SHN, .SHN_UNDEF))) {
+                if (sym.shndx == std.elf.SHN_UNDEF) {
                     const ver_table_addr = verneed_tab_addr;
 
                     var ver_table_cursor = ver_table_addr;
@@ -1640,7 +1405,7 @@ fn loadDso(o_path: []const u8) !void {
             .offset = j * @sizeOf(std.elf.Sym),
             .type = sym.info.type,
             .bind = sym.info.bind,
-            .shidx = @enumFromInt(sym.shndx),
+            .shidx = sym.shndx,
             .value = sym.value,
             .size = sym.size,
         };
@@ -1683,70 +1448,70 @@ fn loadDso(o_path: []const u8) !void {
         i += 1;
         ph_addr += eh.e_phentsize;
     }) {
-        const ph: *std.elf.Phdr = @ptrFromInt(ph_addr);
+        const ph: *std.elf.Elf64.Phdr = @ptrFromInt(ph_addr);
 
-        Logger.debug("  - {d}: [0x{x}]", .{ i, ph.p_type });
-        Logger.debug("    type: {s}", .{@tagName(@as(PT, @enumFromInt(ph.p_type)))});
-        Logger.debug("    flags: {b}", .{ph.p_flags});
-        Logger.debug("    offset: 0x{x}", .{ph.p_offset});
-        Logger.debug("    v_addr: 0x{x}", .{ph.p_vaddr});
-        Logger.debug("    fsize: 0x{x}", .{ph.p_filesz});
-        Logger.debug("    msize: 0x{x}", .{ph.p_memsz});
+        Logger.debug("  - {d}", .{i});
+        Logger.debug("    type: {t}", .{ph.type});
+        Logger.debug("    flags: {b}", .{@as(std.elf.Word, @bitCast(ph.flags))});
+        Logger.debug("    offset: 0x{x}", .{ph.offset});
+        Logger.debug("    v_addr: 0x{x}", .{ph.vaddr});
+        Logger.debug("    fsize: 0x{x}", .{ph.filesz});
+        Logger.debug("    msize: 0x{x}", .{ph.memsz});
 
-        if (@as(PT, @enumFromInt(ph.p_type)) == .PT_LOAD) {
+        if (ph.type == .LOAD) {
             const segment: LoadSegment = .{
-                .file_offset = ph.p_offset,
-                .file_size = ph.p_filesz,
-                .mem_offset = ph.p_vaddr,
-                .mem_size = ph.p_memsz,
-                .mem_align = ph.p_align,
+                .file_offset = ph.offset,
+                .file_size = ph.filesz,
+                .mem_offset = ph.vaddr,
+                .mem_size = ph.memsz,
+                .mem_align = ph.@"align",
                 .mapped_from_file = false,
                 .flags_first = .{
-                    .read = ((ph.p_flags >> 2) & 1) > 0,
-                    .write = ((ph.p_flags >> 1) & 1) > 0,
-                    .exec = ((ph.p_flags >> 0) & 1) > 0,
-                    .mem_offset = ph.p_vaddr,
-                    .mem_size = ph.p_memsz,
+                    .read = ph.flags.R,
+                    .write = ph.flags.W,
+                    .exec = ph.flags.X,
+                    .mem_offset = ph.vaddr,
+                    .mem_size = ph.memsz,
                 },
                 .flags_last = .{
-                    .read = ((ph.p_flags >> 2) & 1) > 0,
-                    .write = ((ph.p_flags >> 1) & 1) > 0,
-                    .exec = ((ph.p_flags >> 0) & 1) > 0,
-                    .mem_offset = ph.p_vaddr,
-                    .mem_size = ph.p_memsz,
+                    .read = ph.flags.R,
+                    .write = ph.flags.W,
+                    .exec = ph.flags.X,
+                    .mem_offset = ph.vaddr,
+                    .mem_size = ph.memsz,
                 },
                 .loaded_at = 0,
             };
 
             try segments.put(allocator, segment.mem_offset, segment);
-        } else if (@as(PT, @enumFromInt(ph.p_type)) == .PT_GNU_RELRO) {
-            var segment = segments.get(ph.p_vaddr) orelse return error.SegmentNotFound;
+        } else if (ph.type == std.elf.PT.GNU_RELRO) {
+            var segment = segments.get(ph.vaddr) orelse return error.SegmentNotFound;
 
             std.debug.assert(segment.flags_last.mem_offset == segment.flags_first.mem_offset and segment.flags_last.mem_size == segment.flags_first.mem_size);
 
             segment.flags_last = .{
-                .read = ((ph.p_flags >> 2) & 1) > 0,
-                .write = ((ph.p_flags >> 1) & 1) > 0,
-                .exec = ((ph.p_flags >> 0) & 1) > 0,
-                .mem_offset = ph.p_vaddr,
-                .mem_size = ph.p_memsz,
+                .read = ph.flags.R,
+                .write = ph.flags.W,
+                .exec = ph.flags.X,
+                .mem_offset = ph.vaddr,
+                .mem_size = ph.memsz,
             };
 
             try segments.put(allocator, segment.mem_offset, segment);
-        } else if (@as(PT, @enumFromInt(ph.p_type)) == .PT_TLS) {
-            tls_init_file_offset = ph.p_offset;
-            tls_init_file_size = ph.p_filesz;
-            tls_init_mem_offset = ph.p_vaddr;
-            tls_init_mem_size = ph.p_memsz;
-            tls_align = ph.p_align;
-        } else if (@as(PT, @enumFromInt(ph.p_type)) == .PT_GNU_EH_FRAME) {
-            eh_init_file_offset = ph.p_offset;
-            eh_init_file_size = ph.p_filesz;
-            eh_init_mem_offset = ph.p_vaddr;
-            eh_init_mem_size = ph.p_memsz;
-            eh_align = ph.p_align;
-        } else if (@as(PT, @enumFromInt(ph.p_type)) == .PT_DYNAMIC) {
-            const dyn_addr: usize = file_addr + ph.p_offset;
+        } else if (ph.type == .TLS) {
+            tls_init_file_offset = ph.offset;
+            tls_init_file_size = ph.filesz;
+            tls_init_mem_offset = ph.vaddr;
+            tls_init_mem_size = ph.memsz;
+            tls_align = ph.@"align";
+        } else if (ph.type == std.elf.PT.GNU_EH_FRAME) {
+            eh_init_file_offset = ph.offset;
+            eh_init_file_size = ph.filesz;
+            eh_init_mem_offset = ph.vaddr;
+            eh_init_mem_size = ph.memsz;
+            eh_align = ph.@"align";
+        } else if (ph.type == .DYNAMIC) {
+            const dyn_addr: usize = file_addr + ph.offset;
             const dyns: [*]std.elf.Dyn = @ptrFromInt(dyn_addr);
 
             var runpath: [*:0]u8 = undefined;
@@ -1760,7 +1525,7 @@ fn loadDso(o_path: []const u8) !void {
             var relr_reloc_tbl_size: usize = 0;
             var relr_reloc_tbl_entry_size: usize = 0;
 
-            var plt_reloc_type: DT = .DT_NULL;
+            var plt_reloc_type: usize = 0;
             var plt_reloc_tbl_size: usize = 0;
             var plt_reloc_tbl_addr: usize = 0;
 
@@ -1768,73 +1533,77 @@ fn loadDso(o_path: []const u8) !void {
 
             var j: usize = 0;
             while (dyns[j].d_tag != 0) : (j += 1) {
-                Logger.debug("      {s}: 0x{x}", .{ @tagName(@as(DT, @enumFromInt(dyns[j].d_tag))), dyns[j].d_val });
+                Logger.debug("      DT type 0x{x}: 0x{x}", .{ dyns[j].d_tag, dyns[j].d_val });
 
-                if (dyns[j].d_tag == @intFromEnum(@as(DT, .DT_RUNPATH))) {
+                if (dyns[j].d_tag == std.elf.DT_RUNPATH) {
                     runpath = @ptrFromInt(dyn_strtab_addr + dyns[j].d_val);
                     Logger.debug("        => lib rpath: {s}", .{runpath});
-                } else if (dyns[j].d_tag == @intFromEnum(@as(DT, .DT_RELA))) {
+                } else if (dyns[j].d_tag == std.elf.DT_RELA) {
                     rela_reloc_tbl_addr = file_addr + dyns[j].d_val;
                     Logger.debug("        => rela reloc table addr: 0x{x}", .{rela_reloc_tbl_addr});
-                } else if (dyns[j].d_tag == @intFromEnum(@as(DT, .DT_RELASZ))) {
+                } else if (dyns[j].d_tag == std.elf.DT_RELASZ) {
                     rela_reloc_tbl_size = dyns[j].d_val;
                     Logger.debug("        => rela reloc table size: 0x{x}", .{rela_reloc_tbl_size});
-                } else if (dyns[j].d_tag == @intFromEnum(@as(DT, .DT_RELAENT))) {
+                } else if (dyns[j].d_tag == std.elf.DT_RELAENT) {
                     rela_reloc_tbl_entry_size = dyns[j].d_val;
                     Logger.debug("        => rela reloc table entry size: 0x{x}", .{rela_reloc_tbl_entry_size});
-                } else if (dyns[j].d_tag == @intFromEnum(@as(DT, .DT_RELACOUNT))) {
+                } else if (dyns[j].d_tag == std.elf.DT_RELACOUNT) {
                     rela_reloc_nb_entry = dyns[j].d_val;
                     Logger.debug("        => rela reloc nb entry: {d}", .{rela_reloc_nb_entry});
-                } else if (dyns[j].d_tag == @intFromEnum(@as(DT, .DT_RELR))) {
+                } else if (dyns[j].d_tag == std.elf.DT_RELR) {
                     relr_reloc_tbl_addr = file_addr + dyns[j].d_val;
                     Logger.debug("        => relr reloc table addr: 0x{x}", .{relr_reloc_tbl_addr});
-                } else if (dyns[j].d_tag == @intFromEnum(@as(DT, .DT_RELRSZ))) {
+                } else if (dyns[j].d_tag == std.elf.DT_RELRSZ) {
                     relr_reloc_tbl_size = dyns[j].d_val;
                     Logger.debug("        => relr reloc table size: 0x{x}", .{relr_reloc_tbl_size});
-                } else if (dyns[j].d_tag == @intFromEnum(@as(DT, .DT_RELRENT))) {
+                } else if (dyns[j].d_tag == std.elf.DT_RELRENT) {
                     relr_reloc_tbl_entry_size = dyns[j].d_val;
                     Logger.debug("        => relr reloc table entry size: 0x{x}", .{relr_reloc_tbl_entry_size});
-                } else if (dyns[j].d_tag == @intFromEnum(@as(DT, .DT_PLTREL))) {
-                    plt_reloc_type = @enumFromInt(dyns[j].d_val);
-                    Logger.debug("        => plt reloc type: {s}", .{@tagName(plt_reloc_type)});
-                } else if (dyns[j].d_tag == @intFromEnum(@as(DT, .DT_PLTRELSZ_OR_SPARC_NUM_OR_PPC_NUM))) {
+                } else if (dyns[j].d_tag == std.elf.DT_PLTREL) {
+                    plt_reloc_type = dyns[j].d_val;
+                    Logger.debug("        => plt reloc type: 0x{x}", .{plt_reloc_type});
+                } else if (dyns[j].d_tag == std.elf.DT_PLTRELSZ) {
                     plt_reloc_tbl_size = dyns[j].d_val;
                     Logger.debug("        => plt reloc table size: 0x{x}", .{plt_reloc_tbl_size});
-                } else if (dyns[j].d_tag == @intFromEnum(@as(DT, .DT_JMPREL))) {
+                } else if (dyns[j].d_tag == std.elf.DT_JMPREL) {
                     plt_reloc_tbl_addr = file_addr + dyns[j].d_val;
                     Logger.debug("        => plt reloc table addr: 0x{x}", .{plt_reloc_tbl_addr});
-                } else if (dyns[j].d_tag == @intFromEnum(@as(DT, .DT_PLTGOT_OR_EXTRANUM))) {
+                } else if (dyns[j].d_tag == std.elf.DT_PLTGOT) {
                     plt_got_addr = file_addr + dyns[j].d_val;
                     Logger.debug("        => plt got addr: 0x{x}", .{plt_got_addr});
-                } else if (dyns[j].d_tag == @intFromEnum(@as(DT, .DT_INIT_OR_VALNUM))) {
+                } else if (dyns[j].d_tag == std.elf.DT_INIT) {
                     init_addr = dyns[j].d_val;
                     Logger.debug("        => init addr: 0x{x}", .{init_addr});
-                } else if (dyns[j].d_tag == @intFromEnum(@as(DT, .DT_FINI))) {
+                } else if (dyns[j].d_tag == std.elf.DT_FINI) {
                     fini_addr = dyns[j].d_val;
                     Logger.debug("        => fini addr: 0x{x}", .{fini_addr});
-                } else if (dyns[j].d_tag == @intFromEnum(@as(DT, .DT_INIT_ARRAY))) {
+                } else if (dyns[j].d_tag == std.elf.DT_INIT_ARRAY) {
                     init_array_addr = dyns[j].d_val;
                     Logger.debug("        => init array addr: 0x{x}", .{init_array_addr});
-                } else if (dyns[j].d_tag == @intFromEnum(@as(DT, .DT_INIT_ARRAYSZ))) {
+                } else if (dyns[j].d_tag == std.elf.DT_INIT_ARRAYSZ) {
                     init_array_size = dyns[j].d_val;
                     Logger.debug("        => init array size: 0x{x}", .{init_array_size});
-                } else if (dyns[j].d_tag == @intFromEnum(@as(DT, .DT_FINI_ARRAY))) {
+                } else if (dyns[j].d_tag == std.elf.DT_FINI_ARRAY) {
                     fini_array_addr = dyns[j].d_val;
                     Logger.debug("        => fini array addr: 0x{x}", .{fini_array_addr});
-                } else if (dyns[j].d_tag == @intFromEnum(@as(DT, .DT_FINI_ARRAYSZ))) {
+                } else if (dyns[j].d_tag == std.elf.DT_FINI_ARRAYSZ) {
                     fini_array_size = dyns[j].d_val;
                     Logger.debug("        => fini array size: 0x{x}", .{fini_array_size});
-                } else if (dyns[j].d_tag == @intFromEnum(@as(DT, .DT_FLAGS))) {
+                } else if (dyns[j].d_tag == std.elf.DT_FLAGS) {
                     Logger.debug("        => TODO: DT_FLAGS: 0x{x}", .{dyns[j].d_val});
-                } else if (dyns[j].d_tag == @intFromEnum(@as(DT, .DT_FLAGS_1))) {
+                } else if (dyns[j].d_tag == std.elf.DT_FLAGS_1) {
                     Logger.debug("        => TODO: DT_FLAGS_1: 0x{x}", .{dyns[j].d_val});
-                } else if (dyns[j].d_tag == @intFromEnum(@as(DT, .DT_VERDEFNUM))) {
+                } else if (dyns[j].d_tag == std.elf.DT_VERDEFNUM) {
                     Logger.debug("        => TODO: DT_VERDEFNUM: 0x{x}", .{dyns[j].d_val});
                 } else {
-                    switch (@as(DT, @enumFromInt(dyns[j].d_tag))) {
-                        .DT_NEEDED_OR_ALPHA_NUM_OR_IA_64_NUM, .DT_STRTAB, .DT_SYMTAB, .DT_STRSZ => {},
+                    switch (dyns[j].d_tag) {
+                        std.elf.DT_NEEDED,
+                        std.elf.DT_STRTAB,
+                        std.elf.DT_SYMTAB,
+                        std.elf.DT_STRSZ,
+                        => {},
                         else => {
-                            Logger.debug("        == TODO: {s}: 0x{x}", .{ @tagName(@as(DT, @enumFromInt(dyns[j].d_tag))), dyns[j].d_val });
+                            Logger.debug("        == TODO: DT type 0x{x}: 0x{x}", .{ dyns[j].d_tag, dyns[j].d_val });
                         },
                     }
                 }
@@ -1958,7 +1727,7 @@ fn loadDso(o_path: []const u8) !void {
                 }
             }
         } else {
-            Logger.debug("    => TODO: {s}", .{@tagName(@as(PT, @enumFromInt(ph.p_type)))});
+            Logger.debug("    => TODO: {t}", .{ph.type});
         }
     }
 
@@ -2686,8 +2455,8 @@ fn resolveSymbolByName(sym_name: []const u8) !ResolvedSymbol {
         if (dep_object.syms.get(sym_name)) |dep_sym_list| {
             for (dep_sym_list.items) |dep_sym_idx| {
                 const dep_sym = dep_object.syms_array.items[dep_sym_idx];
-                if (dep_sym.shidx != .SHN_UNDEF and !dep_sym.hidden) {
-                    if (dep_sym.shidx == .SHN_ABS) {
+                if (dep_sym.shidx != std.elf.SHN_UNDEF and !dep_sym.hidden) {
+                    if (dep_sym.shidx == std.elf.SHN_ABS) {
                         Logger.debug("WARNING: ABSOLUTE SYMBOL from dep: {s}", .{dep_sym.name});
                     }
 
@@ -2707,7 +2476,7 @@ fn resolveSymbolByName(sym_name: []const u8) !ResolvedSymbol {
                     };
                 }
 
-                if (dep_sym.shidx != .SHN_UNDEF and dep_sym.hidden) {
+                if (dep_sym.shidx != std.elf.SHN_UNDEF and dep_sym.hidden) {
                     Logger.debug("WARNING: HIDDEN SYMBOL from dep: {s}", .{dep_sym.name});
                 }
             }
@@ -2725,8 +2494,8 @@ fn getResolvedSymbolByName(dyn_object: *DynObject, sym_name: []const u8) !Resolv
         if (dep_object.syms.get(sym_name)) |dep_sym_list| {
             for (dep_sym_list.items) |dep_sym_idx| {
                 const dep_sym = dep_object.syms_array.items[dep_sym_idx];
-                if (dep_sym.shidx != .SHN_UNDEF and !dep_sym.hidden) {
-                    if (dep_sym.shidx == .SHN_ABS) {
+                if (dep_sym.shidx != std.elf.SHN_UNDEF and !dep_sym.hidden) {
+                    if (dep_sym.shidx == std.elf.SHN_ABS) {
                         Logger.debug("WARNING: ABSOLUTE SYMBOL from dep: {s}", .{dep_sym.name});
                     }
 
@@ -2752,7 +2521,7 @@ fn getResolvedSymbolByName(dyn_object: *DynObject, sym_name: []const u8) !Resolv
                     return res_sym;
                 }
 
-                if (dep_sym.shidx != .SHN_UNDEF and dep_sym.hidden) {
+                if (dep_sym.shidx != std.elf.SHN_UNDEF and dep_sym.hidden) {
                     Logger.debug("WARNING: HIDDEN SYMBOL from dep: {s}", .{dep_sym.name});
                 }
             }
@@ -2770,12 +2539,12 @@ fn resolveSymbol(dyn_object: *DynObject, sym_idx: usize) !ResolvedSymbol {
 
     const sym = dyn_object.syms_array.items[sym_idx];
 
-    if (sym_idx == 0 or sym.shidx != .SHN_UNDEF) {
+    if (sym_idx == 0 or sym.shidx != std.elf.SHN_UNDEF) {
         if (sym.bind == .WEAK) {
             Logger.debug("WARNING: WEAK SYMBOL: {s}", .{if (sym_idx == 0) "ZERO" else sym.name});
         }
 
-        if (sym.shidx == .SHN_ABS) {
+        if (sym.shidx == std.elf.SHN_ABS) {
             Logger.debug("WARNING: ABSOLUTE SYMBOL: {s}", .{if (sym_idx == 0) "ZERO" else sym.name});
         }
 
@@ -2806,12 +2575,12 @@ fn resolveSymbol(dyn_object: *DynObject, sym_idx: usize) !ResolvedSymbol {
         if (dep_object.syms.get(sym.name)) |dep_sym_list| {
             for (dep_sym_list.items) |dep_sym_idx| {
                 const dep_sym = dep_object.syms_array.items[dep_sym_idx];
-                if (dep_sym.shidx != .SHN_UNDEF and (dep_sym.version.len == 0 or std.mem.eql(u8, dep_sym.version, "GLOBAL") or std.mem.eql(u8, dep_sym.version, sym.version)) and !dep_sym.hidden) {
+                if (dep_sym.shidx != std.elf.SHN_UNDEF and (dep_sym.version.len == 0 or std.mem.eql(u8, dep_sym.version, "GLOBAL") or std.mem.eql(u8, dep_sym.version, sym.version)) and !dep_sym.hidden) {
                     if (dep_sym.bind == .WEAK) {
                         Logger.debug("WARNING: WEAK SYMBOL from dep: {s}", .{if (sym_idx == 0) "ZERO" else dep_sym.name});
                     }
 
-                    if (dep_sym.shidx == .SHN_ABS) {
+                    if (dep_sym.shidx == std.elf.SHN_ABS) {
                         Logger.debug("WARNING: ABSOLUTE SYMBOL from dep: {s}", .{if (sym_idx == 0) "ZERO" else dep_sym.name});
                     }
 
@@ -2832,7 +2601,7 @@ fn resolveSymbol(dyn_object: *DynObject, sym_idx: usize) !ResolvedSymbol {
                     };
                 }
 
-                if (dep_sym.shidx == .SHN_UNDEF) Logger.debug("WARNING: SKIPPING UNDEF SYMBOL from dep: {s} | {s}@{s}", .{ dep_object.name, dep_sym.name, dep_sym.version });
+                if (dep_sym.shidx == std.elf.SHN_UNDEF) Logger.debug("WARNING: SKIPPING UNDEF SYMBOL from dep: {s} | {s}@{s}", .{ dep_object.name, dep_sym.name, dep_sym.version });
                 if (dep_sym.hidden) Logger.debug("WARNING: SKIPPING HIDDEN SYMBOL from dep: {s} | {s}@{s}", .{ dep_object.name, dep_sym.name, dep_sym.version });
                 if (dep_sym.version.len != 0 and !std.mem.eql(u8, dep_sym.version, "GLOBAL") and !std.mem.eql(u8, dep_sym.version, sym.version)) Logger.debug("WARNING: SKIPPING MISVERSIONED SYMBOL from dep: {s} | {s} ({s} vs {s})", .{ dep_object.name, dep_sym.name, sym.version, dep_sym.version });
             }
@@ -2842,7 +2611,7 @@ fn resolveSymbol(dyn_object: *DynObject, sym_idx: usize) !ResolvedSymbol {
     if (sym.bind == .WEAK) {
         Logger.debug("WARNING: UNRESOLVED WEAK SYMBOL: {s}", .{if (sym_idx == 0) "ZERO" else sym.name});
 
-        if (sym.shidx == .SHN_ABS) {
+        if (sym.shidx == std.elf.SHN_ABS) {
             Logger.debug("WARNING: UNRESOLVED WEAK ABSOLUTE SYMBOL: {s}", .{if (sym_idx == 0) "ZERO" else sym.name});
         }
 

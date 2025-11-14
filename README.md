@@ -1,9 +1,9 @@
 ## Loading dynamic libraries from non libc static executable - Proof of concept
 
-Prototype quality: lots of bugs, lots of TODOs remaining.
+*Warning: prototype quality: lots of bugs, lots of TODOs remaining.*
 
-Tested on `x86_64-linux-gnu` with glibc 2.41.
-Works with a lightly patched musl for now.
+Tested on `x86_64-linux-gnu`, with libraries compiled agasint glibc 2.41.
+Seems to also work on libraries compiled agasint musl, with a lightly patched `libc.so` version for now (cf. [Notes](#Notes)).
 
 See [this thread](https://ziggit.dev/t/dynamic-linking-without-libc-adventures) for further information.
 
@@ -37,7 +37,8 @@ pub fn main() !void {
 
 ### Notes
 
-A custom musl's `libc.so` is included, which is a patched version of musl 1.25. The library is stripped (`strip --strip-unneeded lib/libc.so`) as it is often the case when it is packaged for linux distros.
+A custom musl's `libc.so` is included, which is a patched version of musl 1.25. You should load it first before loading libraries compiled against musl.
+The library is stripped (`strip --strip-unneeded lib/libc.so`) as it is often the case when it is packaged for linux distros.
 
 The patch is:
 
@@ -83,14 +84,12 @@ An unpatched copy of `libvulkan.so.1.4.326` from [the Alpine repository](https:/
 
 Both are in the `resources/musl` directory. It is recommended that you produce those binary artifacts by yourself.
 
-### Build examples
+### Run examples
 
 ```
 zig build run-printf
-zig build run-vulkan
-zig build run-vulkan_advanced
-zig build run-vulkan_musl
-zig build run-vulkan_advanced_musl
+zig build run-vulkan_version
+zig build run-vulkan_version_musl
 zig build run-x11_window
 ```
 
