@@ -2062,11 +2062,11 @@ fn mapTlsBlock(dyn_object: *DynObject) !void {
 
     const sizeof_pthread: usize = sp: {
         const sym = resolveSymbolByName("_thread_db_sizeof_pthread") catch {
-            Logger.warn("no _thread_db_sizeof_pthread symbol found, using defaut 2048", .{});
-            break :sp 2048;
+            Logger.info("no _thread_db_sizeof_pthread symbol found, using defaut 4096", .{});
+            break :sp 4096 + std.heap.pageSize();
         };
         const sizeof_pthread_ptr: *u32 = @ptrFromInt(sym.address);
-        break :sp sizeof_pthread_ptr.*;
+        break :sp sizeof_pthread_ptr.* + std.heap.pageSize();
     };
     Logger.debug("tls: size of pthread struct: 0x{x} ({d})", .{ sizeof_pthread, sizeof_pthread });
 
@@ -2266,6 +2266,8 @@ fn mapTlsBlock(dyn_object: *DynObject) !void {
         dl_tls_static_align.* = new_tls_area_desc.alignment;
 
         try reprotectSegment(seg_infos.dyn_object, seg_infos.segment_index);
+    } else {
+        Logger.info("tls: no rtld_global_ro symbol found", .{});
     }
 
     dyn_object.tls_mapped_at = @as(usize, @intFromPtr(new_area.ptr)) - dyn_object.tls_offset;

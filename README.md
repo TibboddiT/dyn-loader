@@ -43,12 +43,13 @@ pub fn main() !void {
   - `__tls_get_addr` is implemented
 - Loading libraries should be done before having started any thread.
 - Starting threads in zig land and in library land needs to be tested.
-- Some (rare) relocation types are still missing
+- Some (rare) relocation types are still missing.
 - You should not link any `libc` (it is part of the goal anyway).
 
 ### Notes
 
-A custom musl's `libc.so` is included, which is a patched version of musl 1.25. You should load it first before loading libraries compiled against musl.
+A custom musl's `libc.so` is included, which is a patched version of musl 1.25.
+You should load it first before loading libraries compiled against musl (see [the musl printf example](src/examples/printf_musl.zig)).
 The library is stripped (`strip --strip-unneeded lib/libc.so`) as it is often the case when it is packaged for linux distros.
 
 The patch is:
