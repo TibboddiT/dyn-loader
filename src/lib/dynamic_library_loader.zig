@@ -965,16 +965,12 @@ pub fn load(f_path: []const u8) !DynamicLibrary {
 fn loadDepTree(o_path: []const u8) !DynamicLibrary {
     Logger.debug("dep tree: checking {s}", .{o_path});
 
-    const lib: DynamicLibrary = .{
-        .index = dyn_objects.count(),
-    };
-
-    loadDso(o_path) catch |err| switch (err) {
-        error.UnloadedDependency => {
-            Logger.debug("dep tree: {s} has unloaded dependencies", .{o_path});
-        },
-        else => |e| return e,
-    };
+    const lib_idx = try loadDso(o_path);
+    if (dyn_objects.values()[lib_idx].mapped_at != 0) {
+        return .{
+            .index = lib_idx,
+        };
+    }
 
     var has_unloaded = true;
     while (has_unloaded) {
@@ -998,21 +994,18 @@ fn loadDepTree(o_path: []const u8) !DynamicLibrary {
 
             has_unloaded = true;
 
-            loadDso(dyn_object_name) catch |err| switch (err) {
-                error.UnloadedDependency => {
-                    Logger.debug("dep tree: {s} has unloaded dependencies", .{dyn_object_name});
-                    continue;
-                },
-                else => |e| return e,
-            };
-
-            Logger.debug("dep tree: {s} has been mapped", .{dyn_object_name});
+            const idx = try loadDso(if (dyn_object_idx == lib_idx) o_path else dyn_object_name);
+            if (dyn_objects.values()[idx].mapped_at != 0) {
+                Logger.debug("dep tree: {s} has been mapped", .{dyn_object_name});
+            }
         }
     }
 
-    try logDepTree(&dyn_objects.values()[lib.index]);
+    try logDepTree(&dyn_objects.values()[lib_idx]);
 
-    return lib;
+    return .{
+        .index = lib_idx,
+    };
 }
 
 // TODO mimic path resolution of linux-ld better
@@ -1052,13 +1045,17 @@ fn resolvePath(r_path: []const u8) ![]const u8 {
         break;
     }
 
+    if (path == null) {
+        Logger.err("cannot find library {s}", .{r_path});
+    }
+
     return path orelse error.LibraryNotFound;
 }
 
-fn loadDso(o_path: []const u8) !void {
+fn loadDso(o_path: []const u8) !usize {
     var scratch_buf: [1024]u8 = undefined;
 
-    const path: []const u8 = if (std.mem.startsWith(u8, o_path, "/")) try allocator.dupe(u8, o_path) else try resolvePath(o_path);
+    const path: []const u8 = if (std.mem.findScalar(u8, o_path, '/') != null) try allocator.dupe(u8, o_path) else try resolvePath(o_path);
     defer allocator.free(path);
 
     Logger.debug("loading: {s} [{s}]", .{ o_path, path });
@@ -1085,6 +1082,9 @@ fn loadDso(o_path: []const u8) !void {
     if (!dyn_objects.contains(dyn_object_name)) {
         const key = try std.fmt.allocPrint(allocator, "{s}", .{dyn_object_name});
         try dyn_objects.putNoClobber(allocator, key, .init(key));
+    } else if (dyn_objects.get(dyn_object_name).?.loaded) {
+        defer allocator.free(dyn_object_name);
+        return dyn_objects.getIndex(dyn_object_name).?;
     }
 
     const eh: *std.elf.Elf64_Ehdr = @ptrCast(file_bytes);
@@ -1253,7 +1253,9 @@ fn loadDso(o_path: []const u8) !void {
             }
 
             if (has_unloaded_deps) {
-                return error.UnloadedDependency;
+                dependencies.deinit(allocator);
+                defer allocator.free(dyn_object_name);
+                return dyn_objects.getIndex(dyn_object_name).?;
             }
 
             break;
@@ -1800,6 +1802,8 @@ fn loadDso(o_path: []const u8) !void {
     try collectDepsBreadthFirst(dyn_object);
 
     Logger.info("{s} loaded => {s}", .{ dyn_object_name, dyn_object.path });
+
+    return dyn_objects.getIndex(dyn_object_name).?;
 }
 
 fn collectDepsBreadthFirst(dyn_object: *DynObject) !void {
@@ -1829,7 +1833,7 @@ fn collectDepsBreadthFirst(dyn_object: *DynObject) !void {
 
 var indent_buf: [64]u8 = @splat(' ');
 
-fn logDepTree(dyn_object: *DynObject) !void {
+fn logDepTree(dyn_object: *const DynObject) !void {
     if (Logger.level != .debug) {
         return;
     }
@@ -1840,7 +1844,7 @@ fn logDepTree(dyn_object: *DynObject) !void {
     try logDepTreeInner(dyn_object, 0, &already_visited);
 }
 
-fn logDepTreeInner(dyn_object: *DynObject, level: usize, already_visited: *std.ArrayList(usize)) !void {
+fn logDepTreeInner(dyn_object: *const DynObject, level: usize, already_visited: *std.ArrayList(usize)) !void {
     std.debug.assert(level < 32);
 
     Logger.debug("loaded dep tree:{s} - {s} => {s}", .{ indent_buf[0 .. 2 * level], dyn_object.name, dyn_object.path });
@@ -2507,43 +2511,174 @@ fn resolveSymbolByName(sym_name: []const u8) !ResolvedSymbol {
     return error.UnresolvedSymbol;
 }
 
+// TODO the next 3 functions are very ugly and need factorization
+
 // TODO thread safety (called from Symbol)
-fn getResolvedSymbolByName(dyn_object: *DynObject, sym_name: []const u8) !ResolvedSymbol {
-    for (dyn_object.deps_breadth_first.items) |dep_idx| {
-        const dep_object = &dyn_objects.values()[dep_idx];
+fn getResolvedSymbolByName(maybe_dyn_object: ?*DynObject, sym_name: []const u8) !ResolvedSymbol {
+    if (maybe_dyn_object) |dyn_object| {
+        for (dyn_object.deps_breadth_first.items) |dep_idx| {
+            const dep_object = &dyn_objects.values()[dep_idx];
 
-        if (dep_object.syms.get(sym_name)) |dep_sym_list| {
-            for (dep_sym_list.items) |dep_sym_idx| {
-                const dep_sym = dep_object.syms_array.items[dep_sym_idx];
-                if (dep_sym.shidx != std.elf.SHN_UNDEF and !dep_sym.hidden) {
-                    if (dep_sym.shidx == std.elf.SHN_ABS) {
-                        Logger.debug("WARNING: ABSOLUTE SYMBOL from dep: {s}", .{dep_sym.name});
+            if (dep_object.syms.get(sym_name)) |dep_sym_list| {
+                for (dep_sym_list.items) |dep_sym_idx| {
+                    const dep_sym = dep_object.syms_array.items[dep_sym_idx];
+                    if (dep_sym.shidx != std.elf.SHN_UNDEF and !dep_sym.hidden) {
+                        if (dep_sym.shidx == std.elf.SHN_ABS) {
+                            Logger.debug("WARNING: ABSOLUTE SYMBOL from dep: {s}", .{dep_sym.name});
+                        }
+
+                        const dep_sym_address = dep_sym.value;
+
+                        var dep_addr = try vAddressToLoadedAddress(dep_object, dep_sym_address);
+                        if (irel_resolved_addrs.get(dep_addr)) |res_addr| {
+                            dep_addr = res_addr;
+                        }
+
+                        var res_sym: ResolvedSymbol = .{
+                            .value = dep_sym.value,
+                            .address = dep_addr,
+                            .name = dep_sym.name,
+                            .version = dep_sym.version,
+                            .dyn_object_idx = dyn_objects.getIndex(dep_object.name).?,
+                        };
+
+                        if (getSubstituteAddress(res_sym)) |a| {
+                            res_sym.address = a;
+                        }
+
+                        return res_sym;
                     }
 
-                    const dep_sym_address = dep_sym.value;
-
-                    var dep_addr = try vAddressToLoadedAddress(dep_object, dep_sym_address);
-                    if (irel_resolved_addrs.get(dep_addr)) |res_addr| {
-                        dep_addr = res_addr;
+                    if (dep_sym.shidx != std.elf.SHN_UNDEF and dep_sym.hidden) {
+                        Logger.debug("WARNING: HIDDEN SYMBOL from dep: {s}", .{dep_sym.name});
                     }
-
-                    var res_sym: ResolvedSymbol = .{
-                        .value = dep_sym.value,
-                        .address = dep_addr,
-                        .name = dep_sym.name,
-                        .version = dep_sym.version,
-                        .dyn_object_idx = dyn_objects.getIndex(dep_object.name).?,
-                    };
-
-                    if (getSubstituteAddress(res_sym)) |a| {
-                        res_sym.address = a;
-                    }
-
-                    return res_sym;
                 }
+            }
+        }
+    } else {
+        for (0..dyn_objects.count()) |dep_idx| {
+            const dep_object = &dyn_objects.values()[dep_idx];
 
-                if (dep_sym.shidx != std.elf.SHN_UNDEF and dep_sym.hidden) {
-                    Logger.debug("WARNING: HIDDEN SYMBOL from dep: {s}", .{dep_sym.name});
+            if (dep_object.syms.get(sym_name)) |dep_sym_list| {
+                for (dep_sym_list.items) |dep_sym_idx| {
+                    const dep_sym = dep_object.syms_array.items[dep_sym_idx];
+                    if (dep_sym.shidx != std.elf.SHN_UNDEF and !dep_sym.hidden) {
+                        if (dep_sym.shidx == std.elf.SHN_ABS) {
+                            Logger.debug("WARNING: ABSOLUTE SYMBOL from dep: {s}", .{dep_sym.name});
+                        }
+
+                        const dep_sym_address = dep_sym.value;
+
+                        var dep_addr = try vAddressToLoadedAddress(dep_object, dep_sym_address);
+                        if (irel_resolved_addrs.get(dep_addr)) |res_addr| {
+                            dep_addr = res_addr;
+                        }
+
+                        var res_sym: ResolvedSymbol = .{
+                            .value = dep_sym.value,
+                            .address = dep_addr,
+                            .name = dep_sym.name,
+                            .version = dep_sym.version,
+                            .dyn_object_idx = dyn_objects.getIndex(dep_object.name).?,
+                        };
+
+                        if (getSubstituteAddress(res_sym)) |a| {
+                            res_sym.address = a;
+                        }
+
+                        return res_sym;
+                    }
+
+                    if (dep_sym.shidx != std.elf.SHN_UNDEF and dep_sym.hidden) {
+                        Logger.debug("WARNING: HIDDEN SYMBOL from dep: {s}", .{dep_sym.name});
+                    }
+                }
+            }
+        }
+    }
+
+    return error.UnresolvedSymbol;
+}
+
+// TODO thread safety (called from Symbol)
+fn getResolvedSymbolByNameAndVersion(maybe_dyn_object: ?*DynObject, sym_name: []const u8, version: []const u8) !ResolvedSymbol {
+    if (maybe_dyn_object) |dyn_object| {
+        for (dyn_object.deps_breadth_first.items) |dep_idx| {
+            const dep_object = &dyn_objects.values()[dep_idx];
+
+            if (dep_object.syms.get(sym_name)) |dep_sym_list| {
+                for (dep_sym_list.items) |dep_sym_idx| {
+                    const dep_sym = dep_object.syms_array.items[dep_sym_idx];
+                    if (std.mem.eql(u8, dep_sym.version, version) and dep_sym.shidx != std.elf.SHN_UNDEF and !dep_sym.hidden) {
+                        if (dep_sym.shidx == std.elf.SHN_ABS) {
+                            Logger.debug("WARNING: ABSOLUTE SYMBOL from dep: {s}", .{dep_sym.name});
+                        }
+
+                        const dep_sym_address = dep_sym.value;
+
+                        var dep_addr = try vAddressToLoadedAddress(dep_object, dep_sym_address);
+                        if (irel_resolved_addrs.get(dep_addr)) |res_addr| {
+                            dep_addr = res_addr;
+                        }
+
+                        var res_sym: ResolvedSymbol = .{
+                            .value = dep_sym.value,
+                            .address = dep_addr,
+                            .name = dep_sym.name,
+                            .version = dep_sym.version,
+                            .dyn_object_idx = dyn_objects.getIndex(dep_object.name).?,
+                        };
+
+                        if (getSubstituteAddress(res_sym)) |a| {
+                            res_sym.address = a;
+                        }
+
+                        return res_sym;
+                    }
+
+                    if (dep_sym.shidx != std.elf.SHN_UNDEF and dep_sym.hidden) {
+                        Logger.debug("WARNING: HIDDEN SYMBOL from dep: {s}", .{dep_sym.name});
+                    }
+                }
+            }
+        }
+    } else {
+        for (0..dyn_objects.count()) |dep_idx| {
+            const dep_object = &dyn_objects.values()[dep_idx];
+
+            if (dep_object.syms.get(sym_name)) |dep_sym_list| {
+                for (dep_sym_list.items) |dep_sym_idx| {
+                    const dep_sym = dep_object.syms_array.items[dep_sym_idx];
+                    if (std.mem.eql(u8, dep_sym.version, version) and dep_sym.shidx != std.elf.SHN_UNDEF and !dep_sym.hidden) {
+                        if (dep_sym.shidx == std.elf.SHN_ABS) {
+                            Logger.debug("WARNING: ABSOLUTE SYMBOL from dep: {s}", .{dep_sym.name});
+                        }
+
+                        const dep_sym_address = dep_sym.value;
+
+                        var dep_addr = try vAddressToLoadedAddress(dep_object, dep_sym_address);
+                        if (irel_resolved_addrs.get(dep_addr)) |res_addr| {
+                            dep_addr = res_addr;
+                        }
+
+                        var res_sym: ResolvedSymbol = .{
+                            .value = dep_sym.value,
+                            .address = dep_addr,
+                            .name = dep_sym.name,
+                            .version = dep_sym.version,
+                            .dyn_object_idx = dyn_objects.getIndex(dep_object.name).?,
+                        };
+
+                        if (getSubstituteAddress(res_sym)) |a| {
+                            res_sym.address = a;
+                        }
+
+                        return res_sym;
+                    }
+
+                    if (dep_sym.shidx != std.elf.SHN_UNDEF and dep_sym.hidden) {
+                        Logger.debug("WARNING: HIDDEN SYMBOL from dep: {s}", .{dep_sym.name});
+                    }
                 }
             }
         }
@@ -2981,28 +3116,49 @@ fn dlopenSubstitute(path: ?[*:0]const u8, flags: c_int) callconv(.c) ?*anyopaque
 
 fn dlcloseSubstitute(lib: *anyopaque) callconv(.c) c_int {
     // TODO real implementation
-    Logger.err("unimplemented: dlclose(0x{x})", .{@intFromPtr(lib)});
-    @panic("unimplemented dlclose");
+    Logger.warn("unimplemented: dlclose({d})", .{@intFromPtr(lib)});
+
+    return 0;
 }
 
-fn dlsymSubstitute(lib_handle: *anyopaque, sym_name: [*:0]const u8) callconv(.c) ?*anyopaque {
-    Logger.info("intercepted call: dlsym(0x{x}, \"{s}\")", .{ @intFromPtr(lib_handle), sym_name });
+fn dlsymSubstitute(lib_handle: ?*anyopaque, sym_name: [*:0]const u8) callconv(.c) ?*anyopaque {
+    Logger.info("intercepted call: dlsym({d}, \"{s}\")", .{ @intFromPtr(lib_handle), sym_name });
 
-    const lib_idx: usize = @as(usize, @intFromPtr(lib_handle)) - 1;
-    const dyn_object = &dyn_objects.values()[lib_idx];
+    const dyn_object = if (lib_handle) |h| &dyn_objects.values()[@intFromPtr(h) - 1] else null;
 
     const sym = getResolvedSymbolByName(dyn_object, std.mem.span(sym_name)) catch |err| {
         if (last_dl_error != null) {
             allocator.free(last_dl_error.?);
         }
-        last_dl_error = std.fmt.allocPrintSentinel(allocator, "unable to get symbol {s} for library {s}:  {}", .{ sym_name, dyn_object.name, err }, 0) catch @panic("OOM");
+        last_dl_error = std.fmt.allocPrintSentinel(allocator, "unable to get symbol {s} for library {s}:  {}", .{ sym_name, if (dyn_object) |do| do.name else "NULL", err }, 0) catch @panic("OOM");
 
-        Logger.warn("dlsym(0x{x} [{s}], \"{s}\") failed: {}", .{ @intFromPtr(lib_handle), dyn_object.name, sym_name, err });
+        Logger.warn("dlsym({d} [{s}], \"{s}\") failed: {}", .{ @intFromPtr(lib_handle), if (dyn_object) |do| do.name else "NULL", sym_name, err });
 
         return null;
     };
 
-    Logger.info("intercepted call: success: dlsym(0x{x}, \"{s}\") = 0x{x}", .{ @intFromPtr(lib_handle), sym_name, sym.address });
+    Logger.info("intercepted call: success: dlsym({d} [{s}], \"{s}\") = 0x{x}", .{ @intFromPtr(lib_handle), if (dyn_object) |do| do.name else "NULL", sym_name, sym.address });
+
+    return @ptrFromInt(sym.address);
+}
+
+fn dlvsymSubstitute(lib_handle: ?*anyopaque, sym_name: [*:0]const u8, version: [*:0]const u8) callconv(.c) ?*anyopaque {
+    Logger.info("intercepted call: dlvsym({d}, \"{s}\" \"{s}\")", .{ @intFromPtr(lib_handle), sym_name, version });
+
+    const dyn_object = if (lib_handle) |h| &dyn_objects.values()[@intFromPtr(h) - 1] else null;
+
+    const sym = getResolvedSymbolByNameAndVersion(dyn_object, std.mem.span(sym_name), std.mem.span(version)) catch |err| {
+        if (last_dl_error != null) {
+            allocator.free(last_dl_error.?);
+        }
+        last_dl_error = std.fmt.allocPrintSentinel(allocator, "unable to get symbol {s}@{s} for library {s}:  {}", .{ sym_name, version, if (dyn_object) |do| do.name else "NULL", err }, 0) catch @panic("OOM");
+
+        Logger.warn("dlvsym({d} [{s}], \"{s}\", \"{s}\") failed: {}", .{ @intFromPtr(lib_handle), if (dyn_object) |do| do.name else "NULL", sym_name, version, err });
+
+        return null;
+    };
+
+    Logger.info("intercepted call: success: dlvsym({d} [{s}], \"{s}\", \"{s}\") = 0x{x}", .{ @intFromPtr(lib_handle), if (dyn_object) |do| do.name else "NULL", sym_name, version, sym.address });
 
     return @ptrFromInt(sym.address);
 }
@@ -3068,12 +3224,6 @@ fn dlerrorSubstitute() callconv(.c) ?[*:0]const u8 {
     Logger.info("intercepted call: success: dlerror() = {?s}", .{last_dl_error});
 
     return if (last_dl_error) |e| e.ptr else null;
-}
-
-fn dlvsymSubstitute(lib: *anyopaque, sym_name: [*:0]const u8, caller: ?*anyopaque) callconv(.c) ?*anyopaque {
-    // TODO real implementation
-    Logger.err("unimplemented: dlvsym(0x{x}, \"{s}\", 0x{x})", .{ @intFromPtr(lib), sym_name, if (caller != null) @intFromPtr(caller) else 0 });
-    @panic("unimplemented dlvsym");
 }
 
 fn dladdr1Substitute(addr: *anyopaque, dl_info: *DlInfo, extra_infos: *anyopaque, flags: c_int) callconv(.c) c_int {
