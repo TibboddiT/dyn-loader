@@ -1056,6 +1056,8 @@ fn resolvePath(r_path: []const u8) ![]const u8 {
 }
 
 fn loadDso(o_path: []const u8) !void {
+    var scratch_buf: [1024]u8 = undefined;
+
     const path: []const u8 = if (std.mem.startsWith(u8, o_path, "/")) try allocator.dupe(u8, o_path) else try resolvePath(o_path);
     defer allocator.free(path);
 
@@ -1131,7 +1133,6 @@ fn loadDso(o_path: []const u8) !void {
         Logger.debug("    name: {s}", .{name});
         Logger.debug("    link: {d}", .{sh.link});
         Logger.debug("    type: 0x{x}", .{sh.type});
-        Logger.debug("    type: {t}", .{sh.type});
         Logger.debug("    flags: {b}", .{@as(std.elf.Word, @bitCast(sh.flags.shf))});
         Logger.debug("    offset: 0x{x}", .{sh.offset});
         Logger.debug("    size: 0x{x}", .{sh.size});
@@ -1144,20 +1145,18 @@ fn loadDso(o_path: []const u8) !void {
 
             var j: usize = 0;
             while (j < sh.size) : (j += 1) {
-                // TODO max len of section name ?
-                var buf: [2048]u8 = [_]u8{0} ** 2048;
                 var k: usize = 0;
                 while (j < sh.size) : ({
                     k += 1;
                     j += 1;
                 }) {
-                    buf[k] = strs[j];
+                    scratch_buf[k] = strs[j];
                     if (strs[j] == 0) {
                         break;
                     }
                 }
                 if (k > 0) {
-                    Logger.debug("      - {s}", .{buf[0..k]});
+                    Logger.debug("      - {s}", .{scratch_buf[0..k]});
                 }
             }
 
@@ -1200,9 +1199,11 @@ fn loadDso(o_path: []const u8) !void {
                 .RELA,
                 .RELR,
                 .DYNAMIC,
+                .FINI_ARRAY,
                 => {},
+                std.elf.SHT.GNU_HASH => Logger.debug("    == TODO: section type GNU_HASH: {s}", .{name}),
                 else => |t| {
-                    Logger.debug("    == TODO: {t}: {s}", .{ t, name });
+                    Logger.debug("    == TODO: section type {s}: {s}", .{ if (@intFromEnum(t) <= 19) @tagName(t) else try std.fmt.bufPrint(&scratch_buf, "0x{x}", .{t}), name });
                 },
             }
         }
@@ -1451,7 +1452,7 @@ fn loadDso(o_path: []const u8) !void {
         const ph: *std.elf.Elf64.Phdr = @ptrFromInt(ph_addr);
 
         Logger.debug("  - {d}", .{i});
-        Logger.debug("    type: {t}", .{ph.type});
+        Logger.debug("    type: 0x{x}", .{ph.type});
         Logger.debug("    flags: {b}", .{@as(std.elf.Word, @bitCast(ph.flags))});
         Logger.debug("    offset: 0x{x}", .{ph.offset});
         Logger.debug("    v_addr: 0x{x}", .{ph.vaddr});
@@ -1593,14 +1594,25 @@ fn loadDso(o_path: []const u8) !void {
                     Logger.debug("        => TODO: DT_FLAGS: 0x{x}", .{dyns[j].d_val});
                 } else if (dyns[j].d_tag == std.elf.DT_FLAGS_1) {
                     Logger.debug("        => TODO: DT_FLAGS_1: 0x{x}", .{dyns[j].d_val});
-                } else if (dyns[j].d_tag == std.elf.DT_VERDEFNUM) {
-                    Logger.debug("        => TODO: DT_VERDEFNUM: 0x{x}", .{dyns[j].d_val});
+                } else if (dyns[j].d_tag == std.elf.DT_SONAME) {
+                    Logger.debug("        => TODO: DT_SONAME: 0x{x}", .{dyns[j].d_val});
+                } else if (dyns[j].d_tag == std.elf.DT_HASH) {
+                    Logger.debug("        => TODO: DT_HASH: 0x{x}", .{dyns[j].d_val});
+                } else if (dyns[j].d_tag == std.elf.DT_SYMENT) {
+                    Logger.debug("        => TODO: DT_SYMENT: 0x{x}", .{dyns[j].d_val});
+                } else if (dyns[j].d_tag == std.elf.DT_GNU_HASH) {
+                    Logger.debug("        => TODO: DT_GNU_HASH: 0x{x}", .{dyns[j].d_val});
                 } else {
                     switch (dyns[j].d_tag) {
                         std.elf.DT_NEEDED,
                         std.elf.DT_STRTAB,
                         std.elf.DT_SYMTAB,
                         std.elf.DT_STRSZ,
+                        std.elf.DT_VERSYM,
+                        std.elf.DT_VERNEED,
+                        std.elf.DT_VERNEEDNUM,
+                        std.elf.DT_VERDEF,
+                        std.elf.DT_VERDEFNUM,
                         => {},
                         else => {
                             Logger.debug("        == TODO: DT type 0x{x}: 0x{x}", .{ dyns[j].d_tag, dyns[j].d_val });
@@ -1727,7 +1739,14 @@ fn loadDso(o_path: []const u8) !void {
                 }
             }
         } else {
-            Logger.debug("    => TODO: {t}", .{ph.type});
+            Logger.debug("    => TODO: PT type {s}", .{pht_blk: {
+                if (@intFromEnum(ph.type) <= 8) {
+                    break :pht_blk @tagName(ph.type);
+                } else if (ph.type == std.elf.PT.GNU_STACK) {
+                    break :pht_blk "GNU_STACK";
+                }
+                break :pht_blk try std.fmt.bufPrint(&scratch_buf, "0x{x}", .{@intFromEnum(ph.type)});
+            }});
         }
     }
 
@@ -2719,6 +2738,7 @@ fn reprotectSegment(dyn_object: *DynObject, segment_index: usize) !void {
 const DynObjectSegmentResult = struct {
     dyn_object: *DynObject,
     segment_index: usize,
+    sym_index: ?usize,
 };
 
 fn findDynObjectSegmentForLoadedAddr(addr: usize) !DynObjectSegmentResult {
@@ -2727,9 +2747,20 @@ fn findDynObjectSegmentForLoadedAddr(addr: usize) !DynObjectSegmentResult {
             const segment_start = s.loaded_at;
             const segment_end = segment_start + s.mem_size;
             if (addr >= segment_start and addr < segment_end) {
+                for (dyn_object.syms_array.items, 0..) |*sym, sym_idx| {
+                    const sym_addr = try vAddressToLoadedAddress(dyn_object, sym.value);
+                    if (sym_addr <= addr and sym_addr + sym.size > addr) {
+                        return .{
+                            .dyn_object = dyn_object,
+                            .segment_index = s_idx,
+                            .sym_index = sym_idx,
+                        };
+                    }
+                }
                 return .{
                     .dyn_object = dyn_object,
                     .segment_index = s_idx,
+                    .sym_index = null,
                 };
             }
         }
@@ -2868,7 +2899,13 @@ fn callInitFunctions(dyn_obj: *DynObject) !void {
 fn getSubstituteAddress(sym: ResolvedSymbol) ?usize {
     var addr: ?usize = null;
 
-    // dl public fuctions
+    if (sym.dyn_object_idx == std.math.maxInt(usize)) {
+        return null;
+    }
+
+    const dyn_object = &dyn_objects.values()[sym.dyn_object_idx];
+
+    // dl fuctions
     if (std.mem.eql(u8, sym.name, "dlopen")) {
         addr = @intFromPtr(&dlopenSubstitute);
     } else if (std.mem.eql(u8, sym.name, "dlclose")) {
@@ -2887,6 +2924,15 @@ fn getSubstituteAddress(sym: ResolvedSymbol) ?usize {
         addr = @intFromPtr(&dlinfoSubstitute);
     } else if (std.mem.eql(u8, sym.name, "dlmopen")) {
         addr = @intFromPtr(&dlmopenSubstitute);
+    } else if (std.mem.eql(u8, sym.name, "_dl_find_object")) {
+        addr = @intFromPtr(&dlFindObjectSubstitute);
+    } else if (std.mem.eql(u8, sym.name, "dl_iterate_phdr")) {
+        addr = @intFromPtr(&dlIteratePhdrSubstitute);
+    } else if (std.mem.startsWith(u8, sym.name, "dl") or std.mem.startsWith(u8, sym.name, "_dl")) {
+        if (std.mem.find(u8, dyn_object.name, "ld-linux") == null) {
+            Logger.warn("substitutes: {s}: dangerous unsubstituted symbol {s} at 0x{x}", .{ dyn_object.name, sym.name, sym.address });
+        }
+        addr = @intFromPtr(&unsubstitutedTrap);
     }
 
     // special functions
@@ -2895,21 +2941,24 @@ fn getSubstituteAddress(sym: ResolvedSymbol) ?usize {
     }
 
     if (addr != null) {
-        Logger.debug("substitutes: found for {s}: 0x{x} => 0x{x}", .{ sym.name, sym.address, addr.? });
+        Logger.debug("substitutes: {s}: found for {s}: 0x{x} => 0x{x}", .{ dyn_object.name, sym.name, sym.address, addr.? });
     }
-
     return addr;
+}
+
+fn unsubstitutedTrap() void {
+    @panic("unsupported call to a dangerous function");
 }
 
 var extra_bytes: std.ArrayList([]const u8) = .empty;
 var last_dl_error: ?[:0]const u8 = null;
 
 fn dlopenSubstitute(path: ?[*:0]const u8, flags: c_int) callconv(.c) ?*anyopaque {
+    Logger.info("intercepted call: dlopen(\"{?s}\", 0x{x})", .{ path, flags });
+
     if (path == null) {
         return null;
     }
-
-    Logger.info("intercepted call: dlopen(\"{s}\", 0x{x})", .{ path.?, flags });
 
     const owned_path = allocator.dupe(u8, std.mem.span(path.?)) catch @panic("OOM");
     extra_bytes.append(allocator, owned_path) catch @panic("OOM");
@@ -2925,6 +2974,8 @@ fn dlopenSubstitute(path: ?[*:0]const u8, flags: c_int) callconv(.c) ?*anyopaque
         return null;
     };
 
+    Logger.info("intercepted call: success: dlopen(\"{?s}\", 0x{x}) = 0x{x}", .{ path, flags, lib.index + 1 });
+
     return @ptrFromInt(lib.index + 1);
 }
 
@@ -2935,6 +2986,8 @@ fn dlcloseSubstitute(lib: *anyopaque) callconv(.c) c_int {
 }
 
 fn dlsymSubstitute(lib_handle: *anyopaque, sym_name: [*:0]const u8) callconv(.c) ?*anyopaque {
+    Logger.info("intercepted call: dlsym(0x{x}, \"{s}\")", .{ @intFromPtr(lib_handle), sym_name });
+
     const lib_idx: usize = @as(usize, @intFromPtr(lib_handle)) - 1;
     const dyn_object = &dyn_objects.values()[lib_idx];
 
@@ -2949,6 +3002,8 @@ fn dlsymSubstitute(lib_handle: *anyopaque, sym_name: [*:0]const u8) callconv(.c)
         return null;
     };
 
+    Logger.info("intercepted call: success: dlsym(0x{x}, \"{s}\") = 0x{x}", .{ @intFromPtr(lib_handle), sym_name, sym.address });
+
     return @ptrFromInt(sym.address);
 }
 
@@ -2960,20 +3015,57 @@ fn dlsymSubstitute(lib_handle: *anyopaque, sym_name: [*:0]const u8) callconv(.c)
 // } Dl_info;
 
 const DlInfo = extern struct {
-    dli_fname: ?[*:0]const u8,
-    dli_fbase: ?[*:0]const u8,
+    dli_fname: [*:0]const u8,
+    dli_fbase: *anyopaque,
     dli_fsname: ?[*:0]const u8,
-    dli_fsaddr: ?[*:0]const u8,
+    dli_fsaddr: ?*anyopaque,
 };
 
 fn dladdrSubstitute(addr: *anyopaque, dl_info: *DlInfo) callconv(.c) c_int {
-    // TODO real implementation
-    Logger.warn("unimplemented: dladdr(0x{x}, {})", .{ @intFromPtr(addr), dl_info.* });
-    return 0;
+    Logger.info("intercepted call: dladdr(0x{x}, dl_info: *DlInfo [0x{x}])", .{ @intFromPtr(addr), @intFromPtr(dl_info) });
+
+    const infos = findDynObjectSegmentForLoadedAddr(@intFromPtr(addr)) catch |err| {
+        if (last_dl_error != null) {
+            allocator.free(last_dl_error.?);
+        }
+        last_dl_error = std.fmt.allocPrintSentinel(allocator, "unable to get infos for address 0x{x}:  {}", .{ @intFromPtr(addr), err }, 0) catch @panic("OOM");
+
+        Logger.warn("dladdr(0x{x}, {}) failed: {}", .{ @intFromPtr(addr), dl_info.*, err });
+
+        return 0;
+    };
+
+    const owned_name = allocator.dupeZ(u8, infos.dyn_object.name) catch @panic("OOM");
+    extra_bytes.append(allocator, owned_name) catch @panic("OOM");
+
+    dl_info.dli_fname = owned_name.ptr;
+    dl_info.dli_fbase = @ptrFromInt(infos.dyn_object.loaded_at.?);
+
+    if (infos.sym_index) |sidx| {
+        const sym = infos.dyn_object.syms_array.items[sidx];
+        const sym_addr = vAddressToLoadedAddress(infos.dyn_object, sym.value) catch unreachable;
+
+        const owned_sym_name = allocator.dupeZ(u8, sym.name) catch @panic("OOM");
+        extra_bytes.append(allocator, owned_sym_name) catch @panic("OOM");
+
+        dl_info.dli_fsname = owned_sym_name.ptr;
+        dl_info.dli_fsaddr = @ptrFromInt(sym_addr);
+    }
+
+    Logger.info("intercepted call: success: dladdr(0x{x}, .{{.dli_fname = {s}, .dli_fbase = 0x{x}, .dli_fsname = {?s}, .dli_fs_addr = 0x{x}}}) = 1", .{
+        @intFromPtr(addr),
+        dl_info.dli_fname,
+        @intFromPtr(dl_info.dli_fbase),
+        dl_info.dli_fsname,
+        if (dl_info.dli_fsaddr) |fsa| @intFromPtr(fsa) else 0,
+    });
+
+    return 1;
 }
 
 fn dlerrorSubstitute() callconv(.c) ?[*:0]const u8 {
     Logger.info("intercepted call: dlerror()", .{});
+    Logger.info("intercepted call: success: dlerror() = {?s}", .{last_dl_error});
 
     return if (last_dl_error) |e| e.ptr else null;
 }
@@ -3002,13 +3094,50 @@ fn dlmopenSubstitute(lmid: c_long, path: ?[*:0]u8, flags: c_int) callconv(.c) ?*
     return null;
 }
 
+fn dlfindObjectSubstitute(lmid: c_long, path: ?[*:0]u8, flags: c_int) callconv(.c) ?*anyopaque {
+    // TODO real implementation
+    Logger.warn("unimplemented: dlmopen({d}, \"{s}\", 0x{x})", .{ lmid, path orelse "NULL", flags });
+    return null;
+}
+
+//     addr = @intFromPtr(&dlFindObjectSubstitute);
+// } else if (std.mem.eql(u8, sym.name, "dl_iterate_phdr")) {
+//     addr = @intFromPtr(&dlIteratePhdrSubstitute);
+
+const DlFindObject = opaque {};
+
+fn dlFindObjectSubstitute(pc: *anyopaque, result: *DlFindObject) callconv(.c) c_int {
+    // TODO real implementation
+    Logger.warn("unimplemented: _dl_find_object(pc: 0x{x}, result: *DlFindObject [0x{x}])", .{ @intFromPtr(pc), @intFromPtr(result) });
+    return 0;
+}
+
+const DlPhdrInfo = opaque {};
+
+fn dlIteratePhdrSubstitute(callback: *const fn (*DlPhdrInfo, c_uint, *anyopaque) callconv(.c) c_int) callconv(.c) c_int {
+    // TODO real implementation
+    Logger.warn("unimplemented: dl_iterate_phdr(callback: 0x{x})", .{@intFromPtr(callback)});
+    return 0;
+}
+
 const TlsIndex = extern struct {
     ti_module: usize,
     ti_offset: usize,
 };
 
 fn tlsGetAddressSubstitute(tls_index: *TlsIndex) callconv(.c) ?*anyopaque {
-    // TODO real implementation
-    Logger.warn("unimplemented: __tls_get_addr({})", .{tls_index});
-    return null;
+    Logger.info("intercepted call: __tls_get_addr({})", .{tls_index});
+
+    const dyn_object_idx = tls_index.ti_module - 1;
+
+    var tp: usize = undefined;
+    const e_get_fs = std.os.linux.syscall2(.arch_prctl, std.os.linux.ARCH.GET_FS, @intFromPtr(&tp));
+    std.debug.assert(e_get_fs == 0);
+
+    const dyn_object = &dyn_objects.values()[dyn_object_idx];
+    const addr = tp - dyn_object.tls_offset + tls_index.ti_offset;
+
+    Logger.info("intercepted call: success: __tls_get_addr({{.module = {s}, .offset = 0x{x}}}) = 0x{x}", .{ dyn_object.name, tls_index.ti_offset, addr });
+
+    return @ptrFromInt(addr);
 }
