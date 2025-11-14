@@ -40,7 +40,7 @@ pub fn main() !void {
 
 - Libraries that `dlopen` other libraries might not behave correctly until:
   - all `dl` public API functions (like `dladdr`) are implemented
-  - `__tls_get_addr` is implemented
+- Even some `dl` not so private functions need an implementation, mainly because C++ exception handling (*sad*) might call them... (for instance `_dl_find_object`)
 - Loading libraries should be done before having started any thread.
 - Starting threads in zig land and in library land needs to be tested.
 - Some (rare) relocation types are still missing.
