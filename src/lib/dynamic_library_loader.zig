@@ -761,7 +761,7 @@ pub fn init(options: InitOptions) !void {
 
     // TODO
     // - pre restructure TLS
-    // - assert linux x86_64 gnu
+    // - assert linux x86_64
     // - assert statically linked
     // - assert only one thread
 

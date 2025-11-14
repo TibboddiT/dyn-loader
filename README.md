@@ -22,6 +22,7 @@ pub fn main() !void {
     const allocator = gpa.allocator();
     defer if (gpa.deinit() != .ok) @panic("memory check failed");
 
+    // `dll` is a singleton, it should be initialized early and only once, on the main thread
     try dll.init(.{ .allocator = allocator, .log_level = .warn });
     defer dll.deinit();
 
@@ -34,6 +35,16 @@ pub fn main() !void {
     _ = printf("Hello, %s!\n", "World");
 }
 ```
+
+### Current limitations
+
+- Libraries that `dlopen` other libraries might not behave correctly until:
+  - all `dl` public API functions (like `dladdr`) are implemented
+  - `__tls_get_addr` is implemented
+- Loading libraries should be done before having started any thread.
+- Starting threads in zig land and in library land needs to be tested.
+- Some (rare) relocation types are still missing
+- You should not link any `libc` (it is part of the goal anyway).
 
 ### Notes
 
