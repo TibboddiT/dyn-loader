@@ -2981,8 +2981,8 @@ fn dlopenSubstitute(path: ?[*:0]const u8, flags: c_int) callconv(.c) ?*anyopaque
 
 fn dlcloseSubstitute(lib: *anyopaque) callconv(.c) c_int {
     // TODO real implementation
-    Logger.warn("unimplemented: dlclose(0x{x})", .{@intFromPtr(lib)});
-    return 0;
+    Logger.err("unimplemented: dlclose(0x{x})", .{@intFromPtr(lib)});
+    @panic("unimplemented dlclose");
 }
 
 fn dlsymSubstitute(lib_handle: *anyopaque, sym_name: [*:0]const u8) callconv(.c) ?*anyopaque {
@@ -3072,52 +3072,42 @@ fn dlerrorSubstitute() callconv(.c) ?[*:0]const u8 {
 
 fn dlvsymSubstitute(lib: *anyopaque, sym_name: [*:0]const u8, caller: ?*anyopaque) callconv(.c) ?*anyopaque {
     // TODO real implementation
-    Logger.warn("unimplemented: dlvsym(0x{x}, \"{s}\", 0x{x})", .{ @intFromPtr(lib), sym_name, if (caller != null) @intFromPtr(caller) else 0 });
-    return null;
+    Logger.err("unimplemented: dlvsym(0x{x}, \"{s}\", 0x{x})", .{ @intFromPtr(lib), sym_name, if (caller != null) @intFromPtr(caller) else 0 });
+    @panic("unimplemented dlvsym");
 }
 
 fn dladdr1Substitute(addr: *anyopaque, dl_info: *DlInfo, extra_infos: *anyopaque, flags: c_int) callconv(.c) c_int {
     // TODO real implementation
-    Logger.warn("unimplemented: dladdr1(0x{x}, {}, 0x{x}, 0x{x})", .{ @intFromPtr(addr), dl_info.*, @intFromPtr(extra_infos), flags });
-    return 0;
+    Logger.err("unimplemented: dladdr1(0x{x}, {}, 0x{x}, 0x{x})", .{ @intFromPtr(addr), dl_info.*, @intFromPtr(extra_infos), flags });
+    @panic("unimplemented dladdr1");
 }
 
 fn dlinfoSubstitute(lib: *anyopaque, request: c_int, info: *anyopaque) callconv(.c) c_int {
     // TODO real implementation
-    Logger.warn("unimplemented: dlinfo(0x{x}, 0x{x}, 0x{x})", .{ @intFromPtr(lib), request, @intFromPtr(info) });
-    return 0;
+    Logger.err("unimplemented: dlinfo(0x{x}, 0x{x}, 0x{x})", .{ @intFromPtr(lib), request, @intFromPtr(info) });
+    @panic("unimplemented dlinfo");
 }
 
 fn dlmopenSubstitute(lmid: c_long, path: ?[*:0]u8, flags: c_int) callconv(.c) ?*anyopaque {
     // TODO real implementation
-    Logger.warn("unimplemented: dlmopen({d}, \"{s}\", 0x{x})", .{ lmid, path orelse "NULL", flags });
-    return null;
+    Logger.err("unimplemented: dlmopen({d}, \"{s}\", 0x{x})", .{ lmid, path orelse "NULL", flags });
+    @panic("unimplemented dlmopen");
 }
-
-fn dlfindObjectSubstitute(lmid: c_long, path: ?[*:0]u8, flags: c_int) callconv(.c) ?*anyopaque {
-    // TODO real implementation
-    Logger.warn("unimplemented: dlmopen({d}, \"{s}\", 0x{x})", .{ lmid, path orelse "NULL", flags });
-    return null;
-}
-
-//     addr = @intFromPtr(&dlFindObjectSubstitute);
-// } else if (std.mem.eql(u8, sym.name, "dl_iterate_phdr")) {
-//     addr = @intFromPtr(&dlIteratePhdrSubstitute);
 
 const DlFindObject = opaque {};
 
 fn dlFindObjectSubstitute(pc: *anyopaque, result: *DlFindObject) callconv(.c) c_int {
     // TODO real implementation
-    Logger.warn("unimplemented: _dl_find_object(pc: 0x{x}, result: *DlFindObject [0x{x}])", .{ @intFromPtr(pc), @intFromPtr(result) });
-    return 0;
+    Logger.err("unimplemented: _dl_find_object(pc: 0x{x}, result: *DlFindObject [0x{x}])", .{ @intFromPtr(pc), @intFromPtr(result) });
+    @panic("unimplemented _dl_find_object");
 }
 
 const DlPhdrInfo = opaque {};
 
 fn dlIteratePhdrSubstitute(callback: *const fn (*DlPhdrInfo, c_uint, *anyopaque) callconv(.c) c_int) callconv(.c) c_int {
     // TODO real implementation
-    Logger.warn("unimplemented: dl_iterate_phdr(callback: 0x{x})", .{@intFromPtr(callback)});
-    return 0;
+    Logger.err("unimplemented: dl_iterate_phdr(callback: 0x{x})", .{@intFromPtr(callback)});
+    @panic("unimplemented dl_iterate_phdr");
 }
 
 const TlsIndex = extern struct {
