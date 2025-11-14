@@ -804,6 +804,7 @@ const ResolvedSymbol = struct {
     address: usize,
     name: []const u8,
     version: []const u8,
+    dyn_object_idx: usize,
 };
 
 const Reloc = struct {
@@ -2501,6 +2502,13 @@ fn mapTlsBlock(dyn_object: *DynObject) !void {
     dyn_object.tls_mapped_at = @as(usize, @intFromPtr(new_area.ptr)) - dyn_object.tls_offset;
 }
 
+fn tlsDescResolver() callconv(.naked) void {}
+
+const TlsDesc = extern struct {
+    tls_desc_resolver: *const fn () callconv(.naked) void,
+    tls_desc_resolver_arg: isize,
+};
+
 fn processRelocations(dyn_object: *DynObject) !void {
     Logger.debug("processing relocations for {s}", .{dyn_object.name});
 
@@ -2548,7 +2556,8 @@ fn processRelocations(dyn_object: *DynObject) !void {
                 reloc_count += 1;
                 // R_X86_64_TPOFF64: S + A (TLS offset)
                 const sym = try resolveSymbol(dyn_object, reloc.sym_idx);
-                const value = @as(isize, @intCast(sym.value)) + reloc.addend - @as(isize, @intCast(dyn_object.tls_offset));
+                const tls_offset = dyn_objects.values()[sym.dyn_object_idx].tls_offset;
+                const value = @as(isize, @intCast(sym.value)) + reloc.addend - @as(isize, @intCast(tls_offset));
                 Logger.debug("  TPOFF64: 0x{x} (0x{x}): 0x{x} -> 0x{x} (0x{x}, {s}@{s} - [MODULE_TLS_OFFSET]0x{x} + 0x{x})", .{
                     reloc_addr,
                     reloc.offset,
@@ -2561,6 +2570,60 @@ fn processRelocations(dyn_object: *DynObject) !void {
                     reloc.addend,
                 });
                 ptr.* = @bitCast(value);
+            },
+            .DTPOFF64 => {
+                reloc_count += 1;
+                // R_X86_64_DTPOFF64: S + A
+                const sym = try resolveSymbol(dyn_object, reloc.sym_idx);
+                const value = @as(isize, @intCast(sym.value)) + reloc.addend;
+                Logger.debug("  DTPOFF64: 0x{x} (0x{x}): 0x{x} -> 0x{x} (0x{x}, {s}@{s} + 0x{x})", .{
+                    reloc_addr,
+                    reloc.offset,
+                    ptr.*,
+                    value,
+                    sym.value,
+                    sym.name,
+                    sym.version,
+                    reloc.addend,
+                });
+                ptr.* = @bitCast(value);
+            },
+            .DTPMOD64 => {
+                reloc_count += 1;
+                // R_X86_64_DTPMOD64: S (TLS module ID)
+                const sym = try resolveSymbol(dyn_object, reloc.sym_idx);
+                const tls_module_id = sym.dyn_object_idx + 1;
+                const value = @as(isize, @intCast(tls_module_id));
+                Logger.debug("  DTPMOD64: 0x{x} (0x{x}): 0x{x} -> 0x{x} (0x{x}, {s}@{s} => [MODULE_TLS_ID]0x{x})", .{
+                    reloc_addr,
+                    reloc.offset,
+                    ptr.*,
+                    value,
+                    sym.value,
+                    sym.name,
+                    sym.version,
+                    dyn_object.tls_offset,
+                });
+                ptr.* = @bitCast(value);
+            },
+            .TLSDESC => {
+                reloc_count += 1;
+                // TLSDESC
+                const sym = try resolveSymbol(dyn_object, reloc.sym_idx);
+                const tls_offset = dyn_objects.values()[sym.dyn_object_idx].tls_offset;
+                const value: TlsDesc = .{ .tls_desc_resolver_arg = @as(isize, @intCast(sym.value)) + reloc.addend - @as(isize, @intCast(tls_offset)), .tls_desc_resolver = &tlsDescResolver };
+                Logger.debug("  DTPMOD64: 0x{x} (0x{x}): 0x{x} -> {} (0x{x}, {s}@{s} => [MODULE_TLS_ID]0x{x})", .{
+                    reloc_addr,
+                    reloc.offset,
+                    ptr.*,
+                    value,
+                    sym.value,
+                    sym.name,
+                    sym.version,
+                    dyn_object.tls_offset,
+                });
+                const casted_ptr: *TlsDesc = @ptrCast(ptr);
+                casted_ptr.* = @bitCast(value);
             },
             .IRELATIVE => {
                 // R_X86_64_IRELATIVE: indirect relative (function pointer)
@@ -2589,12 +2652,7 @@ fn processIRelativeRelocations(dyn_object: *DynObject) !void {
         std.debug.assert(reloc.addend >= 0);
 
         switch (reloc.type) {
-            .RELATIVE,
-            .@"64",
-            .GLOB_DAT,
-            .JUMP_SLOT,
-            .TPOFF64,
-            => {},
+            .RELATIVE, .@"64", .GLOB_DAT, .JUMP_SLOT, .TPOFF64, .DTPOFF64, .DTPMOD64, .TLSDESC => {},
             .IRELATIVE => {
                 reloc_count += 1;
                 const resolver_addr = try vAddressToLoadedAddress(dyn_object, @intCast(reloc.addend));
@@ -2645,6 +2703,7 @@ fn resolveSymbolByName(sym_name: []const u8) !ResolvedSymbol {
                         .address = dep_addr,
                         .name = dep_sym.name,
                         .version = dep_sym.version,
+                        .dyn_object_idx = dyn_objects.getIndex(dep_object.name).?,
                     };
                 }
 
@@ -2683,6 +2742,7 @@ fn getResolvedSymbolByName(dyn_object: *DynObject, sym_name: []const u8) !Resolv
                         .address = dep_addr,
                         .name = dep_sym.name,
                         .version = dep_sym.version,
+                        .dyn_object_idx = dyn_objects.getIndex(dep_object.name).?,
                     };
 
                     if (getSubstituteAddress(res_sym)) |a| {
@@ -2732,6 +2792,7 @@ fn resolveSymbol(dyn_object: *DynObject, sym_idx: usize) !ResolvedSymbol {
             .address = addr,
             .name = sym.name,
             .version = sym.version,
+            .dyn_object_idx = dyn_objects.getIndex(dyn_object.name).?,
         };
     }
 
@@ -2745,7 +2806,7 @@ fn resolveSymbol(dyn_object: *DynObject, sym_idx: usize) !ResolvedSymbol {
         if (dep_object.syms.get(sym.name)) |dep_sym_list| {
             for (dep_sym_list.items) |dep_sym_idx| {
                 const dep_sym = dep_object.syms_array.items[dep_sym_idx];
-                if (dep_sym.shidx != .SHN_UNDEF and (std.mem.eql(u8, dep_sym.version, "GLOBAL") or std.mem.eql(u8, dep_sym.version, sym.version)) and !dep_sym.hidden) {
+                if (dep_sym.shidx != .SHN_UNDEF and (dep_sym.version.len == 0 or std.mem.eql(u8, dep_sym.version, "GLOBAL") or std.mem.eql(u8, dep_sym.version, sym.version)) and !dep_sym.hidden) {
                     if (dep_sym.bind == .WEAK) {
                         Logger.debug("WARNING: WEAK SYMBOL from dep: {s}", .{if (sym_idx == 0) "ZERO" else dep_sym.name});
                     }
@@ -2767,12 +2828,13 @@ fn resolveSymbol(dyn_object: *DynObject, sym_idx: usize) !ResolvedSymbol {
                         .address = dep_addr,
                         .name = dep_sym.name,
                         .version = dep_sym.version,
+                        .dyn_object_idx = dep_idx,
                     };
                 }
 
                 if (dep_sym.shidx == .SHN_UNDEF) Logger.debug("WARNING: SKIPPING UNDEF SYMBOL from dep: {s} | {s}@{s}", .{ dep_object.name, dep_sym.name, dep_sym.version });
                 if (dep_sym.hidden) Logger.debug("WARNING: SKIPPING HIDDEN SYMBOL from dep: {s} | {s}@{s}", .{ dep_object.name, dep_sym.name, dep_sym.version });
-                if (!std.mem.eql(u8, dep_sym.version, "GLOBAL") and !std.mem.eql(u8, dep_sym.version, sym.version)) Logger.debug("WARNING: SKIPPING MISVERSIONED SYMBOL from dep: {s} | {s} ({s} vs {s})", .{ dep_object.name, dep_sym.name, sym.version, dep_sym.version });
+                if (dep_sym.version.len != 0 and !std.mem.eql(u8, dep_sym.version, "GLOBAL") and !std.mem.eql(u8, dep_sym.version, sym.version)) Logger.debug("WARNING: SKIPPING MISVERSIONED SYMBOL from dep: {s} | {s} ({s} vs {s})", .{ dep_object.name, dep_sym.name, sym.version, dep_sym.version });
             }
         }
     }
@@ -2789,6 +2851,7 @@ fn resolveSymbol(dyn_object: *DynObject, sym_idx: usize) !ResolvedSymbol {
             .address = 0,
             .name = sym.name,
             .version = sym.version,
+            .dyn_object_idx = std.math.maxInt(usize),
         };
     }
 
@@ -3034,6 +3097,7 @@ fn callInitFunctions(dyn_obj: *DynObject) !void {
 fn getSubstituteAddress(sym: ResolvedSymbol) ?usize {
     var addr: ?usize = null;
 
+    // dl public fuctions
     if (std.mem.eql(u8, sym.name, "dlopen")) {
         addr = @intFromPtr(&dlopenSubstitute);
     } else if (std.mem.eql(u8, sym.name, "dlclose")) {
@@ -3052,11 +3116,16 @@ fn getSubstituteAddress(sym: ResolvedSymbol) ?usize {
         addr = @intFromPtr(&dlinfoSubstitute);
     } else if (std.mem.eql(u8, sym.name, "dlmopen")) {
         addr = @intFromPtr(&dlmopenSubstitute);
-    } else {
-        return null;
     }
 
-    Logger.debug("substitutes: found for {s}: 0x{x} => 0x{x}", .{ sym.name, sym.address, addr.? });
+    // special functions
+    if (std.mem.eql(u8, sym.name, "__tls_get_addr")) {
+        addr = @intFromPtr(&tlsGetAddressSubstitute);
+    }
+
+    if (addr != null) {
+        Logger.debug("substitutes: found for {s}: 0x{x} => 0x{x}", .{ sym.name, sym.address, addr.? });
+    }
 
     return addr;
 }
@@ -3094,10 +3163,22 @@ fn dlcloseSubstitute(lib: *anyopaque) callconv(.c) c_int {
     return 0;
 }
 
-fn dlsymSubstitute(lib: *anyopaque, sym_name: [*:0]const u8) callconv(.c) ?*anyopaque {
-    // TODO real implementation
-    Logger.warn("unimplemented: dlsym(0x{x}, \"{s}\")", .{ @intFromPtr(lib), sym_name });
-    return null;
+fn dlsymSubstitute(lib_handle: *anyopaque, sym_name: [*:0]const u8) callconv(.c) ?*anyopaque {
+    const lib_idx: usize = @as(usize, @intFromPtr(lib_handle)) - 1;
+    const dyn_object = &dyn_objects.values()[lib_idx];
+
+    const sym = getResolvedSymbolByName(dyn_object, std.mem.span(sym_name)) catch |err| {
+        if (last_dl_error != null) {
+            allocator.free(last_dl_error.?);
+        }
+        last_dl_error = std.fmt.allocPrintSentinel(allocator, "unable to get symbol {s} for library {s}:  {}", .{ sym_name, dyn_object.name, err }, 0) catch @panic("OOM");
+
+        Logger.warn("dlsym(0x{x} [{s}], \"{s}\") failed: {}", .{ @intFromPtr(lib_handle), dyn_object.name, sym_name, err });
+
+        return null;
+    };
+
+    return @ptrFromInt(sym.address);
 }
 
 // typedef struct {
@@ -3147,5 +3228,16 @@ fn dlinfoSubstitute(lib: *anyopaque, request: c_int, info: *anyopaque) callconv(
 fn dlmopenSubstitute(lmid: c_long, path: ?[*:0]u8, flags: c_int) callconv(.c) ?*anyopaque {
     // TODO real implementation
     Logger.warn("unimplemented: dlmopen({d}, \"{s}\", 0x{x})", .{ lmid, path orelse "NULL", flags });
+    return null;
+}
+
+const TlsIndex = extern struct {
+    ti_module: usize,
+    ti_offset: usize,
+};
+
+fn tlsGetAddressSubstitute(tls_index: *TlsIndex) callconv(.c) ?*anyopaque {
+    // TODO real implementation
+    Logger.warn("unimplemented: __tls_get_addr({})", .{tls_index});
     return null;
 }
