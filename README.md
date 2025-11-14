@@ -105,5 +105,4 @@ zig build run-vulkan_version_musl
 zig build run-x11_window
 ```
 
-- Non musl versions expect a glibc based system.
 - Both `vulkan_advanced` versions will currently result in an error, until libc's `dl` function replacements are implemented.
