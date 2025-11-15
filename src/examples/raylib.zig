@@ -41,9 +41,9 @@ pub fn main() !void {
 
     const init_window_sym = try lib_raylib.getSymbol("InitWindow");
     const init_window_addr = init_window_sym.addr;
-    const init_window: *const fn (width: c_int, height: c_int, title: [*:0]const u8) callconv(.c) void = @ptrFromInt(init_window_addr);
+    const initWindow: *const fn (width: c_int, height: c_int, title: [*:0]const u8) callconv(.c) void = @ptrFromInt(init_window_addr);
 
-    init_window(800, 600, "Hello from raylib!");
+    initWindow(800, 600, "Hello from raylib!");
 
     try std.Io.sleep(io, .fromSeconds(3), .awake);
 }

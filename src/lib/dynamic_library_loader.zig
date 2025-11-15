@@ -451,6 +451,9 @@ pub const CustomSelfInfo = struct {
             .shared => si.rwlock.unlockShared(),
             .exclusive => si.rwlock.unlock(),
         }
+
+        std.log.err("No module found for address 0x{x}", .{address});
+
         return error.MissingDebugInfo;
     }
     const DlIterContext = struct {
@@ -932,13 +935,6 @@ pub fn load(f_path: []const u8) !DynamicLibrary {
 
         try updateSegmentsPermissions(dyn_obj);
         _dl_debug_state();
-        try callInitFunctions(dyn_obj);
-    }
-
-    for (dyn_objects.values()) |*dyn_obj| {
-        if (dyn_obj.loaded_at == null) {
-            continue;
-        }
 
         dyn_obj.loaded = true;
 
@@ -951,12 +947,18 @@ pub fn load(f_path: []const u8) !DynamicLibrary {
             .phnum = dyn_obj.eh.e_phnum,
         };
 
+        Logger.debug("unwinding: registering {s} at 0x{x}", .{ dyn_obj.name, dyn_obj.loaded_at.? });
+
         try CustomSelfInfo.addExtraElf(allocator, dl_phdr_info);
+
+        try callInitFunctions(dyn_obj);
     }
 
-    // for (dyn_objects.values()) |*dyn_obj| {
-    //     try dumpSegments(dyn_obj);
-    // }
+    for (dyn_objects.values()) |*dyn_obj| {
+        if (dyn_obj.loaded) {
+            continue;
+        }
+    }
 
     return lib;
 }
@@ -2123,11 +2125,15 @@ fn mapTlsBlock(dyn_object: *DynObject) !void {
         current_surplus_size -= (new_area_size - current_tls_area_desc.size);
         area_was_extended = true;
     } else if (new_area_size > current_tls_area_desc.size) {
-        Logger.warn("tls: mapping new area (surplus exhausted, dangerous): size: 0x{x} (new_area_size) + 0x{x} (size of pthread struct)", .{ new_area_size, sizeof_pthread });
-        new_area = std.posix.mmap(null, new_area_size + sizeof_pthread, std.posix.PROT.READ | std.posix.PROT.WRITE, .{ .TYPE = .PRIVATE, .ANONYMOUS = true }, -1, 0) catch |err| {
-            Logger.err("failed to allocate tls space: {s}", .{@errorName(err)});
-            return err;
-        };
+        // Logger.warn("tls: mapping new area (surplus exhausted, dangerous): size: 0x{x} (new_area_size) + 0x{x} (size of pthread struct)", .{ new_area_size, sizeof_pthread });
+        // new_area = std.posix.mmap(null, new_area_size + sizeof_pthread, std.posix.PROT.READ | std.posix.PROT.WRITE, .{ .TYPE = .PRIVATE, .ANONYMOUS = true }, -1, 0) catch |err| {
+        //     Logger.err("failed to allocate tls space: {s}", .{@errorName(err)});
+        //     return err;
+        // };
+
+        // TODO the goal is to avoid unstable thread pointer
+        Logger.err("tls: surplus exhausted: wanted size: 0x{x} (new_area_size) + 0x{x} (size of pthread struct)", .{ new_area_size, sizeof_pthread });
+        @panic("unsupported tls area extension");
     }
 
     if (new_area != null and dyn_object.tls_init_file_size > 0) {
@@ -2150,6 +2156,7 @@ fn mapTlsBlock(dyn_object: *DynObject) !void {
 
     if (current_tls_area_desc.gdt_entry_number != @as(usize, @bitCast(@as(isize, -1)))) {
         if (new_area != null and !area_was_extended) {
+            // TODO we should not do that
             Logger.debug("tls: copying previous pthread data: from 0x{x} to 0x{x} (size: 0x{x})", .{
                 new_abi_tcb_offset,
                 new_area_size + sizeof_pthread,
@@ -2321,6 +2328,12 @@ fn mapTlsBlock(dyn_object: *DynObject) !void {
             } else {
                 Logger.info("tls: no rtld_global_ro symbol found", .{});
             }
+
+            // TODO we should find a way to get this offset at runtime
+            const tid = std.Thread.getCurrentId();
+            Logger.debug("tls: setting thread id {d} for pthread at 0x{x}", .{ tid, new_tp + 720 });
+            const tid_ptr: *volatile usize = @ptrFromInt(new_tp + 720);
+            tid_ptr.* = tid;
         }
 
         dyn_object.tls_offset = new_abi_tcb_offset;
@@ -2378,7 +2391,7 @@ fn processRelocations(dyn_object: *DynObject) !void {
                 reloc_count += 1;
                 // R_X86_64_JUMP_SLOT: S
                 const sym = try resolveSymbol(dyn_object, reloc.sym_idx);
-                const value = if (getSubstituteAddress(sym)) |a| a else sym.address;
+                const value = if (getSubstituteAddress(sym, dyn_object)) |a| a else sym.address;
                 Logger.debug("  JUMP_SLOT: 0x{x} (0x{x}): 0x{x} -> 0x{x} (0x{x}, {s}@{s} + 0x{x})", .{ reloc_addr, reloc.offset, ptr.*, value, sym.value, sym.name, sym.version, reloc.addend });
                 ptr.* = value;
             },
@@ -2592,7 +2605,7 @@ fn getResolvedSymbolByName(maybe_dyn_object: ?*DynObject, sym_name: []const u8) 
                             .dyn_object_idx = dyn_objects.getIndex(dep_object.name).?,
                         };
 
-                        if (getSubstituteAddress(res_sym)) |a| {
+                        if (getSubstituteAddress(res_sym, dep_object)) |a| {
                             res_sym.address = a;
                         }
 
@@ -2646,7 +2659,7 @@ fn getResolvedSymbolByName(maybe_dyn_object: ?*DynObject, sym_name: []const u8) 
                             .dyn_object_idx = dyn_objects.getIndex(dep_object.name).?,
                         };
 
-                        if (getSubstituteAddress(res_sym)) |a| {
+                        if (getSubstituteAddress(res_sym, dep_object)) |a| {
                             res_sym.address = a;
                         }
 
@@ -2707,7 +2720,7 @@ fn getResolvedSymbolByNameAndVersion(maybe_dyn_object: ?*DynObject, sym_name: []
                             .dyn_object_idx = dyn_objects.getIndex(dep_object.name).?,
                         };
 
-                        if (getSubstituteAddress(res_sym)) |a| {
+                        if (getSubstituteAddress(res_sym, dep_object)) |a| {
                             res_sym.address = a;
                         }
 
@@ -2761,7 +2774,7 @@ fn getResolvedSymbolByNameAndVersion(maybe_dyn_object: ?*DynObject, sym_name: []
                             .dyn_object_idx = dyn_objects.getIndex(dep_object.name).?,
                         };
 
-                        if (getSubstituteAddress(res_sym)) |a| {
+                        if (getSubstituteAddress(res_sym, dep_object)) |a| {
                             res_sym.address = a;
                         }
 
@@ -3019,6 +3032,8 @@ fn findDynObjectSegmentForLoadedAddr(addr: usize) !DynObjectSegmentResult {
         }
     }
 
+    // TODO also search the main executable, in case it is c++ that wants to unwind an exception
+
     return error.LoadedAddressNotMapped;
 }
 
@@ -3149,7 +3164,7 @@ fn callInitFunctions(dyn_obj: *DynObject) !void {
     }
 }
 
-fn getSubstituteAddress(sym: ResolvedSymbol) ?usize {
+fn getSubstituteAddress(sym: ResolvedSymbol, for_obj: *DynObject) ?usize {
     var addr: ?usize = null;
 
     if (sym.dyn_object_idx == std.math.maxInt(usize)) {
@@ -3158,7 +3173,7 @@ fn getSubstituteAddress(sym: ResolvedSymbol) ?usize {
 
     const dyn_object = &dyn_objects.values()[sym.dyn_object_idx];
 
-    // dl fuctions
+    // dl functions
     if (std.mem.eql(u8, sym.name, "dlopen")) {
         addr = @intFromPtr(&dlopenSubstitute);
     } else if (std.mem.eql(u8, sym.name, "dlclose")) {
@@ -3182,10 +3197,43 @@ fn getSubstituteAddress(sym: ResolvedSymbol) ?usize {
     } else if (std.mem.eql(u8, sym.name, "dl_iterate_phdr")) {
         addr = @intFromPtr(&dlIteratePhdrSubstitute);
     } else if (std.mem.startsWith(u8, sym.name, "dl") or std.mem.startsWith(u8, sym.name, "_dl")) {
-        if (std.mem.find(u8, dyn_object.name, "ld-linux") == null) {
-            Logger.warn("substitutes: {s}: dangerous unsubstituted symbol {s} at 0x{x}", .{ dyn_object.name, sym.name, sym.address });
-        }
+        Logger.warn("substitutes: {s}: dangerous unsubstituted dl function [{s}] {s} at 0x{x}", .{ for_obj.name, dyn_object.name, sym.name, sym.address });
         addr = @intFromPtr(&unsubstitutedTrap);
+    }
+
+    // pthreads functions
+    if (!std.mem.startsWith(u8, for_obj.name, "libpthread.so")) {
+        if (std.mem.eql(u8, sym.name, "pthread_create")) {
+            Logger.warn("substitutes: {s}: dangerous unsubstituted pthread function [{s}] {s} as 0x{x}", .{ for_obj.name, dyn_object.name, sym.name, sym.address });
+            addr = @intFromPtr(&pthreadCreateSubstitute);
+        } else if (std.mem.eql(u8, sym.name, "pthread_exit")) {
+            Logger.warn("substitutes: {s}: dangerous unsubstituted pthread function [{s}] {s} as 0x{x}", .{ for_obj.name, dyn_object.name, sym.name, sym.address });
+            addr = @intFromPtr(&unsubstitutedTrap);
+        } else if (std.mem.eql(u8, sym.name, "pthread_cancel")) {
+            Logger.warn("substitutes: {s}: dangerous unsubstituted pthread function [{s}] {s} as 0x{x}", .{ for_obj.name, dyn_object.name, sym.name, sym.address });
+            addr = @intFromPtr(&unsubstitutedTrap);
+        } else if (std.mem.eql(u8, sym.name, "pthread_detach")) {
+            Logger.warn("substitutes: {s}: dangerous unsubstituted pthread function [{s}] {s} as 0x{x}", .{ for_obj.name, dyn_object.name, sym.name, sym.address });
+            addr = @intFromPtr(&unsubstitutedTrap);
+        } else if (std.mem.eql(u8, sym.name, "pthread_join")) {
+            Logger.warn("substitutes: {s}: dangerous unsubstituted pthread function [{s}] {s} as 0x{x}", .{ for_obj.name, dyn_object.name, sym.name, sym.address });
+            addr = @intFromPtr(&unsubstitutedTrap);
+        }
+
+        // TODO checkif those functions really needs to be subsituted, it seems they only acts on the pthread struct
+        // else if (std.mem.eql(u8, sym.name, "pthread_key_create")) {
+        //     Logger.warn("substitutes: {s}: dangerous unsubstituted pthread function [{s}] {s} as 0x{x}", .{ for_obj.name, dyn_object.name, sym.name, sym.address });
+        //     addr = @intFromPtr(&unsubstitutedTrap);
+        // } else if (std.mem.eql(u8, sym.name, "pthread_key_delete")) {
+        //     Logger.warn("substitutes: {s}: dangerous unsubstituted pthread function [{s}] {s} as 0x{x}", .{ for_obj.name, dyn_object.name, sym.name, sym.address });
+        //     addr = @intFromPtr(&unsubstitutedTrap);
+        // } else if (std.mem.eql(u8, sym.name, "pthread_setspecific")) {
+        //     Logger.warn("substitutes: {s}: dangerous unsubstituted pthread function [{s}] {s} as 0x{x}", .{ for_obj.name, dyn_object.name, sym.name, sym.address });
+        //     addr = @intFromPtr(&unsubstitutedTrap);
+        // } else if (std.mem.eql(u8, sym.name, "pthread_getspecific")) {
+        //     Logger.warn("substitutes: {s}: dangerous unsubstituted pthread function [{s}] {s} as 0x{x}", .{ for_obj.name, dyn_object.name, sym.name, sym.address });
+        //     addr = @intFromPtr(&unsubstitutedTrap);
+        // }
     }
 
     // special functions
@@ -3196,6 +3244,7 @@ fn getSubstituteAddress(sym: ResolvedSymbol) ?usize {
     if (addr != null) {
         Logger.debug("substitutes: {s}: found for {s}: 0x{x} => 0x{x}", .{ dyn_object.name, sym.name, sym.address, addr.? });
     }
+
     return addr;
 }
 
@@ -3324,6 +3373,9 @@ fn dladdrSubstitute(addr: *anyopaque, dl_info: *DlInfo) callconv(.c) c_int {
 
         dl_info.dli_fsname = owned_sym_name.ptr;
         dl_info.dli_fsaddr = @ptrFromInt(sym_addr);
+    } else {
+        dl_info.dli_fsname = null;
+        dl_info.dli_fsaddr = null;
     }
 
     Logger.info("intercepted call: success: dladdr(0x{x}, .{{.dli_fname = {s}, .dli_fbase = 0x{x}, .dli_fsname = {?s}, .dli_fs_addr = 0x{x}}}) = 1", .{
@@ -3362,20 +3414,65 @@ fn dlmopenSubstitute(lmid: c_long, path: ?[*:0]u8, flags: c_int) callconv(.c) ?*
     @panic("unimplemented dlmopen");
 }
 
-const DlFindObject = opaque {};
+const DlFindObject = extern struct {
+    dlfo_flags: c_ulonglong,
+    dlfo_map_start: ?*anyopaque,
+    dlfo_map_end: ?*anyopaque,
+    dlfo_link_map: ?*anyopaque,
+    dlfo_eh_frame: ?*anyopaque,
+    __dlfo_reserved: [7]c_ulonglong,
+};
 
 fn dlFindObjectSubstitute(pc: *anyopaque, result: *DlFindObject) callconv(.c) c_int {
-    // TODO real implementation
-    Logger.err("unimplemented: _dl_find_object(pc: 0x{x}, result: *DlFindObject [0x{x}])", .{ @intFromPtr(pc), @intFromPtr(result) });
-    @panic("unimplemented _dl_find_object");
+    Logger.info("intercepted call: _dl_find_object(0x{x}, *DlFindObject [0x{x}])", .{ @intFromPtr(pc), @intFromPtr(result) });
+
+    const infos = findDynObjectSegmentForLoadedAddr(@intFromPtr(pc)) catch |err| {
+        Logger.warn("_dl_find_object(0x{x}, *DlFindObject [0x{x}]) failed: {}", .{ @intFromPtr(pc), @intFromPtr(result), err });
+        return 1;
+    };
+
+    result.dlfo_eh_frame = @ptrFromInt(infos.dyn_object.loaded_at.? + infos.dyn_object.eh_init_mem_offset);
+
+    Logger.warn("_dl_find_object: only `dl_info_result.dlfo_eh_frame` field supported", .{});
+
+    Logger.info("intercepted call: success: _dl_find_object(0x{x}, .{{ .dflo_eh_frame = 0x{x} }})", .{ @intFromPtr(pc), @intFromPtr(result.dlfo_eh_frame) });
+
+    return 0;
 }
 
-const DlPhdrInfo = opaque {};
+fn dlIteratePhdrSubstitute(callback: *const fn (*anyopaque, c_uint, *anyopaque) callconv(.c) c_int, data: *anyopaque) callconv(.c) c_int {
+    Logger.info("intercepted call: dl_iterate_phdr(callback: 0x{x}, data: 0x{x})", .{ @intFromPtr(callback), @intFromPtr(data) });
 
-fn dlIteratePhdrSubstitute(callback: *const fn (*DlPhdrInfo, c_uint, *anyopaque) callconv(.c) c_int) callconv(.c) c_int {
+    for (dyn_objects.values()) |*dyn_obj| {
+        if (!dyn_obj.loaded) {
+            continue;
+        }
+
+        const dl_phdr_info = allocator.create(std.posix.dl_phdr_info) catch @panic("OOM");
+
+        dl_phdr_info.* = .{
+            .addr = dyn_obj.loaded_at.?,
+            .name = @ptrCast(dyn_obj.path),
+            .phdr = @ptrFromInt(dyn_obj.loaded_at.? + dyn_obj.eh.e_phoff),
+            .phnum = dyn_obj.eh.e_phnum,
+        };
+
+        const ret = callback(dl_phdr_info, @sizeOf(std.posix.dl_phdr_info), data);
+        if (ret != 0) {
+            Logger.info("intercepted call: dl_iterate_phdr(callback: 0x{x}, data: 0x{x}) != 0 for {s}", .{ @intFromPtr(callback), @intFromPtr(data), dyn_obj.name });
+            return ret;
+        }
+    }
+
+    Logger.info("intercepted call: success: dl_iterate_phdr(callback: 0x{x}, data: 0x{x})", .{ @intFromPtr(callback), @intFromPtr(data) });
+
+    return 0;
+}
+
+fn pthreadCreateSubstitute(newthread: *anyopaque, attr: ?*const anyopaque, start_routine: *const fn (?*anyopaque) callconv(.c) *anyopaque, arg: ?*anyopaque) callconv(.c) c_int {
     // TODO real implementation
-    Logger.err("unimplemented: dl_iterate_phdr(callback: 0x{x})", .{@intFromPtr(callback)});
-    @panic("unimplemented dl_iterate_phdr");
+    Logger.err("unimplemented: pthread_create(0x{x}, 0x{x}, 0x{x}, 0x{x})", .{ @intFromPtr(newthread), @intFromPtr(attr), @intFromPtr(start_routine), @intFromPtr(arg) });
+    @panic("unimplemented pthread_create");
 }
 
 const TlsIndex = extern struct {
