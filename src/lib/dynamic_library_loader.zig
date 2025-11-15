@@ -592,7 +592,7 @@ const Reloc = struct {
 
 const RelocList = std.ArrayList(Reloc);
 
-var irel_resolved_addrs: std.AutoArrayHashMapUnmanaged(usize, usize) = .empty;
+var ifunc_resolved_addrs: std.AutoArrayHashMapUnmanaged(usize, usize) = .empty;
 var irel_resolved_targets: std.AutoArrayHashMapUnmanaged(usize, usize) = .empty;
 
 const DynObject = struct {
@@ -800,7 +800,7 @@ pub fn deinit() void {
     dyn_objects.clearAndFree(allocator);
     dyn_objects_sorted_indices.deinit(allocator);
 
-    irel_resolved_addrs.clearAndFree(allocator);
+    ifunc_resolved_addrs.clearAndFree(allocator);
     irel_resolved_targets.clearAndFree(allocator);
 
     const current_tls_area_desc = std.os.linux.tls.area_desc;
@@ -2035,6 +2035,12 @@ const Dtv = extern struct {
 //
 // #define TLS_DTV_UNALLOCATED ((void *) -1l)
 
+var initial_tls_init_file_size: usize = undefined;
+var initial_tls_init_mem_size: usize = undefined;
+var initial_tls_offset: usize = undefined;
+var initial_tls_align: ?usize = null;
+var initial_tls_init_block: []const u8 = undefined;
+
 fn computeTcbOffset(dyn_object: *DynObject) void {
     Logger.debug("computing tcb offset of library {s}", .{dyn_object.name});
 
@@ -2045,16 +2051,13 @@ fn computeTcbOffset(dyn_object: *DynObject) void {
     new_area_size = if (new_area_size > 0) std.mem.alignForward(usize, new_area_size, dyn_object.tls_align) else new_area_size;
     new_area_size = if (new_area_size > 0) std.mem.alignForward(usize, new_area_size, current_tls_area_desc.alignment) else new_area_size;
     new_area_size += current_tls_area_desc.block.size;
-    new_area_size = if (new_area_size > 0) std.mem.alignForward(usize, new_area_size, current_tls_area_desc.alignment) else new_area_size;
+    new_area_size = if (new_area_size > 0) std.mem.alignForward(usize, new_area_size, initial_tls_align orelse current_tls_area_desc.alignment) else new_area_size;
     const new_abi_tcb_offset = new_area_size;
 
     dyn_object.tls_offset = new_abi_tcb_offset;
 }
 
-var initial_tls_init_file_size: usize = undefined;
-var initial_tls_init_mem_size: usize = undefined;
-var initial_tls_offset: usize = undefined;
-var initial_tls_init_block: []const u8 = undefined;
+var current_surplus_size: usize = 0x2000;
 
 fn mapTlsBlock(dyn_object: *DynObject) !void {
     Logger.debug("mapping tls block of library {s}", .{dyn_object.name});
@@ -2068,7 +2071,7 @@ fn mapTlsBlock(dyn_object: *DynObject) !void {
     new_area_size = if (new_area_size > 0) std.mem.alignForward(usize, new_area_size, current_tls_area_desc.alignment) else new_area_size;
     const prev_block_offset = new_area_size;
     new_area_size += current_tls_area_desc.block.size;
-    new_area_size = if (new_area_size > 0) std.mem.alignForward(usize, new_area_size, current_tls_area_desc.alignment) else new_area_size;
+    new_area_size = if (new_area_size > 0) std.mem.alignForward(usize, new_area_size, initial_tls_align orelse current_tls_area_desc.alignment) else new_area_size;
     const new_abi_tcb_offset = new_area_size;
     new_area_size += @sizeOf(AbiTcb);
     new_area_size += @sizeOf(ZigTcb);
@@ -2086,54 +2089,79 @@ fn mapTlsBlock(dyn_object: *DynObject) !void {
     const sizeof_pthread: usize = sp: {
         const sym = resolveSymbolByName("_thread_db_sizeof_pthread") catch {
             Logger.info("no _thread_db_sizeof_pthread symbol found, using defaut 4096", .{});
-            break :sp 4096 + std.heap.pageSize();
+            break :sp 0x2000 + std.heap.pageSize();
         };
         const sizeof_pthread_ptr: *u32 = @ptrFromInt(sym.address);
         break :sp sizeof_pthread_ptr.* + std.heap.pageSize();
     };
     Logger.debug("tls: size of pthread struct: 0x{x} ({d})", .{ sizeof_pthread, sizeof_pthread });
 
-    Logger.debug("tls: mapping new area: size: 0x{x} + 0x{x}", .{ new_area_size, sizeof_pthread });
-    const new_area = std.posix.mmap(null, new_area_size + sizeof_pthread, std.posix.PROT.READ | std.posix.PROT.WRITE, .{ .TYPE = .PRIVATE, .ANONYMOUS = true }, -1, 0) catch |err| {
-        Logger.err("failed to allocate tls space: {s}", .{@errorName(err)});
-        return err;
-    };
+    var old_tp: usize = undefined;
+    const e_get_fs = std.os.linux.syscall2(.arch_prctl, std.os.linux.ARCH.GET_FS, @intFromPtr(&old_tp));
+    std.debug.assert(e_get_fs == 0);
 
-    if (dyn_object.tls_init_file_size > 0) {
+    const prev_area_addr = old_tp - (new_abi_tcb_offset - prev_block_offset);
+
+    Logger.debug("tls: old_tp: 0x{x}, prev area: 0x{x}", .{ old_tp, prev_area_addr });
+
+    var new_area: ?[]u8 = null;
+    var area_was_extended = false;
+
+    if (current_tls_area_desc.gdt_entry_number == @as(usize, @bitCast(@as(isize, -1)))) {
+        Logger.debug("tls: mapping new area (first time): size: 0x{x} (surplus) + 0x{x} (new_area_size) + 0x{x} (size of pthread struct)", .{ current_surplus_size, new_area_size, sizeof_pthread });
+        const space = std.posix.mmap(null, current_surplus_size + new_area_size + sizeof_pthread, std.posix.PROT.READ | std.posix.PROT.WRITE, .{ .TYPE = .PRIVATE, .ANONYMOUS = true }, -1, 0) catch |err| {
+            Logger.err("failed to allocate tls space: {s}", .{@errorName(err)});
+            return err;
+        };
+        Logger.debug("tls: setting new area start at 0x{x} (0x{x})", .{ current_surplus_size, @intFromPtr(space.ptr) + current_surplus_size });
+        new_area = space[current_surplus_size..];
+    } else if (new_area_size > current_tls_area_desc.size and new_area_size <= current_tls_area_desc.size + current_surplus_size) {
+        Logger.debug("tls: extending old area: size: 0x{x} (new_area_size) = 0x{x} (surplus) + 0x{x} (current_area_siz)", .{ new_area_size, new_area_size - current_tls_area_desc.size, current_tls_area_desc.size });
+        Logger.debug("tls: setting new area start at -0x{x} (0x{x})", .{ new_area_size - current_tls_area_desc.size, prev_area_addr - (new_area_size - current_tls_area_desc.size) });
+        new_area = @ptrFromInt(prev_area_addr - (new_area_size - current_tls_area_desc.size));
+        Logger.debug("tls: setting new surplus size: 0x{x}", .{current_surplus_size - (new_area_size - current_tls_area_desc.size)});
+        current_surplus_size -= (new_area_size - current_tls_area_desc.size);
+        area_was_extended = true;
+    } else if (new_area_size > current_tls_area_desc.size) {
+        Logger.warn("tls: mapping new area (surplus exhausted, dangerous): size: 0x{x} (new_area_size) + 0x{x} (size of pthread struct)", .{ new_area_size, sizeof_pthread });
+        new_area = std.posix.mmap(null, new_area_size + sizeof_pthread, std.posix.PROT.READ | std.posix.PROT.WRITE, .{ .TYPE = .PRIVATE, .ANONYMOUS = true }, -1, 0) catch |err| {
+            Logger.err("failed to allocate tls space: {s}", .{@errorName(err)});
+            return err;
+        };
+    }
+
+    if (new_area != null and dyn_object.tls_init_file_size > 0) {
         Logger.debug("tls: copying new block data: from 0x{x} to 0x{x} (size: 0x{x})", .{
             0,
             dyn_object.tls_init_file_size,
             dyn_object.tls_init_file_size,
         });
-        @memcpy(new_area[0..dyn_object.tls_init_file_size], @as([*]u8, @ptrFromInt(try vAddressToLoadedAddress(dyn_object, dyn_object.tls_init_mem_offset))));
+        @memcpy(new_area.?[0..dyn_object.tls_init_file_size], @as([*]u8, @ptrFromInt(try vAddressToLoadedAddress(dyn_object, dyn_object.tls_init_mem_offset))));
     }
 
-    var old_tp: usize = undefined;
-    const e_get_fs = std.os.linux.syscall2(.arch_prctl, std.os.linux.ARCH.GET_FS, @intFromPtr(&old_tp));
-    std.debug.assert(e_get_fs == 0);
-
-    Logger.debug("tls: old_tp: 0x{x}", .{old_tp});
-
-    if (current_tls_area_desc.block.size > 0) {
+    if (new_area != null and current_tls_area_desc.block.size > 0 and !area_was_extended) {
         Logger.debug("tls: copying previous area block data: from 0x{x} to 0x{x} (size: 0x{x})", .{
             prev_block_offset,
             prev_block_offset + current_tls_area_desc.block.size,
             current_tls_area_desc.block.size,
         });
-        @memcpy(new_area[prev_block_offset .. prev_block_offset + current_tls_area_desc.block.size], @as([*]u8, @ptrFromInt(old_tp - (new_abi_tcb_offset - prev_block_offset))));
+        @memcpy(new_area.?[prev_block_offset .. prev_block_offset + current_tls_area_desc.block.size], @as([*]u8, @ptrFromInt(old_tp - (new_abi_tcb_offset - prev_block_offset))));
     }
 
     if (current_tls_area_desc.gdt_entry_number != @as(usize, @bitCast(@as(isize, -1)))) {
-        Logger.debug("tls: copying previous pthread data: from 0x{x} to 0x{x} (size: 0x{x})", .{
-            new_abi_tcb_offset,
-            new_area_size + sizeof_pthread,
-            new_area_size + sizeof_pthread - new_abi_tcb_offset,
-        });
-        @memcpy(new_area[new_abi_tcb_offset .. new_area_size + sizeof_pthread], @as([*]u8, @ptrFromInt(old_tp)));
+        if (new_area != null and !area_was_extended) {
+            Logger.debug("tls: copying previous pthread data: from 0x{x} to 0x{x} (size: 0x{x})", .{
+                new_abi_tcb_offset,
+                new_area_size + sizeof_pthread,
+                new_area_size + sizeof_pthread - new_abi_tcb_offset,
+            });
+            @memcpy(new_area.?[new_abi_tcb_offset .. new_area_size + sizeof_pthread], @as([*]u8, @ptrFromInt(old_tp)));
+        }
     } else {
         initial_tls_init_file_size = current_tls_area_desc.block.init.len;
         initial_tls_init_mem_size = current_tls_area_desc.block.size;
         initial_tls_offset = current_tls_area_desc.abi_tcb.offset;
+        initial_tls_align = current_tls_area_desc.alignment;
         initial_tls_init_block = current_tls_area_desc.block.init;
 
         Logger.debug("tls: copying previous area metadata: from 0x{x} to 0x{x} (size: 0x{x})", .{
@@ -2141,8 +2169,10 @@ fn mapTlsBlock(dyn_object: *DynObject) !void {
             new_abi_tcb_offset + current_tls_area_desc.size - current_tls_area_desc.abi_tcb.offset,
             current_tls_area_desc.size - current_tls_area_desc.abi_tcb.offset,
         });
-        @memcpy(new_area[new_abi_tcb_offset..][0 .. current_tls_area_desc.size - current_tls_area_desc.abi_tcb.offset], @as([*]u8, @ptrFromInt(old_tp)));
+        @memcpy(new_area.?[new_abi_tcb_offset..][0 .. current_tls_area_desc.size - current_tls_area_desc.abi_tcb.offset], @as([*]u8, @ptrFromInt(old_tp)));
     }
+
+    // TODO this allocation could easily be avoided
 
     Logger.debug("tls: allocating new init block: size: 0x{x}", .{new_abi_tcb_offset});
     const new_initial_block = try allocator.alloc(u8, new_abi_tcb_offset);
@@ -2250,50 +2280,56 @@ fn mapTlsBlock(dyn_object: *DynObject) !void {
 
     std.os.linux.tls.area_desc = new_tls_area_desc;
 
-    // const new_tp = std.os.linux.tls.prepareArea(new_area);
+    if (new_area != null) {
+        if (!area_was_extended) {
+            // const new_tp = std.os.linux.tls.prepareArea(new_area);
 
-    const new_tp = @intFromPtr(new_area.ptr) + new_abi_tcb_offset;
+            const new_tp = @intFromPtr(new_area.?.ptr) + new_abi_tcb_offset;
 
-    // TODO unmap previous area
+            // TODO unmap previous area
 
-    const new_tcb: *AbiTcb = @ptrCast(@alignCast(new_area.ptr + new_tls_area_desc.abi_tcb.offset));
-    new_tcb.self = @ptrFromInt(new_tp);
+            const new_tcb: *AbiTcb = @ptrCast(@alignCast(new_area.?.ptr + new_tls_area_desc.abi_tcb.offset));
+            new_tcb.self = @ptrFromInt(new_tp);
 
-    // setting dtv.len to self because it happens to coincide with what is expected by pthread
-    const new_dtv: *Dtv = @ptrCast(@alignCast(new_area.ptr + new_tls_area_desc.dtv.offset));
-    new_dtv.tls_block = new_area.ptr;
-    new_dtv.len = new_tp;
+            // setting dtv.len to self because it happens to coincide with what is expected by pthread
+            const new_dtv: *Dtv = @ptrCast(@alignCast(new_area.?.ptr + new_tls_area_desc.dtv.offset));
+            new_dtv.tls_block = new_area.?.ptr;
+            new_dtv.len = new_tp;
 
-    Logger.debug("tls: tls space mapped, new TP: 0x{x}", .{new_tp});
+            Logger.debug("tls: tls space mapped, new TP: 0x{x}", .{new_tp});
 
-    const e_set_fs = std.os.linux.syscall2(.arch_prctl, std.os.linux.ARCH.SET_FS, new_tp);
-    std.debug.assert(e_set_fs == 0);
+            const e_set_fs = std.os.linux.syscall2(.arch_prctl, std.os.linux.ARCH.SET_FS, new_tp);
+            std.debug.assert(e_set_fs == 0);
 
-    dyn_object.tls_offset = new_abi_tcb_offset;
-    Logger.debug("tls: tls offset: 0x{x}", .{new_abi_tcb_offset});
+            const maybe_rtld_global_ro = resolveSymbolByName("_rtld_global_ro") catch null;
 
-    const maybe_rtld_global_ro = resolveSymbolByName("_rtld_global_ro") catch null;
+            if (maybe_rtld_global_ro) |rtld_global_ro| {
+                Logger.debug("tls: rtld_global_ro: 0x{x}", .{rtld_global_ro.address});
 
-    if (maybe_rtld_global_ro) |rtld_global_ro| {
-        Logger.debug("tls: rtld_global_ro: 0x{x}", .{rtld_global_ro.address});
+                const seg_infos = try findDynObjectSegmentForLoadedAddr(rtld_global_ro.address);
 
-        const seg_infos = try findDynObjectSegmentForLoadedAddr(rtld_global_ro.address);
+                // TODO we should find a way to get those field offsets at runtime
+                const dl_tls_static_size: *volatile usize = @ptrFromInt(rtld_global_ro.address + 704);
+                const dl_tls_static_align: *volatile usize = @ptrFromInt(rtld_global_ro.address + 712);
 
-        // TODO we should find a way to get those field offsets at runtime
-        const dl_tls_static_size: *volatile usize = @ptrFromInt(rtld_global_ro.address + 704);
-        const dl_tls_static_align: *volatile usize = @ptrFromInt(rtld_global_ro.address + 712);
+                try unprotectSegment(seg_infos.dyn_object, seg_infos.segment_index);
 
-        try unprotectSegment(seg_infos.dyn_object, seg_infos.segment_index);
+                dl_tls_static_size.* = new_tls_area_desc.block.size;
+                dl_tls_static_align.* = new_tls_area_desc.alignment;
 
-        dl_tls_static_size.* = new_tls_area_desc.block.size;
-        dl_tls_static_align.* = new_tls_area_desc.alignment;
+                try reprotectSegment(seg_infos.dyn_object, seg_infos.segment_index);
+            } else {
+                Logger.info("tls: no rtld_global_ro symbol found", .{});
+            }
+        }
 
-        try reprotectSegment(seg_infos.dyn_object, seg_infos.segment_index);
+        dyn_object.tls_offset = new_abi_tcb_offset;
+        Logger.debug("tls: tls offset: 0x{x}", .{new_abi_tcb_offset});
+
+        dyn_object.tls_mapped_at = @as(usize, @intFromPtr(new_area.?.ptr)) - dyn_object.tls_offset;
     } else {
-        Logger.info("tls: no rtld_global_ro symbol found", .{});
+        Logger.debug("tls: {s}: no change to TLS area", .{dyn_object.name});
     }
-
-    dyn_object.tls_mapped_at = @as(usize, @intFromPtr(new_area.ptr)) - dyn_object.tls_offset;
 }
 
 fn tlsDescResolver() callconv(.naked) void {}
@@ -2431,7 +2467,7 @@ fn processRelocations(dyn_object: *DynObject) !void {
         }
     }
 
-    Logger.debug("processed relocations {d} for {s}", .{ reloc_count, dyn_object.name });
+    Logger.debug("processed {d} relocations for {s}", .{ reloc_count, dyn_object.name });
 }
 
 fn processIRelativeRelocations(dyn_object: *DynObject) !void {
@@ -2455,10 +2491,10 @@ fn processIRelativeRelocations(dyn_object: *DynObject) !void {
                 const value = resolver();
                 Logger.debug("  IRELATIVE: 0x{x} (0x{x}): 0x{x} -> 0x{x}", .{ reloc_addr, reloc.offset, ptr.*, value });
                 ptr.* = value;
-                if (irel_resolved_addrs.get(resolver_addr)) |res_val| {
+                if (ifunc_resolved_addrs.get(resolver_addr)) |res_val| {
                     std.debug.assert(res_val == value);
                 }
-                try irel_resolved_addrs.put(allocator, resolver_addr, value);
+                try ifunc_resolved_addrs.put(allocator, resolver_addr, value);
                 try irel_resolved_targets.putNoClobber(allocator, reloc_addr, value);
             },
             else => {
@@ -2488,7 +2524,7 @@ fn resolveSymbolByName(sym_name: []const u8) !ResolvedSymbol {
                     const dep_sym_address = dep_sym.value;
 
                     var dep_addr = try vAddressToLoadedAddress(dep_object, dep_sym_address);
-                    if (irel_resolved_addrs.get(dep_addr)) |res_addr| {
+                    if (ifunc_resolved_addrs.get(dep_addr)) |res_addr| {
                         dep_addr = res_addr;
                     }
 
@@ -2530,8 +2566,22 @@ fn getResolvedSymbolByName(maybe_dyn_object: ?*DynObject, sym_name: []const u8) 
                         const dep_sym_address = dep_sym.value;
 
                         var dep_addr = try vAddressToLoadedAddress(dep_object, dep_sym_address);
-                        if (irel_resolved_addrs.get(dep_addr)) |res_addr| {
+
+                        if (ifunc_resolved_addrs.get(dep_addr)) |res_addr| {
+                            Logger.debug("ifunc address substitution: {s}: 0x{x} => 0x{x}", .{ dep_sym.name, dep_addr, res_addr });
                             dep_addr = res_addr;
+                        } else if (dep_sym.type == std.elf.STT.GNU_IFUNC) {
+                            const resolver_addr = dep_addr;
+                            const resolver: *const fn () callconv(.c) usize = @ptrFromInt(resolver_addr);
+                            Logger.debug("  IFUNC: calling resolver for {s} at 0x{x} (0x{x})", .{ dep_sym.name, resolver_addr, dep_sym_address });
+                            const value = resolver();
+                            Logger.debug("  IFUNC: {s}: 0x{x} (0x{x}): 0x{x}", .{ dep_sym.name, resolver_addr, dep_sym_address, value });
+                            if (ifunc_resolved_addrs.get(resolver_addr)) |res_val| {
+                                std.debug.assert(res_val == value);
+                            }
+                            try ifunc_resolved_addrs.put(allocator, resolver_addr, value);
+                            try irel_resolved_targets.putNoClobber(allocator, resolver_addr, value);
+                            dep_addr = value;
                         }
 
                         var res_sym: ResolvedSymbol = .{
@@ -2570,8 +2620,22 @@ fn getResolvedSymbolByName(maybe_dyn_object: ?*DynObject, sym_name: []const u8) 
                         const dep_sym_address = dep_sym.value;
 
                         var dep_addr = try vAddressToLoadedAddress(dep_object, dep_sym_address);
-                        if (irel_resolved_addrs.get(dep_addr)) |res_addr| {
+
+                        if (ifunc_resolved_addrs.get(dep_addr)) |res_addr| {
+                            Logger.debug("ifunc address substitution: {s}: 0x{x} => 0x{x}", .{ dep_sym.name, dep_addr, res_addr });
                             dep_addr = res_addr;
+                        } else if (dep_sym.type == std.elf.STT.GNU_IFUNC) {
+                            const resolver_addr = dep_addr;
+                            const resolver: *const fn () callconv(.c) usize = @ptrFromInt(resolver_addr);
+                            Logger.debug("  IFUNC: calling resolver for {s} at 0x{x} (0x{x})", .{ dep_sym.name, resolver_addr, dep_sym_address });
+                            const value = resolver();
+                            Logger.debug("  IFUNC: {s}: 0x{x} (0x{x}): 0x{x}", .{ dep_sym.name, resolver_addr, dep_sym_address, value });
+                            if (ifunc_resolved_addrs.get(resolver_addr)) |res_val| {
+                                std.debug.assert(res_val == value);
+                            }
+                            try ifunc_resolved_addrs.put(allocator, resolver_addr, value);
+                            try irel_resolved_targets.putNoClobber(allocator, resolver_addr, value);
+                            dep_addr = value;
                         }
 
                         var res_sym: ResolvedSymbol = .{
@@ -2617,8 +2681,22 @@ fn getResolvedSymbolByNameAndVersion(maybe_dyn_object: ?*DynObject, sym_name: []
                         const dep_sym_address = dep_sym.value;
 
                         var dep_addr = try vAddressToLoadedAddress(dep_object, dep_sym_address);
-                        if (irel_resolved_addrs.get(dep_addr)) |res_addr| {
+
+                        if (ifunc_resolved_addrs.get(dep_addr)) |res_addr| {
+                            Logger.debug("ifunc address substitution: {s}: 0x{x} => 0x{x}", .{ dep_sym.name, dep_addr, res_addr });
                             dep_addr = res_addr;
+                        } else if (dep_sym.type == std.elf.STT.GNU_IFUNC) {
+                            const resolver_addr = dep_addr;
+                            const resolver: *const fn () callconv(.c) usize = @ptrFromInt(resolver_addr);
+                            Logger.debug("  IFUNC: calling resolver for {s} at 0x{x} (0x{x})", .{ dep_sym.name, resolver_addr, dep_sym_address });
+                            const value = resolver();
+                            Logger.debug("  IFUNC: {s}: 0x{x} (0x{x}): 0x{x}", .{ dep_sym.name, resolver_addr, dep_sym_address, value });
+                            if (ifunc_resolved_addrs.get(resolver_addr)) |res_val| {
+                                std.debug.assert(res_val == value);
+                            }
+                            try ifunc_resolved_addrs.put(allocator, resolver_addr, value);
+                            try irel_resolved_targets.putNoClobber(allocator, resolver_addr, value);
+                            dep_addr = value;
                         }
 
                         var res_sym: ResolvedSymbol = .{
@@ -2657,8 +2735,22 @@ fn getResolvedSymbolByNameAndVersion(maybe_dyn_object: ?*DynObject, sym_name: []
                         const dep_sym_address = dep_sym.value;
 
                         var dep_addr = try vAddressToLoadedAddress(dep_object, dep_sym_address);
-                        if (irel_resolved_addrs.get(dep_addr)) |res_addr| {
+
+                        if (ifunc_resolved_addrs.get(dep_addr)) |res_addr| {
+                            Logger.debug("ifunc address substitution: {s}: 0x{x} => 0x{x}", .{ dep_sym.name, dep_addr, res_addr });
                             dep_addr = res_addr;
+                        } else if (dep_sym.type == std.elf.STT.GNU_IFUNC) {
+                            const resolver_addr = dep_addr;
+                            const resolver: *const fn () callconv(.c) usize = @ptrFromInt(resolver_addr);
+                            Logger.debug("  IFUNC: calling resolver for {s} at 0x{x} (0x{x})", .{ dep_sym.name, resolver_addr, dep_sym_address });
+                            const value = resolver();
+                            Logger.debug("  IFUNC: {s}: 0x{x} (0x{x}): 0x{x}", .{ dep_sym.name, resolver_addr, dep_sym_address, value });
+                            if (ifunc_resolved_addrs.get(resolver_addr)) |res_val| {
+                                std.debug.assert(res_val == value);
+                            }
+                            try ifunc_resolved_addrs.put(allocator, resolver_addr, value);
+                            try irel_resolved_targets.putNoClobber(allocator, resolver_addr, value);
+                            dep_addr = value;
                         }
 
                         var res_sym: ResolvedSymbol = .{
@@ -2707,9 +2799,22 @@ fn resolveSymbol(dyn_object: *DynObject, sym_idx: usize) !ResolvedSymbol {
         const sym_address = sym.value;
 
         var addr = try vAddressToLoadedAddress(dyn_object, sym_address);
-        if (irel_resolved_addrs.get(addr)) |res_addr| {
-            Logger.debug("irel address substitution: {s}: 0x{x} => 0x{x}", .{ sym.name, addr, res_addr });
+
+        if (ifunc_resolved_addrs.get(addr)) |res_addr| {
+            Logger.debug("ifunc address substitution: {s}: 0x{x} => 0x{x}", .{ sym.name, addr, res_addr });
             addr = res_addr;
+        } else if (sym.type == std.elf.STT.GNU_IFUNC) {
+            const resolver_addr = addr;
+            const resolver: *const fn () callconv(.c) usize = @ptrFromInt(resolver_addr);
+            Logger.debug("  IFUNC: calling resolver for {s} at 0x{x} (0x{x})", .{ sym.name, resolver_addr, sym_address });
+            const value = resolver();
+            Logger.debug("  IFUNC: {s}: 0x{x} (0x{x}): 0x{x}", .{ sym.name, resolver_addr, sym_address, value });
+            if (ifunc_resolved_addrs.get(resolver_addr)) |res_val| {
+                std.debug.assert(res_val == value);
+            }
+            try ifunc_resolved_addrs.put(allocator, resolver_addr, value);
+            try irel_resolved_targets.putNoClobber(allocator, resolver_addr, value);
+            addr = value;
         }
 
         return .{
@@ -2743,9 +2848,22 @@ fn resolveSymbol(dyn_object: *DynObject, sym_idx: usize) !ResolvedSymbol {
                     const dep_sym_address = dep_sym.value;
 
                     var dep_addr = try vAddressToLoadedAddress(dep_object, dep_sym_address);
-                    if (irel_resolved_addrs.get(dep_addr)) |res_addr| {
-                        Logger.debug("irel address substitution: {s}: 0x{x} => 0x{x}", .{ dep_sym.name, dep_addr, res_addr });
+
+                    if (ifunc_resolved_addrs.get(dep_addr)) |res_addr| {
+                        Logger.debug("ifunc address substitution: {s}: 0x{x} => 0x{x}", .{ dep_sym.name, dep_addr, res_addr });
                         dep_addr = res_addr;
+                    } else if (dep_sym.type == std.elf.STT.GNU_IFUNC) {
+                        const resolver_addr = dep_addr;
+                        const resolver: *const fn () callconv(.c) usize = @ptrFromInt(resolver_addr);
+                        Logger.debug("  IFUNC: calling resolver for {s} at 0x{x} (0x{x})", .{ dep_sym.name, resolver_addr, dep_sym_address });
+                        const value = resolver();
+                        Logger.debug("  IFUNC: {s}: 0x{x} (0x{x}): 0x{x}", .{ dep_sym.name, resolver_addr, dep_sym_address, value });
+                        if (ifunc_resolved_addrs.get(resolver_addr)) |res_val| {
+                            std.debug.assert(res_val == value);
+                        }
+                        try ifunc_resolved_addrs.put(allocator, resolver_addr, value);
+                        try irel_resolved_targets.putNoClobber(allocator, resolver_addr, value);
+                        dep_addr = value;
                     }
 
                     return .{
