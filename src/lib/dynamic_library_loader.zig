@@ -619,6 +619,7 @@ const DynObject = struct {
     eh_init_mem_offset: usize,
     eh_init_mem_size: usize,
     eh_align: usize,
+    dyn_section_offset: usize,
     syms: DynSymList,
     syms_array: std.ArrayList(DynSym),
     dependencies: std.ArrayList(usize),
@@ -656,6 +657,7 @@ const DynObject = struct {
             .eh_init_mem_offset = 0,
             .eh_init_mem_size = 0,
             .eh_align = 0,
+            .dyn_section_offset = 0,
             .syms = .empty,
             .syms_array = .empty,
             .relocs = .empty,
@@ -1220,6 +1222,7 @@ fn loadDso(o_path: []const u8) !usize {
     }
 
     var ph_addr: usize = file_addr + eh.e_phoff;
+    var dyn_addr: usize = undefined;
 
     i = 0;
     while (i < eh.e_phnum) : ({
@@ -1228,7 +1231,7 @@ fn loadDso(o_path: []const u8) !usize {
     }) {
         const ph: *std.elf.Elf64.Phdr = @ptrFromInt(ph_addr);
 
-        const dyn_addr: usize = file_addr + ph.offset;
+        dyn_addr = file_addr + ph.offset;
         const dyns: [*]std.elf.Dyn = @ptrFromInt(dyn_addr);
 
         var libName: [*:0]u8 = undefined;
@@ -1524,7 +1527,7 @@ fn loadDso(o_path: []const u8) !usize {
             eh_init_mem_size = ph.memsz;
             eh_align = ph.@"align";
         } else if (ph.type == .DYNAMIC) {
-            const dyn_addr: usize = file_addr + ph.offset;
+            dyn_addr = file_addr + ph.offset;
             const dyns: [*]std.elf.Dyn = @ptrFromInt(dyn_addr);
 
             var runpath: [*:0]u8 = undefined;
@@ -1788,6 +1791,7 @@ fn loadDso(o_path: []const u8) !usize {
         .eh_init_mem_offset = eh_init_mem_offset,
         .eh_init_mem_size = eh_init_mem_size,
         .eh_align = eh_align,
+        .dyn_section_offset = dyn_addr,
         .syms = syms,
         .syms_array = syms_array,
         .relocs = relocs,
@@ -2128,7 +2132,7 @@ fn mapTlsBlock(dyn_object: *DynObject) !void {
     } else if (new_area_size > current_tls_area_desc.size and new_area_size <= current_tls_area_desc.size + current_surplus_size) {
         Logger.debug("tls: extending old area: size: 0x{x} (new_area_size) = 0x{x} (surplus) + 0x{x} (current_area_siz)", .{ new_area_size, new_area_size - current_tls_area_desc.size, current_tls_area_desc.size });
         Logger.debug("tls: setting new area start at -0x{x} (0x{x})", .{ new_area_size - current_tls_area_desc.size, prev_area_addr - (new_area_size - current_tls_area_desc.size) });
-        new_area = @ptrFromInt(prev_area_addr - (new_area_size - current_tls_area_desc.size));
+        new_area = @as([*]u8, @ptrFromInt(prev_area_addr - (new_area_size - current_tls_area_desc.size)))[0..new_area_size];
         Logger.debug("tls: setting new surplus size: 0x{x}", .{current_surplus_size - (new_area_size - current_tls_area_desc.size)});
         current_surplus_size -= (new_area_size - current_tls_area_desc.size);
         area_was_extended = true;
@@ -2358,7 +2362,10 @@ fn mapTlsBlock(dyn_object: *DynObject) !void {
     }
 }
 
-fn tlsDescResolver() callconv(.naked) void {}
+// this function has a special callconv
+fn tlsDescResolver() callconv(.naked) void {
+    asm volatile ("ret");
+}
 
 const TlsDesc = extern struct {
     tls_desc_resolver: *const fn () callconv(.naked) void,
@@ -2468,15 +2475,16 @@ fn processRelocations(dyn_object: *DynObject) !void {
                 const sym = try resolveSymbol(dyn_object, reloc.sym_idx);
                 const tls_offset = dyn_objects.values()[sym.dyn_object_idx].tls_offset;
                 const value: TlsDesc = .{ .tls_desc_resolver_arg = @as(isize, @intCast(sym.value)) + reloc.addend - @as(isize, @intCast(tls_offset)), .tls_desc_resolver = &tlsDescResolver };
-                Logger.debug("  DTPMOD64: 0x{x} (0x{x}): 0x{x} -> {} (0x{x}, {s}@{s} => [MODULE_TLS_ID]0x{x})", .{
+                Logger.debug("  TLSDESC: 0x{x} (0x{x}): 0x{x} -> 0x{x} (0x{x}, {s}@{s} - [MODULE_TLS_OFFSET]0x{x} + 0x{x})", .{
                     reloc_addr,
                     reloc.offset,
                     ptr.*,
-                    value,
+                    value.tls_desc_resolver_arg,
                     sym.value,
                     sym.name,
                     sym.version,
                     dyn_object.tls_offset,
+                    reloc.addend,
                 });
                 const casted_ptr: *TlsDesc = @ptrCast(ptr);
                 casted_ptr.* = @bitCast(value);
@@ -3277,6 +3285,7 @@ fn unsubstitutedTrap() void {
 }
 
 var extra_bytes: std.ArrayList([]const u8) = .empty;
+var extra_link_maps: std.ArrayList(*DlLinkMap) = .empty;
 var last_dl_error: ?[:0]const u8 = null;
 
 fn dlopenSubstitute(path: ?[*:0]const u8, flags: c_int) callconv(.c) ?*anyopaque {
@@ -3366,6 +3375,24 @@ const DlInfo = extern struct {
     dli_fbase: *anyopaque,
     dli_fsname: ?[*:0]const u8,
     dli_fsaddr: ?*anyopaque,
+};
+
+const DlLinkMap = extern struct {
+    l_addr: usize,
+    l_name: [*:0]const u8,
+    l_ld: *std.elf.Dyn,
+    l_next: ?*DlLinkMap,
+    l_prev: ?*DlLinkMap,
+    _others: [1168]u8, // implementation dependent
+};
+
+const DlFindObject = extern struct {
+    dlfo_flags: c_ulonglong,
+    dlfo_map_start: ?*anyopaque,
+    dlfo_map_end: ?*anyopaque,
+    dlfo_link_map: ?*DlLinkMap,
+    dlfo_eh_frame: ?*anyopaque,
+    __dlfo_reserved: [7]c_ulonglong, // implementation dependent
 };
 
 fn dladdrSubstitute(addr: *anyopaque, dl_info: *DlInfo) callconv(.c) c_int {
@@ -3465,7 +3492,46 @@ fn dladdr1Substitute(addr: *anyopaque, dl_info: *DlInfo, extra_infos: *anyopaque
         dl_info.dli_fsaddr = null;
     }
 
-    Logger.warn("dladdr1(0x{x}, .{{.dli_fname = {s}, .dli_fbase = 0x{x}, .dli_fsname = {?s}, .dli_fs_addr = 0x{x}}}) = 1, extra_infos: 0x{x}, flags: {s}) failed: {s}", .{
+    if (flags == 2) {
+        const extra_infos_impl: **DlLinkMap = @ptrCast(@alignCast(extra_infos));
+
+        var curr: ?*DlLinkMap = null;
+        for (dyn_objects.values()) |*dyn_obj| {
+            if (!dyn_obj.loaded) {
+                continue;
+            }
+
+            const link_map = allocator.create(DlLinkMap) catch @panic("OOM");
+            extra_link_maps.append(allocator, link_map) catch @panic("OOM");
+
+            link_map.l_addr = dyn_obj.loaded_at.?;
+            link_map.l_name = owned_name;
+            link_map.l_ld = @ptrFromInt(dyn_obj.loaded_at.? + dyn_obj.dyn_section_offset);
+            link_map.l_prev = curr;
+            link_map.l_next = null;
+            link_map._others = @splat(0);
+
+            if (curr == null) {
+                extra_infos_impl.* = link_map;
+            }
+            curr = link_map;
+        }
+    } else {
+        Logger.err("dladdr1(0x{x}, .{{.dli_fname = {s}, .dli_fbase = 0x{x}, .dli_fsname = {?s}, .dli_fs_addr = 0x{x}}}) = 1, extra_infos: 0x{x}, flags: {s}) failed: {s}", .{
+            @intFromPtr(addr),
+            dl_info.dli_fname,
+            @intFromPtr(dl_info.dli_fbase),
+            dl_info.dli_fsname,
+            if (dl_info.dli_fsaddr) |fsa| @intFromPtr(fsa) else 0,
+            @intFromPtr(extra_infos),
+            if (flags == 1) "RTLD_DL_SYMENT" else if (flags == 2) "RTLD_DL_LINKMAP" else "UNKNOWN_FLAGS",
+            "implementation incomplete: flags = RTLD_DL_SYMENT",
+        });
+
+        @panic("dladdr1 implementation incomplete: flags = RTLD_DL_SYMENT");
+    }
+
+    Logger.info("intercepted call: success: dladdr1(0x{x}, .{{.dli_fname = {s}, .dli_fbase = 0x{x}, .dli_fsname = {?s}, .dli_fs_addr = 0x{x}}}) = 1, extra_infos: 0x{x}, flags: {s}) = 1", .{
         @intFromPtr(addr),
         dl_info.dli_fname,
         @intFromPtr(dl_info.dli_fbase),
@@ -3473,12 +3539,9 @@ fn dladdr1Substitute(addr: *anyopaque, dl_info: *DlInfo, extra_infos: *anyopaque
         if (dl_info.dli_fsaddr) |fsa| @intFromPtr(fsa) else 0,
         @intFromPtr(extra_infos),
         if (flags == 1) "RTLD_DL_SYMENT" else if (flags == 2) "RTLD_DL_LINKMAP" else "UNKNOWN_FLAGS",
-        "implementation incomplete",
     });
 
-    @panic("dladdr1 implementation incomplete");
-
-    // return 1;
+    return 1;
 }
 
 fn dlinfoSubstitute(lib: *anyopaque, request: c_int, info: *anyopaque) callconv(.c) c_int {
@@ -3493,15 +3556,6 @@ fn dlmopenSubstitute(lmid: c_long, path: ?[*:0]u8, flags: c_int) callconv(.c) ?*
     @panic("unimplemented dlmopen");
 }
 
-const DlFindObject = extern struct {
-    dlfo_flags: c_ulonglong,
-    dlfo_map_start: ?*anyopaque,
-    dlfo_map_end: ?*anyopaque,
-    dlfo_link_map: ?*anyopaque,
-    dlfo_eh_frame: ?*anyopaque,
-    __dlfo_reserved: [7]c_ulonglong,
-};
-
 fn dlFindObjectSubstitute(pc: *anyopaque, result: *DlFindObject) callconv(.c) c_int {
     Logger.info("intercepted call: _dl_find_object(0x{x}, *DlFindObject [0x{x}])", .{ @intFromPtr(pc), @intFromPtr(result) });
 
@@ -3512,7 +3566,7 @@ fn dlFindObjectSubstitute(pc: *anyopaque, result: *DlFindObject) callconv(.c) c_
 
     result.dlfo_eh_frame = @ptrFromInt(infos.dyn_object.loaded_at.? + infos.dyn_object.eh_init_mem_offset);
 
-    Logger.warn("_dl_find_object: only `dl_info_result.dlfo_eh_frame` field supported", .{});
+    Logger.warn("_dl_find_object: partial implementation: only `dl_info_result.dlfo_eh_frame` field supported", .{});
 
     Logger.info("intercepted call: success: _dl_find_object(0x{x}, .{{ .dflo_eh_frame = 0x{x} }})", .{ @intFromPtr(pc), @intFromPtr(result.dlfo_eh_frame) });
 
