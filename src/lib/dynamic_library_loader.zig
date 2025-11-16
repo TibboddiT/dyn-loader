@@ -1062,6 +1062,17 @@ fn loadDso(o_path: []const u8) !usize {
 
     Logger.debug("loading: {s} [{s}]", .{ o_path, path });
 
+    const dyn_object_name = try allocator.dupe(u8, std.fs.path.basename(path));
+    errdefer allocator.free(dyn_object_name);
+
+    if (std.mem.find(u8, dyn_object_name, "libc.so") != null) {
+        for (dyn_objects.values()) |*do| {
+            if (do.loaded and std.mem.find(u8, do.name, "libc.so") != null and !std.mem.eql(u8, do.path, path)) {
+                return error.MultipleLibcs;
+            }
+        }
+    }
+
     const f = try std.fs.openFileAbsolute(path, .{ .mode = .read_only });
     const stat = try f.stat();
     const size = std.math.cast(usize, stat.size) orelse return error.FileTooBig;
@@ -1077,9 +1088,6 @@ fn loadDso(o_path: []const u8) !usize {
     errdefer std.posix.munmap(file_bytes);
 
     const file_addr = @intFromPtr(file_bytes.ptr);
-
-    const dyn_object_name = try allocator.dupe(u8, std.fs.path.basename(path));
-    errdefer allocator.free(dyn_object_name);
 
     if (!dyn_objects.contains(dyn_object_name)) {
         const key = try std.fmt.allocPrint(allocator, "{s}", .{dyn_object_name});
@@ -1424,8 +1432,8 @@ fn loadDso(o_path: []const u8) !usize {
         try syms_array.append(allocator, s);
     }
 
-    Logger.debug("programs headers offset: 0x{x}", .{eh.e_phoff});
-    Logger.debug("programs headers:", .{});
+    Logger.debug("program headers offset: 0x{x}", .{eh.e_phoff});
+    Logger.debug("program headers:", .{});
 
     var tls_init_file_offset: usize = 0;
     var tls_init_file_size: usize = 0;
@@ -2142,7 +2150,7 @@ fn mapTlsBlock(dyn_object: *DynObject) !void {
             dyn_object.tls_init_file_size,
             dyn_object.tls_init_file_size,
         });
-        @memcpy(new_area.?[0..dyn_object.tls_init_file_size], @as([*]u8, @ptrFromInt(try vAddressToLoadedAddress(dyn_object, dyn_object.tls_init_mem_offset))));
+        @memcpy(new_area.?[0..dyn_object.tls_init_file_size], @as([*]u8, @ptrFromInt(try vAddressToLoadedAddress(dyn_object, dyn_object.tls_init_mem_offset, false))));
     }
 
     if (new_area != null and current_tls_area_desc.block.size > 0 and !area_was_extended) {
@@ -2207,7 +2215,7 @@ fn mapTlsBlock(dyn_object: *DynObject) !void {
                 new_abi_tcb_offset - do.tls_offset + do.tls_init_file_size,
                 do.tls_init_file_size,
             });
-            @memcpy(new_initial_block[new_abi_tcb_offset - do.tls_offset ..][0..do.tls_init_file_size], @as([*]u8, @ptrFromInt(try vAddressToLoadedAddress(do, do.tls_init_mem_offset))));
+            @memcpy(new_initial_block[new_abi_tcb_offset - do.tls_offset ..][0..do.tls_init_file_size], @as([*]u8, @ptrFromInt(try vAddressToLoadedAddress(do, do.tls_init_mem_offset, false))));
             Logger.debug("tls: zeroing {s} tbss: from 0x{x} to 0x{x} (size: 0x{x})", .{
                 do.name,
                 new_abi_tcb_offset - do.tls_offset + do.tls_init_file_size,
@@ -2225,7 +2233,7 @@ fn mapTlsBlock(dyn_object: *DynObject) !void {
             dyn_object.tls_init_file_size,
             dyn_object.tls_init_file_size,
         });
-        @memcpy(new_initial_block[0..dyn_object.tls_init_file_size], @as([*]u8, @ptrFromInt(try vAddressToLoadedAddress(dyn_object, dyn_object.tls_init_mem_offset))));
+        @memcpy(new_initial_block[0..dyn_object.tls_init_file_size], @as([*]u8, @ptrFromInt(try vAddressToLoadedAddress(dyn_object, dyn_object.tls_init_mem_offset, false))));
         Logger.debug("tls: zeroing {s} tbss: from 0x{x} to 0x{x} (size: 0x{x})", .{
             dyn_object.name,
             dyn_object.tls_init_file_size,
@@ -2316,10 +2324,15 @@ fn mapTlsBlock(dyn_object: *DynObject) !void {
                 const seg_infos = try findDynObjectSegmentForLoadedAddr(rtld_global_ro.address);
 
                 // TODO we should find a way to get those field offsets at runtime
+                const dl_auxv: *volatile *anyopaque = @ptrFromInt(rtld_global_ro.address + 104);
                 const dl_tls_static_size: *volatile usize = @ptrFromInt(rtld_global_ro.address + 704);
                 const dl_tls_static_align: *volatile usize = @ptrFromInt(rtld_global_ro.address + 712);
 
                 try unprotectSegment(seg_infos.dyn_object, seg_infos.segment_index);
+
+                if (std.os.linux.elf_aux_maybe) |auxv| {
+                    dl_auxv.* = auxv;
+                }
 
                 dl_tls_static_size.* = new_tls_area_desc.block.size;
                 dl_tls_static_align.* = new_tls_area_desc.alignment;
@@ -2358,7 +2371,7 @@ fn processRelocations(dyn_object: *DynObject) !void {
     var reloc_count: usize = 0;
 
     for (dyn_object.relocs.items) |reloc| {
-        const reloc_addr = try vAddressToLoadedAddress(dyn_object, reloc.offset);
+        const reloc_addr = try vAddressToLoadedAddress(dyn_object, reloc.offset, false);
         const ptr: *usize = @ptrFromInt(reloc_addr);
 
         std.debug.assert(reloc.addend >= 0);
@@ -2367,7 +2380,7 @@ fn processRelocations(dyn_object: *DynObject) !void {
             .RELATIVE => {
                 reloc_count += 1;
                 // R_X86_64_RELATIVE: B + A
-                const value = try vAddressToLoadedAddress(dyn_object, @as(usize, @intCast(reloc.addend)) + if (reloc.addend == 0) ptr.* else 0);
+                const value = try vAddressToLoadedAddress(dyn_object, @as(usize, @intCast(reloc.addend)) + if (reloc.addend == 0) ptr.* else 0, true);
                 Logger.debug("  RELATIVE: 0x{x} (0x{x}): 0x{x} -> 0x{x} (addend: 0x{x}, relr: {})", .{ reloc_addr, reloc.offset, ptr.*, value, reloc.addend, reloc.is_relr });
                 ptr.* = value;
             },
@@ -2489,7 +2502,7 @@ fn processIRelativeRelocations(dyn_object: *DynObject) !void {
     var reloc_count: usize = 0;
 
     for (dyn_object.relocs.items) |reloc| {
-        const reloc_addr = try vAddressToLoadedAddress(dyn_object, reloc.offset);
+        const reloc_addr = try vAddressToLoadedAddress(dyn_object, reloc.offset, false);
         const ptr: *usize = @ptrFromInt(reloc_addr);
 
         std.debug.assert(reloc.addend >= 0);
@@ -2498,7 +2511,7 @@ fn processIRelativeRelocations(dyn_object: *DynObject) !void {
             .RELATIVE, .@"64", .GLOB_DAT, .JUMP_SLOT, .TPOFF64, .DTPOFF64, .DTPMOD64, .TLSDESC => {},
             .IRELATIVE => {
                 reloc_count += 1;
-                const resolver_addr = try vAddressToLoadedAddress(dyn_object, @intCast(reloc.addend));
+                const resolver_addr = try vAddressToLoadedAddress(dyn_object, @intCast(reloc.addend), false);
                 const resolver: *const fn () callconv(.c) usize = @ptrFromInt(resolver_addr);
                 Logger.debug("  IRELATIVE: calling resolver at 0x{x} (0x{x})", .{ resolver_addr, reloc.addend });
                 const value = resolver();
@@ -2536,7 +2549,7 @@ fn resolveSymbolByName(sym_name: []const u8) !ResolvedSymbol {
 
                     const dep_sym_address = dep_sym.value;
 
-                    var dep_addr = try vAddressToLoadedAddress(dep_object, dep_sym_address);
+                    var dep_addr = try vAddressToLoadedAddress(dep_object, dep_sym_address, false);
                     if (ifunc_resolved_addrs.get(dep_addr)) |res_addr| {
                         dep_addr = res_addr;
                     }
@@ -2578,7 +2591,7 @@ fn getResolvedSymbolByName(maybe_dyn_object: ?*DynObject, sym_name: []const u8) 
 
                         const dep_sym_address = dep_sym.value;
 
-                        var dep_addr = try vAddressToLoadedAddress(dep_object, dep_sym_address);
+                        var dep_addr = try vAddressToLoadedAddress(dep_object, dep_sym_address, false);
 
                         if (ifunc_resolved_addrs.get(dep_addr)) |res_addr| {
                             Logger.debug("ifunc address substitution: {s}: 0x{x} => 0x{x}", .{ dep_sym.name, dep_addr, res_addr });
@@ -2632,7 +2645,7 @@ fn getResolvedSymbolByName(maybe_dyn_object: ?*DynObject, sym_name: []const u8) 
 
                         const dep_sym_address = dep_sym.value;
 
-                        var dep_addr = try vAddressToLoadedAddress(dep_object, dep_sym_address);
+                        var dep_addr = try vAddressToLoadedAddress(dep_object, dep_sym_address, false);
 
                         if (ifunc_resolved_addrs.get(dep_addr)) |res_addr| {
                             Logger.debug("ifunc address substitution: {s}: 0x{x} => 0x{x}", .{ dep_sym.name, dep_addr, res_addr });
@@ -2693,7 +2706,7 @@ fn getResolvedSymbolByNameAndVersion(maybe_dyn_object: ?*DynObject, sym_name: []
 
                         const dep_sym_address = dep_sym.value;
 
-                        var dep_addr = try vAddressToLoadedAddress(dep_object, dep_sym_address);
+                        var dep_addr = try vAddressToLoadedAddress(dep_object, dep_sym_address, false);
 
                         if (ifunc_resolved_addrs.get(dep_addr)) |res_addr| {
                             Logger.debug("ifunc address substitution: {s}: 0x{x} => 0x{x}", .{ dep_sym.name, dep_addr, res_addr });
@@ -2747,7 +2760,7 @@ fn getResolvedSymbolByNameAndVersion(maybe_dyn_object: ?*DynObject, sym_name: []
 
                         const dep_sym_address = dep_sym.value;
 
-                        var dep_addr = try vAddressToLoadedAddress(dep_object, dep_sym_address);
+                        var dep_addr = try vAddressToLoadedAddress(dep_object, dep_sym_address, false);
 
                         if (ifunc_resolved_addrs.get(dep_addr)) |res_addr| {
                             Logger.debug("ifunc address substitution: {s}: 0x{x} => 0x{x}", .{ dep_sym.name, dep_addr, res_addr });
@@ -2811,7 +2824,7 @@ fn resolveSymbol(dyn_object: *DynObject, sym_idx: usize) !ResolvedSymbol {
 
         const sym_address = sym.value;
 
-        var addr = try vAddressToLoadedAddress(dyn_object, sym_address);
+        var addr = try vAddressToLoadedAddress(dyn_object, sym_address, false);
 
         if (ifunc_resolved_addrs.get(addr)) |res_addr| {
             Logger.debug("ifunc address substitution: {s}: 0x{x} => 0x{x}", .{ sym.name, addr, res_addr });
@@ -2860,7 +2873,7 @@ fn resolveSymbol(dyn_object: *DynObject, sym_idx: usize) !ResolvedSymbol {
 
                     const dep_sym_address = dep_sym.value;
 
-                    var dep_addr = try vAddressToLoadedAddress(dep_object, dep_sym_address);
+                    var dep_addr = try vAddressToLoadedAddress(dep_object, dep_sym_address, false);
 
                     if (ifunc_resolved_addrs.get(dep_addr)) |res_addr| {
                         Logger.debug("ifunc address substitution: {s}: 0x{x} => 0x{x}", .{ dep_sym.name, dep_addr, res_addr });
@@ -3014,7 +3027,7 @@ fn findDynObjectSegmentForLoadedAddr(addr: usize) !DynObjectSegmentResult {
             const segment_end = segment_start + s.mem_size;
             if (addr >= segment_start and addr < segment_end) {
                 for (dyn_object.syms_array.items, 0..) |*sym, sym_idx| {
-                    const sym_addr = try vAddressToLoadedAddress(dyn_object, sym.value);
+                    const sym_addr = try vAddressToLoadedAddress(dyn_object, sym.value, false);
                     if (sym_addr <= addr and sym_addr + sym.size > addr) {
                         return .{
                             .dyn_object = dyn_object,
@@ -3037,7 +3050,7 @@ fn findDynObjectSegmentForLoadedAddr(addr: usize) !DynObjectSegmentResult {
     return error.LoadedAddressNotMapped;
 }
 
-fn vAddressToLoadedAddress(dyn_object: *DynObject, addr: usize) !usize {
+fn vAddressToLoadedAddress(dyn_object: *DynObject, addr: usize, allow_outside: bool) !usize {
     var containing_segment: ?*LoadSegment = null;
     for (dyn_object.segments.values()) |*s| {
         const segment_start = s.mem_offset;
@@ -3048,8 +3061,13 @@ fn vAddressToLoadedAddress(dyn_object: *DynObject, addr: usize) !usize {
         }
     }
     if (containing_segment == null) {
-        Logger.err("addr 0x{x} not in any mapped segment", .{addr});
-        return error.AddressNotInMappedSegments;
+        if (!allow_outside) {
+            Logger.err("addr 0x{x} not in any mapped segment", .{addr});
+            return error.AddressNotInMappedSegments;
+        }
+
+        Logger.warn("addr 0x{x} not in any mapped segment", .{addr});
+        return dyn_object.loaded_at.? + addr;
     }
 
     const segment = containing_segment.?;
@@ -3096,7 +3114,7 @@ fn dumpSegments(dyn_obj: *DynObject) !void {
 }
 
 fn callInitFunctions(dyn_obj: *DynObject) !void {
-    const is_libc_so = if (std.mem.find(u8, dyn_obj.name, "libc.so")) |_| true else false;
+    const is_libc_so = std.mem.startsWith(u8, dyn_obj.name, "libc.so");
 
     if (is_libc_so) {
         var maybe_sym: ?ResolvedSymbol = undefined;
@@ -3121,7 +3139,7 @@ fn callInitFunctions(dyn_obj: *DynObject) !void {
 
     if (dyn_obj.init_addr != 0) {
         const initial_addr = dyn_obj.init_addr;
-        const actual_addr = try vAddressToLoadedAddress(dyn_obj, dyn_obj.init_addr);
+        const actual_addr = try vAddressToLoadedAddress(dyn_obj, dyn_obj.init_addr, false);
         Logger.debug("calling init function for {s} at 0x{x} (initial address: 0x{x})", .{ dyn_obj.name, actual_addr, initial_addr });
         const func = @as(*const fn () callconv(.c) void, @ptrFromInt(actual_addr));
         func();
@@ -3131,7 +3149,7 @@ fn callInitFunctions(dyn_obj: *DynObject) !void {
         const num_funcs = dyn_obj.init_array_size / @sizeOf(usize);
         Logger.debug("calling {d} init_array functions for {s} (0x{x})", .{ num_funcs, dyn_obj.name, dyn_obj.init_array_addr });
         const initial_init_array: [*]const usize = @ptrFromInt(try vAddressToFileAddress(dyn_obj, dyn_obj.init_array_addr));
-        const actual_init_array: [*]const usize = @ptrFromInt(try vAddressToLoadedAddress(dyn_obj, dyn_obj.init_array_addr));
+        const actual_init_array: [*]const usize = @ptrFromInt(try vAddressToLoadedAddress(dyn_obj, dyn_obj.init_array_addr, false));
 
         for (0..num_funcs) |i| {
             const initial_addr = initial_init_array[i];
@@ -3197,44 +3215,50 @@ fn getSubstituteAddress(sym: ResolvedSymbol, for_obj: *DynObject) ?usize {
     } else if (std.mem.eql(u8, sym.name, "dl_iterate_phdr")) {
         addr = @intFromPtr(&dlIteratePhdrSubstitute);
     } else if (std.mem.startsWith(u8, sym.name, "dl") or std.mem.startsWith(u8, sym.name, "_dl")) {
-        Logger.warn("substitutes: {s}: dangerous unsubstituted dl function [{s}] {s} at 0x{x}", .{ for_obj.name, dyn_object.name, sym.name, sym.address });
+        if (!std.mem.startsWith(u8, for_obj.name, "libc.so")) {
+            Logger.warn("substitutes: {s}: dangerous unsubstituted dl function [{s}] {s} at 0x{x}", .{ for_obj.name, dyn_object.name, sym.name, sym.address });
+        }
         addr = @intFromPtr(&unsubstitutedTrap);
     }
 
     // pthreads functions
-    if (!std.mem.startsWith(u8, for_obj.name, "libpthread.so")) {
-        if (std.mem.eql(u8, sym.name, "pthread_create")) {
+    if (std.mem.eql(u8, sym.name, "pthread_create")) {
+        addr = @intFromPtr(&pthreadCreateSubstitute);
+    } else if (std.mem.eql(u8, sym.name, "pthread_exit")) {
+        if (!std.mem.startsWith(u8, for_obj.name, "libpthread.so") and !std.mem.startsWith(u8, for_obj.name, "libc.so")) {
             Logger.warn("substitutes: {s}: dangerous unsubstituted pthread function [{s}] {s} as 0x{x}", .{ for_obj.name, dyn_object.name, sym.name, sym.address });
-            addr = @intFromPtr(&pthreadCreateSubstitute);
-        } else if (std.mem.eql(u8, sym.name, "pthread_exit")) {
-            Logger.warn("substitutes: {s}: dangerous unsubstituted pthread function [{s}] {s} as 0x{x}", .{ for_obj.name, dyn_object.name, sym.name, sym.address });
-            addr = @intFromPtr(&unsubstitutedTrap);
-        } else if (std.mem.eql(u8, sym.name, "pthread_cancel")) {
-            Logger.warn("substitutes: {s}: dangerous unsubstituted pthread function [{s}] {s} as 0x{x}", .{ for_obj.name, dyn_object.name, sym.name, sym.address });
-            addr = @intFromPtr(&unsubstitutedTrap);
-        } else if (std.mem.eql(u8, sym.name, "pthread_detach")) {
-            Logger.warn("substitutes: {s}: dangerous unsubstituted pthread function [{s}] {s} as 0x{x}", .{ for_obj.name, dyn_object.name, sym.name, sym.address });
-            addr = @intFromPtr(&unsubstitutedTrap);
-        } else if (std.mem.eql(u8, sym.name, "pthread_join")) {
-            Logger.warn("substitutes: {s}: dangerous unsubstituted pthread function [{s}] {s} as 0x{x}", .{ for_obj.name, dyn_object.name, sym.name, sym.address });
-            addr = @intFromPtr(&unsubstitutedTrap);
         }
-
-        // TODO checkif those functions really needs to be subsituted, it seems they only acts on the pthread struct
-        // else if (std.mem.eql(u8, sym.name, "pthread_key_create")) {
-        //     Logger.warn("substitutes: {s}: dangerous unsubstituted pthread function [{s}] {s} as 0x{x}", .{ for_obj.name, dyn_object.name, sym.name, sym.address });
-        //     addr = @intFromPtr(&unsubstitutedTrap);
-        // } else if (std.mem.eql(u8, sym.name, "pthread_key_delete")) {
-        //     Logger.warn("substitutes: {s}: dangerous unsubstituted pthread function [{s}] {s} as 0x{x}", .{ for_obj.name, dyn_object.name, sym.name, sym.address });
-        //     addr = @intFromPtr(&unsubstitutedTrap);
-        // } else if (std.mem.eql(u8, sym.name, "pthread_setspecific")) {
-        //     Logger.warn("substitutes: {s}: dangerous unsubstituted pthread function [{s}] {s} as 0x{x}", .{ for_obj.name, dyn_object.name, sym.name, sym.address });
-        //     addr = @intFromPtr(&unsubstitutedTrap);
-        // } else if (std.mem.eql(u8, sym.name, "pthread_getspecific")) {
-        //     Logger.warn("substitutes: {s}: dangerous unsubstituted pthread function [{s}] {s} as 0x{x}", .{ for_obj.name, dyn_object.name, sym.name, sym.address });
-        //     addr = @intFromPtr(&unsubstitutedTrap);
-        // }
+        addr = @intFromPtr(&unsubstitutedTrap);
+    } else if (std.mem.eql(u8, sym.name, "pthread_cancel")) {
+        if (!std.mem.startsWith(u8, for_obj.name, "libpthread.so") and !std.mem.startsWith(u8, for_obj.name, "libc.so")) {
+            Logger.warn("substitutes: {s}: dangerous unsubstituted pthread function [{s}] {s} as 0x{x}", .{ for_obj.name, dyn_object.name, sym.name, sym.address });
+        }
+        addr = @intFromPtr(&unsubstitutedTrap);
+    } else if (std.mem.eql(u8, sym.name, "pthread_detach")) {
+        if (!std.mem.startsWith(u8, for_obj.name, "libpthread.so") and !std.mem.startsWith(u8, for_obj.name, "libc.so")) {
+            Logger.warn("substitutes: {s}: dangerous unsubstituted pthread function [{s}] {s} as 0x{x}", .{ for_obj.name, dyn_object.name, sym.name, sym.address });
+        }
+        addr = @intFromPtr(&unsubstitutedTrap);
+    } else if (std.mem.eql(u8, sym.name, "pthread_join")) {
+        if (!std.mem.startsWith(u8, for_obj.name, "libpthread.so") and !std.mem.startsWith(u8, for_obj.name, "libc.so")) {
+            Logger.warn("substitutes: {s}: dangerous unsubstituted pthread function [{s}] {s} as 0x{x}", .{ for_obj.name, dyn_object.name, sym.name, sym.address });
+        }
+        addr = @intFromPtr(&unsubstitutedTrap);
     }
+    // TODO checkif those functions really needs to be subsituted, it seems they only acts on the pthread struct
+    // else if (std.mem.eql(u8, sym.name, "pthread_key_create")) {
+    //     Logger.warn("substitutes: {s}: dangerous unsubstituted pthread function [{s}] {s} as 0x{x}", .{ for_obj.name, dyn_object.name, sym.name, sym.address });
+    //     addr = @intFromPtr(&unsubstitutedTrap);
+    // } else if (std.mem.eql(u8, sym.name, "pthread_key_delete")) {
+    //     Logger.warn("substitutes: {s}: dangerous unsubstituted pthread function [{s}] {s} as 0x{x}", .{ for_obj.name, dyn_object.name, sym.name, sym.address });
+    //     addr = @intFromPtr(&unsubstitutedTrap);
+    // } else if (std.mem.eql(u8, sym.name, "pthread_setspecific")) {
+    //     Logger.warn("substitutes: {s}: dangerous unsubstituted pthread function [{s}] {s} as 0x{x}", .{ for_obj.name, dyn_object.name, sym.name, sym.address });
+    //     addr = @intFromPtr(&unsubstitutedTrap);
+    // } else if (std.mem.eql(u8, sym.name, "pthread_getspecific")) {
+    //     Logger.warn("substitutes: {s}: dangerous unsubstituted pthread function [{s}] {s} as 0x{x}", .{ for_obj.name, dyn_object.name, sym.name, sym.address });
+    //     addr = @intFromPtr(&unsubstitutedTrap);
+    // }
 
     // special functions
     if (std.mem.eql(u8, sym.name, "__tls_get_addr")) {
@@ -3259,7 +3283,7 @@ fn dlopenSubstitute(path: ?[*:0]const u8, flags: c_int) callconv(.c) ?*anyopaque
     Logger.info("intercepted call: dlopen(\"{?s}\", 0x{x})", .{ path, flags });
 
     if (path == null) {
-        return null;
+        return @ptrFromInt(std.math.maxInt(usize) - 1);
     }
 
     const owned_path = allocator.dupe(u8, std.mem.span(path.?)) catch @panic("OOM");
@@ -3269,7 +3293,7 @@ fn dlopenSubstitute(path: ?[*:0]const u8, flags: c_int) callconv(.c) ?*anyopaque
         if (last_dl_error != null) {
             allocator.free(last_dl_error.?);
         }
-        last_dl_error = std.fmt.allocPrintSentinel(allocator, "unable to load library {s}:  {}", .{ owned_path, err }, 0) catch @panic("OOM");
+        last_dl_error = std.fmt.allocPrintSentinel(allocator, "unable to load library {s}: {}", .{ owned_path, err }, 0) catch @panic("OOM");
 
         Logger.err("dlopen(\"{s}\", 0x{x}) failed: {}", .{ owned_path, flags, err });
 
@@ -3291,13 +3315,13 @@ fn dlcloseSubstitute(lib: *anyopaque) callconv(.c) c_int {
 fn dlsymSubstitute(lib_handle: ?*anyopaque, sym_name: [*:0]const u8) callconv(.c) ?*anyopaque {
     Logger.info("intercepted call: dlsym({d}, \"{s}\")", .{ @intFromPtr(lib_handle), sym_name });
 
-    const dyn_object = if (lib_handle) |h| &dyn_objects.values()[@intFromPtr(h) - 1] else null;
+    const dyn_object = if (lib_handle != null and @intFromPtr(lib_handle.?) != std.math.maxInt(usize) - 1) &dyn_objects.values()[@intFromPtr(lib_handle.?) - 1] else null;
 
     const sym = getResolvedSymbolByName(dyn_object, std.mem.span(sym_name)) catch |err| {
         if (last_dl_error != null) {
             allocator.free(last_dl_error.?);
         }
-        last_dl_error = std.fmt.allocPrintSentinel(allocator, "unable to get symbol {s} for library {s}:  {}", .{ sym_name, if (dyn_object) |do| do.name else "NULL", err }, 0) catch @panic("OOM");
+        last_dl_error = std.fmt.allocPrintSentinel(allocator, "unable to get symbol {s} for library {s}: {}", .{ sym_name, if (dyn_object) |do| do.name else "NULL", err }, 0) catch @panic("OOM");
 
         Logger.warn("dlsym({d} [{s}], \"{s}\") failed: {}", .{ @intFromPtr(lib_handle), if (dyn_object) |do| do.name else "NULL", sym_name, err });
 
@@ -3312,13 +3336,13 @@ fn dlsymSubstitute(lib_handle: ?*anyopaque, sym_name: [*:0]const u8) callconv(.c
 fn dlvsymSubstitute(lib_handle: ?*anyopaque, sym_name: [*:0]const u8, version: [*:0]const u8) callconv(.c) ?*anyopaque {
     Logger.info("intercepted call: dlvsym({d}, \"{s}\" \"{s}\")", .{ @intFromPtr(lib_handle), sym_name, version });
 
-    const dyn_object = if (lib_handle) |h| &dyn_objects.values()[@intFromPtr(h) - 1] else null;
+    const dyn_object = if (lib_handle != null and @intFromPtr(lib_handle.?) != std.math.maxInt(usize) - 1) &dyn_objects.values()[@intFromPtr(lib_handle.?) - 1] else null;
 
     const sym = getResolvedSymbolByNameAndVersion(dyn_object, std.mem.span(sym_name), std.mem.span(version)) catch |err| {
         if (last_dl_error != null) {
             allocator.free(last_dl_error.?);
         }
-        last_dl_error = std.fmt.allocPrintSentinel(allocator, "unable to get symbol {s}@{s} for library {s}:  {}", .{ sym_name, version, if (dyn_object) |do| do.name else "NULL", err }, 0) catch @panic("OOM");
+        last_dl_error = std.fmt.allocPrintSentinel(allocator, "unable to get symbol {s}@{s} for library {s}: {}", .{ sym_name, version, if (dyn_object) |do| do.name else "NULL", err }, 0) catch @panic("OOM");
 
         Logger.warn("dlvsym({d} [{s}], \"{s}\", \"{s}\") failed: {}", .{ @intFromPtr(lib_handle), if (dyn_object) |do| do.name else "NULL", sym_name, version, err });
 
@@ -3351,7 +3375,7 @@ fn dladdrSubstitute(addr: *anyopaque, dl_info: *DlInfo) callconv(.c) c_int {
         if (last_dl_error != null) {
             allocator.free(last_dl_error.?);
         }
-        last_dl_error = std.fmt.allocPrintSentinel(allocator, "unable to get infos for address 0x{x}:  {}", .{ @intFromPtr(addr), err }, 0) catch @panic("OOM");
+        last_dl_error = std.fmt.allocPrintSentinel(allocator, "unable to get infos for address 0x{x}: {}", .{ @intFromPtr(addr), err }, 0) catch @panic("OOM");
 
         Logger.warn("dladdr(0x{x}, {}) failed: {}", .{ @intFromPtr(addr), dl_info.*, err });
 
@@ -3366,7 +3390,7 @@ fn dladdrSubstitute(addr: *anyopaque, dl_info: *DlInfo) callconv(.c) c_int {
 
     if (infos.sym_index) |sidx| {
         const sym = infos.dyn_object.syms_array.items[sidx];
-        const sym_addr = vAddressToLoadedAddress(infos.dyn_object, sym.value) catch unreachable;
+        const sym_addr = vAddressToLoadedAddress(infos.dyn_object, sym.value, false) catch unreachable;
 
         const owned_sym_name = allocator.dupeZ(u8, sym.name) catch @panic("OOM");
         extra_bytes.append(allocator, owned_sym_name) catch @panic("OOM");
@@ -3397,9 +3421,64 @@ fn dlerrorSubstitute() callconv(.c) ?[*:0]const u8 {
 }
 
 fn dladdr1Substitute(addr: *anyopaque, dl_info: *DlInfo, extra_infos: *anyopaque, flags: c_int) callconv(.c) c_int {
-    // TODO real implementation
-    Logger.err("unimplemented: dladdr1(0x{x}, {}, 0x{x}, 0x{x})", .{ @intFromPtr(addr), dl_info.*, @intFromPtr(extra_infos), flags });
-    @panic("unimplemented dladdr1");
+    Logger.info("intercepted call: dladdr1(0x{x}, dl_info: *DlInfo [0x{x}], extra_infos: 0x{x}, flags: 0x{x})", .{
+        @intFromPtr(addr),
+        @intFromPtr(dl_info),
+        @intFromPtr(extra_infos),
+        if (flags == 1) "RTLD_DL_SYMENT" else if (flags == 2) "RTLD_DL_LINKMAP" else "UNKNOWN_FLAGS",
+    });
+
+    const infos = findDynObjectSegmentForLoadedAddr(@intFromPtr(addr)) catch |err| {
+        if (last_dl_error != null) {
+            allocator.free(last_dl_error.?);
+        }
+        last_dl_error = std.fmt.allocPrintSentinel(allocator, "unable to get infos for address 0x{x}: {}", .{ @intFromPtr(addr), err }, 0) catch @panic("OOM");
+
+        Logger.warn("dladdr1(0x{x}, dl_info: *DlInfo [0x{x}], extra_infos: 0x{x}, flags: 0x{x}) failed: {}", .{
+            @intFromPtr(addr),
+            @intFromPtr(dl_info),
+            @intFromPtr(extra_infos),
+            if (flags == 1) "RTLD_DL_SYMENT" else if (flags == 2) "RTLD_DL_LINKMAP" else "UNKNOWN_FLAGS",
+            err,
+        });
+
+        return 0;
+    };
+
+    const owned_name = allocator.dupeZ(u8, infos.dyn_object.name) catch @panic("OOM");
+    extra_bytes.append(allocator, owned_name) catch @panic("OOM");
+
+    dl_info.dli_fname = owned_name.ptr;
+    dl_info.dli_fbase = @ptrFromInt(infos.dyn_object.loaded_at.?);
+
+    if (infos.sym_index) |sidx| {
+        const sym = infos.dyn_object.syms_array.items[sidx];
+        const sym_addr = vAddressToLoadedAddress(infos.dyn_object, sym.value, false) catch unreachable;
+
+        const owned_sym_name = allocator.dupeZ(u8, sym.name) catch @panic("OOM");
+        extra_bytes.append(allocator, owned_sym_name) catch @panic("OOM");
+
+        dl_info.dli_fsname = owned_sym_name.ptr;
+        dl_info.dli_fsaddr = @ptrFromInt(sym_addr);
+    } else {
+        dl_info.dli_fsname = null;
+        dl_info.dli_fsaddr = null;
+    }
+
+    Logger.warn("dladdr1(0x{x}, .{{.dli_fname = {s}, .dli_fbase = 0x{x}, .dli_fsname = {?s}, .dli_fs_addr = 0x{x}}}) = 1, extra_infos: 0x{x}, flags: {s}) failed: {s}", .{
+        @intFromPtr(addr),
+        dl_info.dli_fname,
+        @intFromPtr(dl_info.dli_fbase),
+        dl_info.dli_fsname,
+        if (dl_info.dli_fsaddr) |fsa| @intFromPtr(fsa) else 0,
+        @intFromPtr(extra_infos),
+        if (flags == 1) "RTLD_DL_SYMENT" else if (flags == 2) "RTLD_DL_LINKMAP" else "UNKNOWN_FLAGS",
+        "implementation incomplete",
+    });
+
+    @panic("dladdr1 implementation incomplete");
+
+    // return 1;
 }
 
 fn dlinfoSubstitute(lib: *anyopaque, request: c_int, info: *anyopaque) callconv(.c) c_int {

@@ -3,12 +3,13 @@ const builtin = @import("builtin");
 
 const dll = @import("dll");
 
-// pub const std_options: std.Options = .{
-//     .log_scope_levels = &.{.{
-//         .scope = .dynamic_library_loader,
-//         .level = .debug,
-//     }},
-// };
+pub const std_options: std.Options = .{
+    // .log_scope_levels = &.{.{
+    //     .scope = .dynamic_library_loader,
+    //     .level = .debug,
+    // }},
+    .enable_segfault_handler = true,
+};
 
 pub const debug = struct {
     pub const SelfInfo = dll.CustomSelfInfo;
