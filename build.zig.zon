@@ -6,7 +6,6 @@
         "build.zig",
         "build.zig.zon",
         "src",
-        "resources",
     },
     .fingerprint = 0xa78f1b5f7c564109,
 }

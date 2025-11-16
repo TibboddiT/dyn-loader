@@ -6,7 +6,7 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
 
     const dll_mod = b.addModule("dll", .{
-        .root_source_file = b.path("src/lib/dynamic_library_loader.zig"),
+        .root_source_file = b.path("src/dynamic_library_loader.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -21,17 +21,17 @@ pub fn build(b: *std.Build) void {
 
     const check_step = b.step("check", "Check");
 
-    addExecutable(b, check_step, dll_mod, target, optimize, "load_lib", "src/examples/load_lib.zig");
-    addExecutable(b, check_step, dll_mod, target, optimize, "printf", "src/examples/printf.zig");
-    addExecutable(b, check_step, dll_mod, target, optimize, "printf_musl", "src/examples/printf_musl.zig");
-    addExecutable(b, check_step, dll_mod, target, optimize, "segfault", "src/examples/segfault.zig");
-    addExecutable(b, check_step, dll_mod, target, optimize, "vulkan_version", "src/examples/vulkan_version.zig");
-    addExecutable(b, check_step, dll_mod, target, optimize, "vulkan_advanced", "src/examples/vulkan_advanced/vulkan.zig");
-    addExecutable(b, check_step, dll_mod, target, optimize, "vulkan_version_musl", "src/examples/vulkan_version_musl.zig");
-    addExecutable(b, check_step, dll_mod, target, optimize, "vulkan_advanced_musl", "src/examples/vulkan_advanced/vulkan_musl.zig");
-    addExecutable(b, check_step, dll_mod, target, optimize, "x11_window", "src/examples/x11_window.zig");
-    addExecutable(b, check_step, dll_mod, target, optimize, "raylib", "src/examples/raylib.zig");
-    addExecutable(b, check_step, dll_mod, target, optimize, "x11_egl", "src/examples/x11_egl.zig");
+    addExecutable(b, check_step, dll_mod, target, optimize, "load_lib", "examples/load_lib.zig");
+    addExecutable(b, check_step, dll_mod, target, optimize, "printf", "examples/printf.zig");
+    addExecutable(b, check_step, dll_mod, target, optimize, "printf_musl", "examples/printf_musl.zig");
+    addExecutable(b, check_step, dll_mod, target, optimize, "segfault", "examples/segfault.zig");
+    addExecutable(b, check_step, dll_mod, target, optimize, "vulkan_version", "examples/vulkan_version.zig");
+    addExecutable(b, check_step, dll_mod, target, optimize, "vulkan_advanced", "examples/vulkan_advanced/vulkan.zig");
+    addExecutable(b, check_step, dll_mod, target, optimize, "vulkan_version_musl", "examples/vulkan_version_musl.zig");
+    addExecutable(b, check_step, dll_mod, target, optimize, "vulkan_advanced_musl", "examples/vulkan_advanced/vulkan_musl.zig");
+    addExecutable(b, check_step, dll_mod, target, optimize, "x11_window", "examples/x11_window.zig");
+    addExecutable(b, check_step, dll_mod, target, optimize, "raylib", "examples/raylib.zig");
+    addExecutable(b, check_step, dll_mod, target, optimize, "x11_egl", "examples/x11_egl.zig");
 }
 
 fn addExecutable(b: *std.Build, check_step: *std.Build.Step, mod: *std.Build.Module, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, name: []const u8, root_source_file: []const u8) void {
