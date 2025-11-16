@@ -104,5 +104,3 @@ zig build run-vulkan_version
 zig build run-vulkan_version_musl
 zig build run-x11_window
 ```
-
-- Both `vulkan_advanced` versions will currently result in an error, until libc's `dl` function replacements are implemented.
