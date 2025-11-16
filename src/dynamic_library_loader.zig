@@ -2364,7 +2364,10 @@ fn mapTlsBlock(dyn_object: *DynObject) !void {
 
 // this function has a special callconv
 fn tlsDescResolver() callconv(.naked) void {
-    asm volatile ("ret");
+    asm volatile (
+        \\ mov %%rsi, %%rax
+        \\ ret
+    );
 }
 
 const TlsDesc = extern struct {
