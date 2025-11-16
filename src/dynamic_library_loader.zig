@@ -2071,7 +2071,7 @@ fn computeTcbOffset(dyn_object: *DynObject) void {
     dyn_object.tls_offset = new_abi_tcb_offset;
 }
 
-var current_surplus_size: usize = 0x2000;
+var current_surplus_size: usize = 0x8000;
 
 fn mapTlsBlock(dyn_object: *DynObject) !void {
     Logger.debug("mapping tls block of library {s}", .{dyn_object.name});
@@ -2475,6 +2475,7 @@ fn processRelocations(dyn_object: *DynObject) !void {
             .TLSDESC => {
                 reloc_count += 1;
                 // TLSDESC
+                // TODO something don't work here, we need to better understand
                 const sym = try resolveSymbol(dyn_object, reloc.sym_idx);
                 const tls_offset = dyn_objects.values()[sym.dyn_object_idx].tls_offset;
                 const value: TlsDesc = .{ .tls_desc_resolver_arg = @as(isize, @intCast(sym.value)) + reloc.addend - @as(isize, @intCast(tls_offset)), .tls_desc_resolver = &tlsDescResolver };

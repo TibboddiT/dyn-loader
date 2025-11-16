@@ -84,7 +84,7 @@ pub fn main() !void {
         .pp_enabled_extension_names = extension_names.items.ptr,
         // enumerate_portability_bit_khr to support vulkan in mac os
         // see https://github.com/glfw/glfw/issues/2335
-        .flags = .{ .enumerate_portability_bit_khr = true },
+        // .flags = .{ .enumerate_portability_bit_khr = true },
     }, null);
 
     _ = instance;
