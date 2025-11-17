@@ -818,6 +818,11 @@ pub fn deinit() void {
     }
     extra_bytes.deinit(allocator);
 
+    for (extra_link_maps.items) |e| {
+        allocator.destroy(e);
+    }
+    extra_link_maps.deinit(allocator);
+
     if (last_dl_error) |dle| {
         allocator.free(dle);
     }
@@ -3256,6 +3261,8 @@ fn getSubstituteAddress(sym: ResolvedSymbol, for_obj: *DynObject) ?usize {
         addr = @intFromPtr(&dlmopenSubstitute);
     } else if (std.mem.eql(u8, sym.name, "_dl_find_object")) {
         addr = @intFromPtr(&dlFindObjectSubstitute);
+    } else if (std.mem.eql(u8, sym.name, "_dl_find_dso_for_object")) {
+        addr = @intFromPtr(&dlFindDsoForObjectSubstitute);
     } else if (std.mem.eql(u8, sym.name, "dl_iterate_phdr")) {
         addr = @intFromPtr(&dlIteratePhdrSubstitute);
     } else if (std.mem.startsWith(u8, sym.name, "dl") or std.mem.startsWith(u8, sym.name, "_dl")) {
@@ -3269,25 +3276,13 @@ fn getSubstituteAddress(sym: ResolvedSymbol, for_obj: *DynObject) ?usize {
     if (std.mem.eql(u8, sym.name, "pthread_create")) {
         addr = @intFromPtr(&pthreadCreateSubstitute);
     } else if (std.mem.eql(u8, sym.name, "pthread_exit")) {
-        if (!std.mem.startsWith(u8, for_obj.name, "libpthread.so") and !std.mem.startsWith(u8, for_obj.name, "libc.so")) {
-            Logger.warn("substitutes: {s}: dangerous unsubstituted pthread function [{s}] {s} as 0x{x}", .{ for_obj.name, dyn_object.name, sym.name, sym.address });
-        }
-        addr = @intFromPtr(&unsubstitutedTrap);
+        addr = @intFromPtr(&pthreadExitSubstitute);
     } else if (std.mem.eql(u8, sym.name, "pthread_cancel")) {
-        if (!std.mem.startsWith(u8, for_obj.name, "libpthread.so") and !std.mem.startsWith(u8, for_obj.name, "libc.so")) {
-            Logger.warn("substitutes: {s}: dangerous unsubstituted pthread function [{s}] {s} as 0x{x}", .{ for_obj.name, dyn_object.name, sym.name, sym.address });
-        }
-        addr = @intFromPtr(&unsubstitutedTrap);
+        addr = @intFromPtr(&pthreadCancelSubstitute);
     } else if (std.mem.eql(u8, sym.name, "pthread_detach")) {
-        if (!std.mem.startsWith(u8, for_obj.name, "libpthread.so") and !std.mem.startsWith(u8, for_obj.name, "libc.so")) {
-            Logger.warn("substitutes: {s}: dangerous unsubstituted pthread function [{s}] {s} as 0x{x}", .{ for_obj.name, dyn_object.name, sym.name, sym.address });
-        }
-        addr = @intFromPtr(&unsubstitutedTrap);
+        addr = @intFromPtr(&pthreadDetachSubstitute);
     } else if (std.mem.eql(u8, sym.name, "pthread_join")) {
-        if (!std.mem.startsWith(u8, for_obj.name, "libpthread.so") and !std.mem.startsWith(u8, for_obj.name, "libc.so")) {
-            Logger.warn("substitutes: {s}: dangerous unsubstituted pthread function [{s}] {s} as 0x{x}", .{ for_obj.name, dyn_object.name, sym.name, sym.address });
-        }
-        addr = @intFromPtr(&unsubstitutedTrap);
+        addr = @intFromPtr(&pthreadJoinSubstitute);
     }
     // TODO check if those functions really needs to be subsituted, it seems they only acts on the pthread struct
     // else if (std.mem.eql(u8, sym.name, "pthread_key_create")) {
@@ -3537,6 +3532,7 @@ fn dladdr1Substitute(addr: *anyopaque, dl_info: *DlInfo, extra_infos: *anyopaque
                 continue;
             }
 
+            // TODO we should cache and reuse produce link maps (store them in a hasmap, keyed by dyn object name)
             const link_map = allocator.create(DlLinkMap) catch @panic("OOM");
             extra_link_maps.append(allocator, link_map) catch @panic("OOM");
 
@@ -3609,6 +3605,35 @@ fn dlFindObjectSubstitute(pc: *anyopaque, result: *DlFindObject) callconv(.c) c_
     return 0;
 }
 
+fn dlFindDsoForObjectSubstitute(addr: *anyopaque) callconv(.c) ?*DlLinkMap {
+    Logger.info("intercepted call: _dl_find_dso_for_object(0x{x})", .{@intFromPtr(addr)});
+
+    const infos = findDynObjectSegmentForLoadedAddr(@intFromPtr(addr)) catch |err| {
+        Logger.warn("_dl_find_dso_for_object(0x{x}) failed: {}", .{ @intFromPtr(addr), err });
+        return null;
+    };
+
+    const owned_name = allocator.dupeZ(u8, infos.dyn_object.name) catch @panic("OOM");
+    extra_bytes.append(allocator, owned_name) catch @panic("OOM");
+
+    Logger.warn("_dl_find_dso_for_object: partial implementation: link maps should be reused as they can be compared by address", .{});
+
+    // TODO we should cache and reuse produce link maps (store them in a hasmap, keyed by dyn object name)
+    const link_map = allocator.create(DlLinkMap) catch @panic("OOM");
+    extra_link_maps.append(allocator, link_map) catch @panic("OOM");
+
+    link_map.l_addr = infos.dyn_object.loaded_at.?;
+    link_map.l_name = owned_name;
+    link_map.l_ld = @ptrFromInt(infos.dyn_object.loaded_at.? + infos.dyn_object.dyn_section_offset);
+    link_map.l_prev = null;
+    link_map.l_next = null;
+    link_map._others = @splat(0);
+
+    Logger.info("intercepted call: success: _dl_find_object(0x{x}) = 0x{x}", .{ @intFromPtr(addr), @intFromPtr(link_map) });
+
+    return link_map;
+}
+
 fn dlIteratePhdrSubstitute(callback: *const fn (*anyopaque, c_uint, *anyopaque) callconv(.c) c_int, data: *anyopaque) callconv(.c) c_int {
     Logger.info("intercepted call: dl_iterate_phdr(callback: 0x{x}, data: 0x{x})", .{ @intFromPtr(callback), @intFromPtr(data) });
 
@@ -3642,6 +3667,30 @@ fn pthreadCreateSubstitute(newthread: *anyopaque, attr: ?*const anyopaque, start
     // TODO real implementation
     Logger.err("unimplemented: pthread_create(0x{x}, 0x{x}, 0x{x}, 0x{x})", .{ @intFromPtr(newthread), @intFromPtr(attr), @intFromPtr(start_routine), @intFromPtr(arg) });
     @panic("unimplemented pthread_create");
+}
+
+fn pthreadExitSubstitute() callconv(.c) void {
+    // TODO real implementation
+    Logger.err("unimplemented: pthread_exit()", .{});
+    @panic("unimplemented pthread_exit");
+}
+
+fn pthreadCancelSubstitute() callconv(.c) void {
+    // TODO real implementation
+    Logger.err("unimplemented: pthread_cancel()", .{});
+    @panic("unimplemented pthread_cancel");
+}
+
+fn pthreadDetachSubstitute() callconv(.c) void {
+    // TODO real implementation
+    Logger.err("unimplemented: pthread_detach()", .{});
+    @panic("unimplemented pthread_detach");
+}
+
+fn pthreadJoinSubstitute() callconv(.c) void {
+    // TODO real implementation
+    Logger.err("unimplemented: pthread_join()", .{});
+    @panic("unimplemented pthread_join");
 }
 
 const TlsIndex = extern struct {
