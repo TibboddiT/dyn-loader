@@ -2320,30 +2320,62 @@ fn mapTlsBlock(dyn_object: *DynObject) !void {
             const e_set_fs = std.os.linux.syscall2(.arch_prctl, std.os.linux.ARCH.SET_FS, new_tp);
             std.debug.assert(e_set_fs == 0);
 
-            const maybe_rtld_global_ro = resolveSymbolByName("_rtld_global_ro") catch null;
+            {
+                // glibc
+                const maybe_rtld_global_ro = resolveSymbolByName("_rtld_global_ro") catch null;
 
-            if (maybe_rtld_global_ro) |rtld_global_ro| {
-                Logger.debug("tls: rtld_global_ro: 0x{x}", .{rtld_global_ro.address});
+                if (maybe_rtld_global_ro) |rtld_global_ro| {
+                    Logger.debug("tls: rtld_global_ro: 0x{x}", .{rtld_global_ro.address});
 
-                const seg_infos = try findDynObjectSegmentForLoadedAddr(rtld_global_ro.address);
+                    const seg_infos = try findDynObjectSegmentForLoadedAddr(rtld_global_ro.address);
 
-                // TODO we should find a way to get those field offsets at runtime
-                const dl_auxv: *volatile *anyopaque = @ptrFromInt(rtld_global_ro.address + 104);
-                const dl_tls_static_size: *volatile usize = @ptrFromInt(rtld_global_ro.address + 704);
-                const dl_tls_static_align: *volatile usize = @ptrFromInt(rtld_global_ro.address + 712);
+                    // TODO we should find a way to get those field offsets at runtime
+                    const dl_auxv: *volatile *anyopaque = @ptrFromInt(rtld_global_ro.address + 104);
+                    const dl_tls_static_size: *volatile usize = @ptrFromInt(rtld_global_ro.address + 704);
+                    const dl_tls_static_align: *volatile usize = @ptrFromInt(rtld_global_ro.address + 712);
 
-                try unprotectSegment(seg_infos.dyn_object, seg_infos.segment_index);
+                    try unprotectSegment(seg_infos.dyn_object, seg_infos.segment_index);
 
-                if (std.os.linux.elf_aux_maybe) |auxv| {
-                    dl_auxv.* = auxv;
+                    if (std.os.linux.elf_aux_maybe) |auxv| {
+                        dl_auxv.* = auxv;
+                    }
+
+                    dl_tls_static_size.* = new_tls_area_desc.block.size + current_surplus_size;
+                    dl_tls_static_align.* = new_tls_area_desc.alignment;
+
+                    try reprotectSegment(seg_infos.dyn_object, seg_infos.segment_index);
+                } else {
+                    Logger.info("tls: no rtld_global_ro symbol found", .{});
                 }
+            }
 
-                dl_tls_static_size.* = new_tls_area_desc.block.size;
-                dl_tls_static_align.* = new_tls_area_desc.alignment;
+            {
+                // musl
+                const maybe_libc = resolveSymbolByName("__libc") catch null;
 
-                try reprotectSegment(seg_infos.dyn_object, seg_infos.segment_index);
-            } else {
-                Logger.info("tls: no rtld_global_ro symbol found", .{});
+                if (maybe_libc) |libc| {
+                    Logger.debug("tls: __libc: 0x{x}", .{libc.address});
+
+                    const seg_infos = try findDynObjectSegmentForLoadedAddr(libc.address);
+
+                    // TODO we should find a way to get those field offsets at runtime
+                    const libc_auxv: *volatile *anyopaque = @ptrFromInt(libc.address + 8);
+                    const libc_tls_static_size: *volatile usize = @ptrFromInt(libc.address + 24);
+                    const libc_tls_static_align: *volatile usize = @ptrFromInt(libc.address + 32);
+
+                    try unprotectSegment(seg_infos.dyn_object, seg_infos.segment_index);
+
+                    if (std.os.linux.elf_aux_maybe) |auxv| {
+                        libc_auxv.* = auxv;
+                    }
+
+                    libc_tls_static_size.* = new_tls_area_desc.block.size + current_surplus_size;
+                    libc_tls_static_align.* = new_tls_area_desc.alignment;
+
+                    try reprotectSegment(seg_infos.dyn_object, seg_infos.segment_index);
+                } else {
+                    Logger.info("tls: no __libc symbol found", .{});
+                }
             }
 
             // TODO we should find a way to get this offset at runtime
@@ -3138,15 +3170,6 @@ fn callInitFunctions(dyn_obj: *DynObject) !void {
             Logger.debug("libc: calling early_init at 0x{x}", .{sym.address});
             early_init(false);
         }
-
-        maybe_sym = resolveSymbolByName("__pre_dls2b") catch null;
-        if (maybe_sym) |sym| {
-            Logger.debug("libc: found __pre_dls2b: 0x{x}", .{sym.address});
-            const early_init: *const fn ([*c]usize) callconv(.c) void = @ptrFromInt(sym.address);
-
-            Logger.debug("libc: calling __pre_dls2b: 0x{x}", .{sym.address});
-            early_init(if (std.os.linux.elf_aux_maybe) |auxv| @ptrCast(auxv) else 0);
-        }
     }
 
     if (dyn_obj.init_addr != 0) {
@@ -3257,7 +3280,7 @@ fn getSubstituteAddress(sym: ResolvedSymbol, for_obj: *DynObject) ?usize {
         }
         addr = @intFromPtr(&unsubstitutedTrap);
     }
-    // TODO checkif those functions really needs to be subsituted, it seems they only acts on the pthread struct
+    // TODO check if those functions really needs to be subsituted, it seems they only acts on the pthread struct
     // else if (std.mem.eql(u8, sym.name, "pthread_key_create")) {
     //     Logger.warn("substitutes: {s}: dangerous unsubstituted pthread function [{s}] {s} as 0x{x}", .{ for_obj.name, dyn_object.name, sym.name, sym.address });
     //     addr = @intFromPtr(&unsubstitutedTrap);
