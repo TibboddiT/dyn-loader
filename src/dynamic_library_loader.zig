@@ -2331,8 +2331,8 @@ fn mapTlsBlock(dyn_object: *DynObject) !void {
 
                     // TODO we should find a way to get those field offsets at runtime
                     const dl_auxv: *volatile *anyopaque = @ptrFromInt(rtld_global_ro.address + 104);
-                    const dl_tls_static_size: *volatile usize = @ptrFromInt(rtld_global_ro.address + 704);
-                    const dl_tls_static_align: *volatile usize = @ptrFromInt(rtld_global_ro.address + 712);
+                    const dl_tls_static_size: *volatile c_ulonglong = @ptrFromInt(rtld_global_ro.address + 704);
+                    const dl_tls_static_align: *volatile c_ulonglong = @ptrFromInt(rtld_global_ro.address + 712);
 
                     try unprotectSegment(seg_infos.dyn_object, seg_infos.segment_index);
 
@@ -2344,6 +2344,12 @@ fn mapTlsBlock(dyn_object: *DynObject) !void {
                     dl_tls_static_align.* = new_tls_area_desc.alignment;
 
                     try reprotectSegment(seg_infos.dyn_object, seg_infos.segment_index);
+
+                    // TODO we should find a way to get this offset at runtime
+                    const tid = std.Thread.getCurrentId();
+                    Logger.debug("tls: setting thread id {d} for pthread at 0x{x}", .{ tid, new_tp + 720 });
+                    const tid_ptr: *volatile i32 = @ptrFromInt(new_tp + 720);
+                    tid_ptr.* = @intCast(tid);
                 } else {
                     Logger.info("tls: no rtld_global_ro symbol found", .{});
                 }
@@ -2360,8 +2366,8 @@ fn mapTlsBlock(dyn_object: *DynObject) !void {
 
                     // TODO we should find a way to get those field offsets at runtime
                     const libc_auxv: *volatile *anyopaque = @ptrFromInt(libc.address + 8);
-                    const libc_tls_static_size: *volatile usize = @ptrFromInt(libc.address + 24);
-                    const libc_tls_static_align: *volatile usize = @ptrFromInt(libc.address + 32);
+                    const libc_tls_static_size: *volatile c_ulonglong = @ptrFromInt(libc.address + 24);
+                    const libc_tls_static_align: *volatile c_ulonglong = @ptrFromInt(libc.address + 32);
 
                     try unprotectSegment(seg_infos.dyn_object, seg_infos.segment_index);
 
@@ -2373,16 +2379,16 @@ fn mapTlsBlock(dyn_object: *DynObject) !void {
                     libc_tls_static_align.* = new_tls_area_desc.alignment;
 
                     try reprotectSegment(seg_infos.dyn_object, seg_infos.segment_index);
+
+                    // TODO we should find a way to get this offset at runtime
+                    const tid = std.Thread.getCurrentId();
+                    Logger.debug("tls: setting thread id {d} for pthread at 0x{x}", .{ tid, new_tp + 48 });
+                    const tid_ptr: *volatile i32 = @ptrFromInt(new_tp + 48);
+                    tid_ptr.* = @intCast(tid);
                 } else {
                     Logger.info("tls: no __libc symbol found", .{});
                 }
             }
-
-            // TODO we should find a way to get this offset at runtime
-            const tid = std.Thread.getCurrentId();
-            Logger.debug("tls: setting thread id {d} for pthread at 0x{x}", .{ tid, new_tp + 720 });
-            const tid_ptr: *volatile usize = @ptrFromInt(new_tp + 720);
-            tid_ptr.* = tid;
         }
 
         dyn_object.tls_offset = new_abi_tcb_offset;
