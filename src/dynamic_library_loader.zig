@@ -2403,7 +2403,7 @@ fn mapTlsBlock(dyn_object: *DynObject) !void {
 // this function has a special callconv
 fn tlsDescResolver() callconv(.naked) void {
     asm volatile (
-        \\ mov %%rsi, %%rax
+        \\ movq 8(%%rax), %%rax
         \\ ret
     );
 }
@@ -2516,7 +2516,10 @@ fn processRelocations(dyn_object: *DynObject) !void {
                 // TODO something don't work here, we need to better understand
                 const sym = try resolveSymbol(dyn_object, reloc.sym_idx);
                 const tls_offset = dyn_objects.values()[sym.dyn_object_idx].tls_offset;
-                const value: TlsDesc = .{ .tls_desc_resolver_arg = @as(isize, @intCast(sym.value)) + reloc.addend - @as(isize, @intCast(tls_offset)), .tls_desc_resolver = &tlsDescResolver };
+                const value: TlsDesc = .{
+                    .tls_desc_resolver_arg = @as(isize, @intCast(sym.value)) + reloc.addend - @as(isize, @intCast(tls_offset)),
+                    .tls_desc_resolver = &tlsDescResolver,
+                };
                 Logger.debug("  TLSDESC: 0x{x} (0x{x}): 0x{x} -> 0x{x} (0x{x}, {s}@{s} - [MODULE_TLS_OFFSET]0x{x} + 0x{x})", .{
                     reloc_addr,
                     reloc.offset,
@@ -2529,7 +2532,7 @@ fn processRelocations(dyn_object: *DynObject) !void {
                     reloc.addend,
                 });
                 const casted_ptr: *TlsDesc = @ptrCast(ptr);
-                casted_ptr.* = @bitCast(value);
+                casted_ptr.* = value;
             },
             .IRELATIVE => {
                 // R_X86_64_IRELATIVE: indirect relative (function pointer)
