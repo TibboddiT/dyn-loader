@@ -19,10 +19,6 @@ pub fn main() !void {
     const allocator = gpa.allocator();
     defer if (gpa.deinit() != .ok) @panic("memory check failed");
 
-    var threaded: std.Io.Threaded = .init(allocator);
-    defer threaded.deinit();
-    const io = threaded.io();
-
     try dll.init(.{ .allocator = allocator });
     defer dll.deinit();
 
@@ -39,11 +35,58 @@ pub fn main() !void {
 
     std.log.info("testing raylib InitWindow...", .{});
 
-    const init_window_sym = try lib_raylib.getSymbol("InitWindow");
-    const init_window_addr = init_window_sym.addr;
-    const initWindow: *const fn (width: c_int, height: c_int, title: [*:0]const u8) callconv(.c) void = @ptrFromInt(init_window_addr);
+    const Color = extern struct {
+        r: u8,
+        g: u8,
+        b: u8,
+        a: u8,
+    };
 
-    initWindow(800, 600, "Hello from raylib!");
+    const Vector2 = extern struct {
+        x: f32,
+        y: f32,
+    };
 
-    try std.Io.sleep(io, .fromSeconds(3), .awake);
+    const initWindow: *const fn (width: c_int, height: c_int, title: [*:0]const u8) callconv(.c) void = @ptrFromInt((try lib_raylib.getSymbol("InitWindow")).addr);
+    const windowShouldClose: *const fn () callconv(.c) bool = @ptrFromInt((try lib_raylib.getSymbol("WindowShouldClose")).addr);
+    const setTargetFPS: *const fn (fps: c_int) callconv(.c) void = @ptrFromInt((try lib_raylib.getSymbol("SetTargetFPS")).addr);
+    const beginDrawing: *const fn () callconv(.c) void = @ptrFromInt((try lib_raylib.getSymbol("BeginDrawing")).addr);
+    const clearBackground: *const fn (color: Color) callconv(.c) void = @ptrFromInt((try lib_raylib.getSymbol("ClearBackground")).addr);
+    const drawCircleV: *const fn (center: Vector2, radius: f32, color: Color) callconv(.c) void = @ptrFromInt((try lib_raylib.getSymbol("DrawCircleV")).addr);
+    const drawText: *const fn (text: [*:0]const u8, pos_x: c_int, pos_y: c_int, font_size: c_int, color: Color) callconv(.c) void = @ptrFromInt((try lib_raylib.getSymbol("DrawText")).addr);
+    const endDrawing: *const fn () callconv(.c) void = @ptrFromInt((try lib_raylib.getSymbol("EndDrawing")).addr);
+    const closeWindow: *const fn () callconv(.c) void = @ptrFromInt((try lib_raylib.getSymbol("CloseWindow")).addr);
+
+    const screenWidth: f32 = 800;
+    const screenHeight: f32 = 450;
+
+    initWindow(screenWidth, screenHeight, "Hello from zig !");
+
+    // Ball properties
+    var ballPosition: Vector2 = .{ .x = screenWidth / 2.0, .y = screenHeight / 2.0 };
+    var ballSpeed: Vector2 = .{ .x = 4.0, .y = 3.0 };
+
+    const ballRadius: f32 = 20.0;
+
+    setTargetFPS(60);
+
+    while (!windowShouldClose()) {
+        ballPosition.x += ballSpeed.x;
+        ballPosition.y += ballSpeed.y;
+
+        if ((ballPosition.x > screenWidth - ballRadius) or (ballPosition.x < ballRadius))
+            ballSpeed.x *= -1;
+
+        if ((ballPosition.y > screenHeight - ballRadius) or (ballPosition.y < ballRadius))
+            ballSpeed.y *= -1;
+
+        // Draw
+        beginDrawing();
+        clearBackground(.{ .r = 0x18, .g = 0x18, .b = 0x18, .a = 255 });
+        drawCircleV(ballPosition, ballRadius, .{ .r = 255, .g = 100, .b = 100, .a = 255 });
+        drawText("Yo ! - Raylib", 10, 10, 20, .{ .r = 120, .g = 120, .b = 120, .a = 255 });
+        endDrawing();
+    }
+
+    closeWindow();
 }

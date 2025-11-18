@@ -9,6 +9,7 @@ pub const CustomSelfInfo = struct {
 
     unwind_cache: if (can_unwind) ?[]std.debug.Dwarf.SelfUnwinder.CacheEntry else ?noreturn,
 
+    // TODO move this to dll global state
     var extra_phdr_infos: std.ArrayList(*std.posix.dl_phdr_info) = .empty;
 
     pub const init: SelfInfo = .{
@@ -456,6 +457,7 @@ pub const CustomSelfInfo = struct {
 
         return error.MissingDebugInfo;
     }
+
     const DlIterContext = struct {
         si: *SelfInfo,
         gpa: std.mem.Allocator,
@@ -595,6 +597,7 @@ const Reloc = struct {
 
 const RelocList = std.ArrayList(Reloc);
 
+// TODO global state
 var ifunc_resolved_addrs: std.AutoArrayHashMapUnmanaged(usize, usize) = .empty;
 var irel_resolved_targets: std.AutoArrayHashMapUnmanaged(usize, usize) = .empty;
 
@@ -699,6 +702,7 @@ pub const DynamicLibrary = struct {
     // }
 };
 
+// TODO global state
 var dyn_objects: DynObjectList = .empty;
 var dyn_objects_sorted_indices: std.ArrayList(usize) = .empty;
 
@@ -747,6 +751,7 @@ export fn _dl_debug_state() callconv(.c) void {
     Logger.debug("_dl_debug_state called", .{});
 }
 
+// TODO global state
 var initialized: bool = false;
 var allocator: std.mem.Allocator = undefined;
 
@@ -813,19 +818,36 @@ pub fn deinit() void {
         allocator.free(current_tls_area_desc.block.init);
     }
 
-    for (extra_bytes.items) |e| {
+    for (extra_strs.items) |e| {
         allocator.free(e);
     }
-    extra_bytes.deinit(allocator);
+    extra_strs.deinit(allocator);
+
+    for (extra_strs_z.items) |e| {
+        allocator.free(e);
+    }
+    extra_strs_z.deinit(allocator);
+
+    for (extra_phdrs.items) |e| {
+        allocator.destroy(e);
+    }
+    extra_phdrs.deinit(allocator);
 
     for (extra_link_maps.items) |e| {
         allocator.destroy(e);
     }
     extra_link_maps.deinit(allocator);
 
+    for (extra_threads.items) |e| {
+        allocator.destroy(e);
+    }
+    extra_threads.deinit(allocator);
+
     if (last_dl_error) |dle| {
         allocator.free(dle);
     }
+
+    thread_infos.clearAndFree(allocator);
 
     CustomSelfInfo.clearExtraElfs(allocator);
 
@@ -1850,7 +1872,7 @@ fn collectDepsBreadthFirst(dyn_object: *DynObject) !void {
     }
 }
 
-var indent_buf: [64]u8 = @splat(' ');
+const indent_buf: [64]u8 = @splat(' ');
 
 fn logDepTree(dyn_object: *const DynObject) !void {
     if (Logger.level != .debug) {
@@ -2054,6 +2076,7 @@ const Dtv = extern struct {
 //
 // #define TLS_DTV_UNALLOCATED ((void *) -1l)
 
+// TODO global state
 var initial_tls_init_file_size: usize = undefined;
 var initial_tls_init_mem_size: usize = undefined;
 var initial_tls_offset: usize = undefined;
@@ -2076,6 +2099,7 @@ fn computeTcbOffset(dyn_object: *DynObject) void {
     dyn_object.tls_offset = new_abi_tcb_offset;
 }
 
+// TODO global state
 var current_surplus_size: usize = 0x8000;
 
 fn mapTlsBlock(dyn_object: *DynObject) !void {
@@ -2231,7 +2255,7 @@ fn mapTlsBlock(dyn_object: *DynObject) !void {
                 new_abi_tcb_offset - do.tls_offset + do.tls_init_mem_size,
                 do.tls_init_mem_size - do.tls_init_file_size,
             });
-            @memset(new_initial_block[new_abi_tcb_offset - do.tls_offset + initial_tls_init_file_size ..][0 .. do.tls_init_mem_size - do.tls_init_file_size], 0);
+            @memset(new_initial_block[new_abi_tcb_offset - do.tls_offset + do.tls_init_file_size ..][0 .. do.tls_init_mem_size - do.tls_init_file_size], 0);
         }
     }
 
@@ -2302,23 +2326,24 @@ fn mapTlsBlock(dyn_object: *DynObject) !void {
         allocator.free(current_tls_area_desc.block.init);
     }
 
+    // TODO keep a copy of the normal area desc,
+    // and create another one to be set to `std.os.linux.tls.area_desc`
+    // that is adapted to the `std.os.linux.tls.prepareArea` call
+    // when spawning a thread
     std.os.linux.tls.area_desc = new_tls_area_desc;
 
     if (new_area != null) {
         if (!area_was_extended) {
-            // const new_tp = std.os.linux.tls.prepareArea(new_area);
-
             const new_tp = @intFromPtr(new_area.?.ptr) + new_abi_tcb_offset;
 
             // TODO unmap previous area
 
-            const new_tcb: *AbiTcb = @ptrCast(@alignCast(new_area.?.ptr + new_tls_area_desc.abi_tcb.offset));
-            new_tcb.self = @ptrFromInt(new_tp);
+            const new_tcb: *usize = @ptrFromInt(new_tp);
+            new_tcb.* = new_tp;
 
-            // setting dtv.len to self because it happens to coincide with what is expected by pthread
-            const new_dtv: *Dtv = @ptrCast(@alignCast(new_area.?.ptr + new_tls_area_desc.dtv.offset));
-            new_dtv.tls_block = new_area.?.ptr;
-            new_dtv.len = new_tp;
+            // for pthread->self
+            const pthread_self: *usize = @ptrFromInt(new_tp + 16);
+            pthread_self.* = new_tp;
 
             Logger.debug("tls: tls space mapped, new TP: 0x{x}", .{new_tp});
 
@@ -3315,8 +3340,12 @@ fn unsubstitutedTrap() void {
     @panic("unsupported call to a dangerous function");
 }
 
-var extra_bytes: std.ArrayList([]const u8) = .empty;
+// TODO global state
+var extra_strs: std.ArrayList([]const u8) = .empty;
+var extra_strs_z: std.ArrayList([:0]const u8) = .empty;
+var extra_phdrs: std.ArrayList(*std.posix.dl_phdr_info) = .empty;
 var extra_link_maps: std.ArrayList(*DlLinkMap) = .empty;
+var extra_threads: std.ArrayList(*std.Thread) = .empty;
 var last_dl_error: ?[:0]const u8 = null;
 
 fn dlopenSubstitute(path: ?[*:0]const u8, flags: c_int) callconv(.c) ?*anyopaque {
@@ -3327,7 +3356,7 @@ fn dlopenSubstitute(path: ?[*:0]const u8, flags: c_int) callconv(.c) ?*anyopaque
     }
 
     const owned_path = allocator.dupe(u8, std.mem.span(path.?)) catch @panic("OOM");
-    extra_bytes.append(allocator, owned_path) catch @panic("OOM");
+    extra_strs.append(allocator, owned_path) catch @panic("OOM");
 
     const lib = load(owned_path) catch |err| {
         if (last_dl_error != null) {
@@ -3441,7 +3470,7 @@ fn dladdrSubstitute(addr: *anyopaque, dl_info: *DlInfo) callconv(.c) c_int {
     };
 
     const owned_name = allocator.dupeZ(u8, infos.dyn_object.name) catch @panic("OOM");
-    extra_bytes.append(allocator, owned_name) catch @panic("OOM");
+    extra_strs_z.append(allocator, owned_name) catch @panic("OOM");
 
     dl_info.dli_fname = owned_name.ptr;
     dl_info.dli_fbase = @ptrFromInt(infos.dyn_object.loaded_at.?);
@@ -3451,7 +3480,7 @@ fn dladdrSubstitute(addr: *anyopaque, dl_info: *DlInfo) callconv(.c) c_int {
         const sym_addr = vAddressToLoadedAddress(infos.dyn_object, sym.value, false) catch unreachable;
 
         const owned_sym_name = allocator.dupeZ(u8, sym.name) catch @panic("OOM");
-        extra_bytes.append(allocator, owned_sym_name) catch @panic("OOM");
+        extra_strs_z.append(allocator, owned_sym_name) catch @panic("OOM");
 
         dl_info.dli_fsname = owned_sym_name.ptr;
         dl_info.dli_fsaddr = @ptrFromInt(sym_addr);
@@ -3504,7 +3533,7 @@ fn dladdr1Substitute(addr: *anyopaque, dl_info: *DlInfo, extra_infos: *anyopaque
     };
 
     const owned_name = allocator.dupeZ(u8, infos.dyn_object.name) catch @panic("OOM");
-    extra_bytes.append(allocator, owned_name) catch @panic("OOM");
+    extra_strs_z.append(allocator, owned_name) catch @panic("OOM");
 
     dl_info.dli_fname = owned_name.ptr;
     dl_info.dli_fbase = @ptrFromInt(infos.dyn_object.loaded_at.?);
@@ -3514,7 +3543,7 @@ fn dladdr1Substitute(addr: *anyopaque, dl_info: *DlInfo, extra_infos: *anyopaque
         const sym_addr = vAddressToLoadedAddress(infos.dyn_object, sym.value, false) catch unreachable;
 
         const owned_sym_name = allocator.dupeZ(u8, sym.name) catch @panic("OOM");
-        extra_bytes.append(allocator, owned_sym_name) catch @panic("OOM");
+        extra_strs_z.append(allocator, owned_sym_name) catch @panic("OOM");
 
         dl_info.dli_fsname = owned_sym_name.ptr;
         dl_info.dli_fsaddr = @ptrFromInt(sym_addr);
@@ -3614,7 +3643,7 @@ fn dlFindDsoForObjectSubstitute(addr: *anyopaque) callconv(.c) ?*DlLinkMap {
     };
 
     const owned_name = allocator.dupeZ(u8, infos.dyn_object.name) catch @panic("OOM");
-    extra_bytes.append(allocator, owned_name) catch @panic("OOM");
+    extra_strs_z.append(allocator, owned_name) catch @panic("OOM");
 
     Logger.warn("_dl_find_dso_for_object: partial implementation: link maps should be reused as they can be compared by address", .{});
 
@@ -3643,6 +3672,7 @@ fn dlIteratePhdrSubstitute(callback: *const fn (*anyopaque, c_uint, *anyopaque) 
         }
 
         const dl_phdr_info = allocator.create(std.posix.dl_phdr_info) catch @panic("OOM");
+        extra_phdrs.append(allocator, dl_phdr_info) catch @panic("OOM");
 
         dl_phdr_info.* = .{
             .addr = dyn_obj.loaded_at.?,
@@ -3663,10 +3693,73 @@ fn dlIteratePhdrSubstitute(callback: *const fn (*anyopaque, c_uint, *anyopaque) 
     return 0;
 }
 
+const ThreadInfos = struct { t: *std.Thread, ret: *anyopaque };
+const ThreadInfosMap = std.AutoArrayHashMapUnmanaged(usize, ThreadInfos);
+
+// TODO global state
+var thread_infos: ThreadInfosMap = .empty;
+var currentIdx: usize = 1;
+
+const ThreadRoutineContext = struct {
+    idx: usize,
+    thread: *std.Thread,
+    f: *const fn (?*anyopaque) callconv(.c) *anyopaque,
+    arg: ?*anyopaque,
+};
+
+fn threadRoutine(ctx: ThreadRoutineContext) void {
+    Logger.info("new thread spawned: {d}", .{ctx.idx});
+
+    var new_tp: usize = undefined;
+    const e_get_fs = std.os.linux.syscall2(.arch_prctl, std.os.linux.ARCH.GET_FS, @intFromPtr(&new_tp));
+    std.debug.assert(e_get_fs == 0);
+
+    // for pthread->self
+    const pthread_self: *usize = @ptrFromInt(new_tp + 16);
+    pthread_self.* = new_tp;
+
+    const maybe_sym = getResolvedSymbolByName(null, "__ctype_init") catch null;
+    if (maybe_sym) |sym| {
+        const ctypeInit: *const fn () callconv(.c) void = @ptrFromInt(sym.address);
+        Logger.debug("thread {d}: call __ctype_init", .{ctx.idx});
+        ctypeInit();
+    }
+
+    thread_infos.putNoClobber(allocator, ctx.idx, .{ .t = ctx.thread, .ret = undefined }) catch @panic("OOM");
+    var r = thread_infos.getOrPut(allocator, ctx.idx) catch @panic("OOM");
+    r.value_ptr.ret = ctx.f(ctx.arg);
+
+    Logger.info("thread {d} completed: 0x{x}", .{ ctx.idx, @intFromPtr(r.value_ptr.ret) });
+}
+
 fn pthreadCreateSubstitute(newthread: *anyopaque, attr: ?*const anyopaque, start_routine: *const fn (?*anyopaque) callconv(.c) *anyopaque, arg: ?*anyopaque) callconv(.c) c_int {
-    // TODO real implementation
-    Logger.err("unimplemented: pthread_create(0x{x}, 0x{x}, 0x{x}, 0x{x})", .{ @intFromPtr(newthread), @intFromPtr(attr), @intFromPtr(start_routine), @intFromPtr(arg) });
-    @panic("unimplemented pthread_create");
+    Logger.debug("intercepted call: pthread_create(0x{x}, 0x{x}, 0x{x}, 0x{x})", .{ @intFromPtr(newthread), @intFromPtr(attr), @intFromPtr(start_routine), @intFromPtr(arg) });
+
+    const page_size = std.heap.pageSize();
+    const default_stack_size = std.Thread.SpawnConfig.default_stack_size;
+    var tls_offset: usize = undefined;
+
+    var bytes: usize = page_size;
+    bytes += @max(page_size, default_stack_size);
+    bytes = std.mem.alignForward(usize, bytes, page_size);
+    bytes = std.mem.alignForward(usize, bytes, std.os.linux.tls.area_desc.alignment);
+    tls_offset = bytes;
+
+    const thread = allocator.create(std.Thread) catch @panic("OOM");
+    extra_threads.append(allocator, thread) catch @panic("OOM");
+
+    const idx = @atomicRmw(usize, &currentIdx, .Add, 1, .seq_cst);
+    thread.* = std.Thread.spawn(.{}, threadRoutine, .{ThreadRoutineContext{ .idx = idx, .thread = thread, .f = start_routine, .arg = arg }}) catch |err| {
+        Logger.warn("pthread_create(0x{x}, 0x{x}, 0x{x}, 0x{x}) failed: {}", .{ @intFromPtr(newthread), @intFromPtr(attr), @intFromPtr(start_routine), @intFromPtr(arg), err });
+        return 1;
+    };
+
+    const newthread_handle: *usize = @ptrCast(@alignCast(newthread));
+    newthread_handle.* = @intFromPtr(thread.impl.thread.mapped.ptr) + tls_offset;
+
+    Logger.info("intercepted call: success: pthread_create(0x{x}, 0x{x}, 0x{x}, 0x{x}) = 0", .{ @intFromPtr(newthread), @intFromPtr(attr), @intFromPtr(start_routine), @intFromPtr(arg) });
+
+    return 0;
 }
 
 fn pthreadExitSubstitute() callconv(.c) void {
