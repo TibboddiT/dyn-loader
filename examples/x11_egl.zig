@@ -149,14 +149,14 @@ pub fn main() !void {
         EGL.EGL_RED_SIZE,        8,
         EGL.EGL_GREEN_SIZE,      8,
         EGL.EGL_BLUE_SIZE,       8,
-        EGL.EGL_DEPTH_SIZE,      16,
+        EGL.EGL_DEPTH_SIZE,      8,
         EGL.EGL_NONE,
     };
 
-    var configs: [*c]EGL.EGLConfig = undefined;
+    var configs: [1]EGL.EGLConfig = undefined;
     var num_configs: EGL.EGLint = undefined;
-    const choose_config_status = eglChooseConfig(egl_display, config_attribs.ptr, @ptrCast(&configs), 1, &num_configs);
-    if (choose_config_status == 0 or num_configs == 0) {
+    const choose_config_status = eglChooseConfig(egl_display, config_attribs.ptr, &configs, 1, &num_configs);
+    if (choose_config_status == 0 or num_configs != 1) {
         return error.EGLChooseConfigError;
     }
 

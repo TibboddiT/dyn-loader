@@ -3693,7 +3693,12 @@ fn dlIteratePhdrSubstitute(callback: *const fn (*anyopaque, c_uint, *anyopaque) 
     return 0;
 }
 
-const ThreadInfos = struct { t: *std.Thread, ret: *anyopaque };
+const ThreadInfos = struct {
+    idx: usize,
+    t: *std.Thread,
+    ret: *anyopaque,
+    handle: c_ulong,
+};
 const ThreadInfosMap = std.AutoArrayHashMapUnmanaged(usize, ThreadInfos);
 
 // TODO global state
@@ -3708,11 +3713,11 @@ const ThreadRoutineContext = struct {
 };
 
 fn threadRoutine(ctx: ThreadRoutineContext) void {
-    Logger.info("new thread spawned: {d}", .{ctx.idx});
-
     var new_tp: usize = undefined;
     const e_get_fs = std.os.linux.syscall2(.arch_prctl, std.os.linux.ARCH.GET_FS, @intFromPtr(&new_tp));
     std.debug.assert(e_get_fs == 0);
+
+    Logger.info("new thread spawned: {d} [0x{x}]", .{ ctx.idx, new_tp });
 
     // for pthread->self
     const pthread_self: *usize = @ptrFromInt(new_tp + 16);
@@ -3725,14 +3730,14 @@ fn threadRoutine(ctx: ThreadRoutineContext) void {
         ctypeInit();
     }
 
-    thread_infos.putNoClobber(allocator, ctx.idx, .{ .t = ctx.thread, .ret = undefined }) catch @panic("OOM");
+    thread_infos.putNoClobber(allocator, ctx.idx, .{ .idx = ctx.idx, .handle = new_tp, .t = ctx.thread, .ret = undefined }) catch @panic("OOM");
     var r = thread_infos.getOrPut(allocator, ctx.idx) catch @panic("OOM");
     r.value_ptr.ret = ctx.f(ctx.arg);
 
     Logger.info("thread {d} completed: 0x{x}", .{ ctx.idx, @intFromPtr(r.value_ptr.ret) });
 }
 
-fn pthreadCreateSubstitute(newthread: *anyopaque, attr: ?*const anyopaque, start_routine: *const fn (?*anyopaque) callconv(.c) *anyopaque, arg: ?*anyopaque) callconv(.c) c_int {
+fn pthreadCreateSubstitute(newthread: *c_ulong, attr: ?*const anyopaque, start_routine: *const fn (?*anyopaque) callconv(.c) *anyopaque, arg: ?*anyopaque) callconv(.c) c_int {
     Logger.debug("intercepted call: pthread_create(0x{x}, 0x{x}, 0x{x}, 0x{x})", .{ @intFromPtr(newthread), @intFromPtr(attr), @intFromPtr(start_routine), @intFromPtr(arg) });
 
     const page_size = std.heap.pageSize();
@@ -3754,7 +3759,7 @@ fn pthreadCreateSubstitute(newthread: *anyopaque, attr: ?*const anyopaque, start
         return 1;
     };
 
-    const newthread_handle: *usize = @ptrCast(@alignCast(newthread));
+    const newthread_handle: *c_ulong = @ptrCast(@alignCast(newthread));
     newthread_handle.* = @intFromPtr(thread.impl.thread.mapped.ptr) + tls_offset;
 
     Logger.info("intercepted call: success: pthread_create(0x{x}, 0x{x}, 0x{x}, 0x{x}) = 0", .{ @intFromPtr(newthread), @intFromPtr(attr), @intFromPtr(start_routine), @intFromPtr(arg) });
@@ -3780,10 +3785,26 @@ fn pthreadDetachSubstitute() callconv(.c) void {
     @panic("unimplemented pthread_detach");
 }
 
-fn pthreadJoinSubstitute() callconv(.c) void {
-    // TODO real implementation
-    Logger.err("unimplemented: pthread_join()", .{});
-    @panic("unimplemented pthread_join");
+fn pthreadJoinSubstitute(thread_handle: c_ulong, retval: **anyopaque) callconv(.c) void {
+    Logger.debug("intercepted call: pthread_join(0x{x}, 0x{x})", .{ thread_handle, @intFromPtr(retval) });
+
+    for (thread_infos.values()) |*entry| {
+        // TODO why does the handle is page aligned, but not the entry handle ?
+        if (std.mem.alignBackward(c_ulong, entry.handle, std.heap.pageSize()) != thread_handle) {
+            continue;
+        }
+
+        entry.t.join();
+
+        retval.* = entry.ret;
+
+        Logger.info("intercepted call: success: pthread_join(0x{x}, 0x{x})", .{ thread_handle, @intFromPtr(retval) });
+
+        return;
+    }
+
+    Logger.err("pthread_join(0x{x}, 0x{x}) failed: thread not found", .{ thread_handle, @intFromPtr(retval) });
+    @panic("pthread_join: thread not found");
 }
 
 const TlsIndex = extern struct {
