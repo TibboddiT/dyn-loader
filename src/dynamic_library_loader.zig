@@ -3320,7 +3320,7 @@ var extra_link_maps: std.ArrayList(*DlLinkMap) = .empty;
 var last_dl_error: ?[:0]const u8 = null;
 
 fn dlopenSubstitute(path: ?[*:0]const u8, flags: c_int) callconv(.c) ?*anyopaque {
-    Logger.info("intercepted call: dlopen(\"{?s}\", 0x{x})", .{ path, flags });
+    Logger.debug("intercepted call: dlopen(\"{?s}\", 0x{x})", .{ path, flags });
 
     if (path == null) {
         return @ptrFromInt(std.math.maxInt(usize) - 1);
@@ -3353,7 +3353,7 @@ fn dlcloseSubstitute(lib: *anyopaque) callconv(.c) c_int {
 }
 
 fn dlsymSubstitute(lib_handle: ?*anyopaque, sym_name: [*:0]const u8) callconv(.c) ?*anyopaque {
-    Logger.info("intercepted call: dlsym({d}, \"{s}\")", .{ @intFromPtr(lib_handle), sym_name });
+    Logger.debug("intercepted call: dlsym({d}, \"{s}\")", .{ @intFromPtr(lib_handle), sym_name });
 
     const dyn_object = if (lib_handle != null and @intFromPtr(lib_handle.?) != std.math.maxInt(usize) - 1) &dyn_objects.values()[@intFromPtr(lib_handle.?) - 1] else null;
 
@@ -3374,7 +3374,7 @@ fn dlsymSubstitute(lib_handle: ?*anyopaque, sym_name: [*:0]const u8) callconv(.c
 }
 
 fn dlvsymSubstitute(lib_handle: ?*anyopaque, sym_name: [*:0]const u8, version: [*:0]const u8) callconv(.c) ?*anyopaque {
-    Logger.info("intercepted call: dlvsym({d}, \"{s}\" \"{s}\")", .{ @intFromPtr(lib_handle), sym_name, version });
+    Logger.debug("intercepted call: dlvsym({d}, \"{s}\" \"{s}\")", .{ @intFromPtr(lib_handle), sym_name, version });
 
     const dyn_object = if (lib_handle != null and @intFromPtr(lib_handle.?) != std.math.maxInt(usize) - 1) &dyn_objects.values()[@intFromPtr(lib_handle.?) - 1] else null;
 
@@ -3427,7 +3427,7 @@ const DlFindObject = extern struct {
 };
 
 fn dladdrSubstitute(addr: *anyopaque, dl_info: *DlInfo) callconv(.c) c_int {
-    Logger.info("intercepted call: dladdr(0x{x}, dl_info: *DlInfo [0x{x}])", .{ @intFromPtr(addr), @intFromPtr(dl_info) });
+    Logger.debug("intercepted call: dladdr(0x{x}, dl_info: *DlInfo [0x{x}])", .{ @intFromPtr(addr), @intFromPtr(dl_info) });
 
     const infos = findDynObjectSegmentForLoadedAddr(@intFromPtr(addr)) catch |err| {
         if (last_dl_error != null) {
@@ -3472,14 +3472,14 @@ fn dladdrSubstitute(addr: *anyopaque, dl_info: *DlInfo) callconv(.c) c_int {
 }
 
 fn dlerrorSubstitute() callconv(.c) ?[*:0]const u8 {
-    Logger.info("intercepted call: dlerror()", .{});
+    Logger.debug("intercepted call: dlerror()", .{});
     Logger.info("intercepted call: success: dlerror() = {?s}", .{last_dl_error});
 
     return if (last_dl_error) |e| e.ptr else null;
 }
 
 fn dladdr1Substitute(addr: *anyopaque, dl_info: *DlInfo, extra_infos: *anyopaque, flags: c_int) callconv(.c) c_int {
-    Logger.info("intercepted call: dladdr1(0x{x}, dl_info: *DlInfo [0x{x}], extra_infos: 0x{x}, flags: 0x{x})", .{
+    Logger.debug("intercepted call: dladdr1(0x{x}, dl_info: *DlInfo [0x{x}], extra_infos: 0x{x}, flags: 0x{x})", .{
         @intFromPtr(addr),
         @intFromPtr(dl_info),
         @intFromPtr(extra_infos),
@@ -3589,7 +3589,7 @@ fn dlmopenSubstitute(lmid: c_long, path: ?[*:0]u8, flags: c_int) callconv(.c) ?*
 }
 
 fn dlFindObjectSubstitute(pc: *anyopaque, result: *DlFindObject) callconv(.c) c_int {
-    Logger.info("intercepted call: _dl_find_object(0x{x}, *DlFindObject [0x{x}])", .{ @intFromPtr(pc), @intFromPtr(result) });
+    Logger.debug("intercepted call: _dl_find_object(0x{x}, *DlFindObject [0x{x}])", .{ @intFromPtr(pc), @intFromPtr(result) });
 
     const infos = findDynObjectSegmentForLoadedAddr(@intFromPtr(pc)) catch |err| {
         Logger.warn("_dl_find_object(0x{x}, *DlFindObject [0x{x}]) failed: {}", .{ @intFromPtr(pc), @intFromPtr(result), err });
@@ -3606,7 +3606,7 @@ fn dlFindObjectSubstitute(pc: *anyopaque, result: *DlFindObject) callconv(.c) c_
 }
 
 fn dlFindDsoForObjectSubstitute(addr: *anyopaque) callconv(.c) ?*DlLinkMap {
-    Logger.info("intercepted call: _dl_find_dso_for_object(0x{x})", .{@intFromPtr(addr)});
+    Logger.debug("intercepted call: _dl_find_dso_for_object(0x{x})", .{@intFromPtr(addr)});
 
     const infos = findDynObjectSegmentForLoadedAddr(@intFromPtr(addr)) catch |err| {
         Logger.warn("_dl_find_dso_for_object(0x{x}) failed: {}", .{ @intFromPtr(addr), err });
@@ -3635,7 +3635,7 @@ fn dlFindDsoForObjectSubstitute(addr: *anyopaque) callconv(.c) ?*DlLinkMap {
 }
 
 fn dlIteratePhdrSubstitute(callback: *const fn (*anyopaque, c_uint, *anyopaque) callconv(.c) c_int, data: *anyopaque) callconv(.c) c_int {
-    Logger.info("intercepted call: dl_iterate_phdr(callback: 0x{x}, data: 0x{x})", .{ @intFromPtr(callback), @intFromPtr(data) });
+    Logger.debug("intercepted call: dl_iterate_phdr(callback: 0x{x}, data: 0x{x})", .{ @intFromPtr(callback), @intFromPtr(data) });
 
     for (dyn_objects.values()) |*dyn_obj| {
         if (!dyn_obj.loaded) {
@@ -3653,7 +3653,7 @@ fn dlIteratePhdrSubstitute(callback: *const fn (*anyopaque, c_uint, *anyopaque) 
 
         const ret = callback(dl_phdr_info, @sizeOf(std.posix.dl_phdr_info), data);
         if (ret != 0) {
-            Logger.info("intercepted call: dl_iterate_phdr(callback: 0x{x}, data: 0x{x}) != 0 for {s}", .{ @intFromPtr(callback), @intFromPtr(data), dyn_obj.name });
+            Logger.info("intercepted call: success: dl_iterate_phdr(callback: 0x{x}, data: 0x{x}), callback() != 0 for {s}", .{ @intFromPtr(callback), @intFromPtr(data), dyn_obj.name });
             return ret;
         }
     }
@@ -3699,7 +3699,7 @@ const TlsIndex = extern struct {
 };
 
 fn tlsGetAddressSubstitute(tls_index: *TlsIndex) callconv(.c) ?*anyopaque {
-    Logger.info("intercepted call: __tls_get_addr({})", .{tls_index});
+    Logger.debug("intercepted call: __tls_get_addr({})", .{tls_index});
 
     const dyn_object_idx = tls_index.ti_module - 1;
 
