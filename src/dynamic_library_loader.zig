@@ -2086,7 +2086,7 @@ var initial_tls_init_block: []const u8 = undefined;
 fn computeTcbOffset(dyn_object: *DynObject) void {
     Logger.debug("computing tcb offset of library {s}", .{dyn_object.name});
 
-    const current_tls_area_desc = std.os.linux.tls.area_desc;
+    const current_tls_area_desc = normal_current_tls_area_desc orelse std.os.linux.tls.area_desc;
 
     var new_area_size: usize = 0;
     new_area_size += dyn_object.tls_init_mem_size;
@@ -2101,11 +2101,12 @@ fn computeTcbOffset(dyn_object: *DynObject) void {
 
 // TODO global state
 var current_surplus_size: usize = 0x8000;
+var normal_current_tls_area_desc: ?@TypeOf(std.os.linux.tls.area_desc) = null;
 
 fn mapTlsBlock(dyn_object: *DynObject) !void {
     Logger.debug("mapping tls block of library {s}", .{dyn_object.name});
 
-    const current_tls_area_desc = std.os.linux.tls.area_desc;
+    const current_tls_area_desc = normal_current_tls_area_desc orelse std.os.linux.tls.area_desc;
 
     var new_area_size: usize = 0;
     const new_block_offset: usize = 0;
@@ -2301,7 +2302,7 @@ fn mapTlsBlock(dyn_object: *DynObject) !void {
     // In this case, when main zig executable is relocating, it should take into account
     // the offset created by the Zig TCB struct.
     //
-    const new_tls_area_desc: @TypeOf(current_tls_area_desc) = .{
+    var new_tls_area_desc: @TypeOf(current_tls_area_desc) = .{
         .size = new_area_size,
         .alignment = new_align_factor,
 
@@ -2330,6 +2331,12 @@ fn mapTlsBlock(dyn_object: *DynObject) !void {
     // and create another one to be set to `std.os.linux.tls.area_desc`
     // that is adapted to the `std.os.linux.tls.prepareArea` call
     // when spawning a thread
+    normal_current_tls_area_desc = new_tls_area_desc;
+
+    new_tls_area_desc.size = current_surplus_size + new_area_size + sizeof_pthread;
+    new_tls_area_desc.dtv.offset += current_surplus_size;
+    new_tls_area_desc.abi_tcb.offset += current_surplus_size;
+    new_tls_area_desc.block.offset += current_surplus_size;
     std.os.linux.tls.area_desc = new_tls_area_desc;
 
     if (new_area != null) {
@@ -2387,6 +2394,11 @@ fn mapTlsBlock(dyn_object: *DynObject) !void {
 
             {
                 // musl
+                // TODO this symbol is not exported by default,
+                // we should find it in another way:
+                // - resolve `getauxval` and `issetugid`
+                // - they both should start with `lea [offset](%rip),%rax`
+                // this offset points to the __libc static variable
                 const maybe_libc = resolveSymbolByName("__libc") catch null;
 
                 if (maybe_libc) |libc| {
@@ -3748,7 +3760,7 @@ fn pthreadCreateSubstitute(newthread: *c_ulong, attr: ?*const anyopaque, start_r
     bytes += @max(page_size, default_stack_size);
     bytes = std.mem.alignForward(usize, bytes, page_size);
     bytes = std.mem.alignForward(usize, bytes, std.os.linux.tls.area_desc.alignment);
-    tls_offset = bytes;
+    tls_offset = bytes + std.os.linux.tls.area_desc.abi_tcb.offset;
 
     const thread = allocator.create(std.Thread) catch @panic("OOM");
     extra_threads.append(allocator, thread) catch @panic("OOM");
@@ -3789,8 +3801,7 @@ fn pthreadJoinSubstitute(thread_handle: c_ulong, retval: **anyopaque) callconv(.
     Logger.debug("intercepted call: pthread_join(0x{x}, 0x{x})", .{ thread_handle, @intFromPtr(retval) });
 
     for (thread_infos.values()) |*entry| {
-        // TODO why does the handle is page aligned, but not the entry handle ?
-        if (std.mem.alignBackward(c_ulong, entry.handle, std.heap.pageSize()) != thread_handle) {
+        if (entry.handle != thread_handle) {
             continue;
         }
 
