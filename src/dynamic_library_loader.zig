@@ -2160,7 +2160,7 @@ fn mapTlsBlock(dyn_object: *DynObject) !void {
         Logger.debug("tls: setting new area start at 0x{x} (0x{x})", .{ current_surplus_size, @intFromPtr(space.ptr) + current_surplus_size });
         new_area = space[current_surplus_size..];
     } else if (new_area_size > current_tls_area_desc.size and new_area_size <= current_tls_area_desc.size + current_surplus_size) {
-        Logger.debug("tls: extending old area: size: 0x{x} (new_area_size) = 0x{x} (surplus) + 0x{x} (current_area_siz)", .{ new_area_size, new_area_size - current_tls_area_desc.size, current_tls_area_desc.size });
+        Logger.debug("tls: extending old area: size: 0x{x} (new_area_size) = 0x{x} (surplus) + 0x{x} (current_area_size)", .{ new_area_size, new_area_size - current_tls_area_desc.size, current_tls_area_desc.size });
         Logger.debug("tls: setting new area start at -0x{x} (0x{x})", .{ new_area_size - current_tls_area_desc.size, prev_area_addr - (new_area_size - current_tls_area_desc.size) });
         new_area = @as([*]u8, @ptrFromInt(prev_area_addr - (new_area_size - current_tls_area_desc.size)))[0..new_area_size];
         Logger.debug("tls: setting new surplus size: 0x{x}", .{current_surplus_size - (new_area_size - current_tls_area_desc.size)});
@@ -2173,7 +2173,7 @@ fn mapTlsBlock(dyn_object: *DynObject) !void {
         //     return err;
         // };
 
-        // TODO the goal is to avoid unstable thread pointer
+        // the goal is to avoid unstable thread pointer
         Logger.err("tls: surplus exhausted: wanted size: 0x{x} (new_area_size) + 0x{x} (size of pthread struct)", .{ new_area_size, sizeof_pthread });
         @panic("unsupported tls area extension");
     }
@@ -2198,7 +2198,7 @@ fn mapTlsBlock(dyn_object: *DynObject) !void {
 
     if (current_tls_area_desc.gdt_entry_number != @as(usize, @bitCast(@as(isize, -1)))) {
         if (new_area != null and !area_was_extended) {
-            // TODO we should not do that
+            // TODO we should not have to do that
             Logger.debug("tls: copying previous pthread data: from 0x{x} to 0x{x} (size: 0x{x})", .{
                 new_abi_tcb_offset,
                 new_area_size + sizeof_pthread,
@@ -2221,59 +2221,66 @@ fn mapTlsBlock(dyn_object: *DynObject) !void {
         @memcpy(new_area.?[new_abi_tcb_offset..][0 .. current_tls_area_desc.size - current_tls_area_desc.abi_tcb.offset], @as([*]u8, @ptrFromInt(old_tp)));
     }
 
-    // TODO this allocation could easily be avoided
-
+    // TODO this allocation could easily be avoided if loaded dyn object has no static tls data
     Logger.debug("tls: allocating new init block: size: 0x{x}", .{new_abi_tcb_offset});
     const new_initial_block = try allocator.alloc(u8, new_abi_tcb_offset);
 
-    if (initial_tls_init_file_size != initial_tls_init_mem_size) {
-        Logger.debug("tls: copying initial tdata: from 0x{x} to 0x{x} (size: 0x{x})", .{
-            new_abi_tcb_offset - initial_tls_offset,
-            new_abi_tcb_offset - initial_tls_offset + initial_tls_init_file_size,
-            initial_tls_init_file_size,
-        });
+    Logger.debug("tls: copying initial tdata: from 0x{x} to 0x{x} (size: 0x{x})", .{
+        new_abi_tcb_offset - initial_tls_offset,
+        new_abi_tcb_offset - initial_tls_offset + initial_tls_init_file_size,
+        initial_tls_init_file_size,
+    });
+    if (initial_tls_init_file_size > 0) {
         @memcpy(new_initial_block[new_abi_tcb_offset - initial_tls_offset ..][0..initial_tls_init_file_size], initial_tls_init_block);
-        Logger.debug("tls: zeroing initial tbss: from 0x{x} to 0x{x} (size: 0x{x})", .{
-            new_abi_tcb_offset - initial_tls_offset + initial_tls_init_file_size,
-            new_abi_tcb_offset - initial_tls_offset + initial_tls_init_mem_size,
-            initial_tls_init_mem_size - initial_tls_init_file_size,
-        });
+    }
+    Logger.debug("tls: zeroing initial tbss: from 0x{x} to 0x{x} (size: 0x{x})", .{
+        new_abi_tcb_offset - initial_tls_offset + initial_tls_init_file_size,
+        new_abi_tcb_offset - initial_tls_offset + initial_tls_init_mem_size,
+        initial_tls_init_mem_size - initial_tls_init_file_size,
+    });
+    if (initial_tls_init_mem_size > 0) {
         @memset(new_initial_block[new_abi_tcb_offset - initial_tls_offset + initial_tls_init_file_size ..][0 .. initial_tls_init_mem_size - initial_tls_init_file_size], 0);
     }
 
     for (dyn_objects.values()) |*do| {
-        if (do.tls_mapped_at != 0 and do.tls_init_file_size != do.tls_init_mem_size) {
+        if (do.tls_mapped_at != 0) {
             Logger.debug("tls: copying {s} tdata: from 0x{x} to 0x{x} (size: 0x{x})", .{
                 do.name,
                 new_abi_tcb_offset - do.tls_offset,
                 new_abi_tcb_offset - do.tls_offset + do.tls_init_file_size,
                 do.tls_init_file_size,
             });
-            @memcpy(new_initial_block[new_abi_tcb_offset - do.tls_offset ..][0..do.tls_init_file_size], @as([*]u8, @ptrFromInt(try vAddressToLoadedAddress(do, do.tls_init_mem_offset, false))));
+            if (do.tls_init_file_size > 0) {
+                @memcpy(new_initial_block[new_abi_tcb_offset - do.tls_offset ..][0..do.tls_init_file_size], @as([*]u8, @ptrFromInt(try vAddressToLoadedAddress(do, do.tls_init_mem_offset, false))));
+            }
             Logger.debug("tls: zeroing {s} tbss: from 0x{x} to 0x{x} (size: 0x{x})", .{
                 do.name,
                 new_abi_tcb_offset - do.tls_offset + do.tls_init_file_size,
                 new_abi_tcb_offset - do.tls_offset + do.tls_init_mem_size,
                 do.tls_init_mem_size - do.tls_init_file_size,
             });
-            @memset(new_initial_block[new_abi_tcb_offset - do.tls_offset + do.tls_init_file_size ..][0 .. do.tls_init_mem_size - do.tls_init_file_size], 0);
+            if (do.tls_init_mem_size > 0) {
+                @memset(new_initial_block[new_abi_tcb_offset - do.tls_offset + do.tls_init_file_size ..][0 .. do.tls_init_mem_size - do.tls_init_file_size], 0);
+            }
         }
     }
 
-    if (dyn_object.tls_init_file_size != dyn_object.tls_init_mem_size) {
-        Logger.debug("tls: copying {s} tdata: from 0x{x} to 0x{x} (size: 0x{x})", .{
-            dyn_object.name,
-            0,
-            dyn_object.tls_init_file_size,
-            dyn_object.tls_init_file_size,
-        });
+    Logger.debug("tls: copying {s} tdata: from 0x{x} to 0x{x} (size: 0x{x})", .{
+        dyn_object.name,
+        0,
+        dyn_object.tls_init_file_size,
+        dyn_object.tls_init_file_size,
+    });
+    if (dyn_object.tls_init_file_size > 0) {
         @memcpy(new_initial_block[0..dyn_object.tls_init_file_size], @as([*]u8, @ptrFromInt(try vAddressToLoadedAddress(dyn_object, dyn_object.tls_init_mem_offset, false))));
-        Logger.debug("tls: zeroing {s} tbss: from 0x{x} to 0x{x} (size: 0x{x})", .{
-            dyn_object.name,
-            dyn_object.tls_init_file_size,
-            dyn_object.tls_init_mem_size,
-            dyn_object.tls_init_mem_size - dyn_object.tls_init_file_size,
-        });
+    }
+    Logger.debug("tls: zeroing {s} tbss: from 0x{x} to 0x{x} (size: 0x{x})", .{
+        dyn_object.name,
+        dyn_object.tls_init_file_size,
+        dyn_object.tls_init_mem_size,
+        dyn_object.tls_init_mem_size - dyn_object.tls_init_file_size,
+    });
+    if (dyn_object.tls_init_mem_size > 0) {
         @memset(new_initial_block[dyn_object.tls_init_file_size..dyn_object.tls_init_mem_size], 0);
     }
 
@@ -2293,14 +2300,11 @@ fn mapTlsBlock(dyn_object: *DynObject) !void {
     //
     // it should be:
     //
-    //                       | POTENTIAL PTHREAD STRUCT ====>
-    //---------------------------------------------------------
-    //| TLS Blocks | Zig TCB | ABI TCB | *DTV | *SELF | SPACE
-    //-----------------------^---------------------------------
-    //                       `-- The TP register points here.
-    //
-    // In this case, when main zig executable is relocating, it should take into account
-    // the offset created by the Zig TCB struct.
+    //             | POTENTIAL PTHREAD STRUCT ====>
+    //----------------------------------------------
+    //| TLS Blocks | ABI TCB | *DTV | *SELF | SPACE
+    //-------------^--------------------------------
+    //              `-- The TP register points here.
     //
     var new_tls_area_desc: @TypeOf(current_tls_area_desc) = .{
         .size = new_area_size,
@@ -2436,7 +2440,7 @@ fn mapTlsBlock(dyn_object: *DynObject) !void {
         dyn_object.tls_offset = new_abi_tcb_offset;
         Logger.debug("tls: tls offset: 0x{x}", .{new_abi_tcb_offset});
 
-        dyn_object.tls_mapped_at = @as(usize, @intFromPtr(new_area.?.ptr)) - dyn_object.tls_offset;
+        dyn_object.tls_mapped_at = @as(usize, @intFromPtr(new_area.?.ptr));
     } else {
         Logger.debug("tls: {s}: no change to TLS area", .{dyn_object.name});
     }
@@ -2554,8 +2558,7 @@ fn processRelocations(dyn_object: *DynObject) !void {
             },
             .TLSDESC => {
                 reloc_count += 1;
-                // TLSDESC
-                // TODO something don't work here, we need to better understand
+                // R_X86_64_TLSDESC: S + A (TLS offset)
                 const sym = try resolveSymbol(dyn_object, reloc.sym_idx);
                 const tls_offset = dyn_objects.values()[sym.dyn_object_idx].tls_offset;
                 const value: TlsDesc = .{
@@ -2628,7 +2631,6 @@ fn processIRelativeRelocations(dyn_object: *DynObject) !void {
     Logger.debug("processed {d} IRELATIVE relocations for {s}", .{ reloc_count, dyn_object.name });
 }
 
-// TODO Should receive a string that must be contained in dso name (like `libc.so`)
 fn resolveSymbolByName(sym_name: []const u8) !ResolvedSymbol {
     var it = dyn_objects.iterator();
     while (it.next()) |entry| {
@@ -3573,7 +3575,7 @@ fn dladdr1Substitute(addr: *anyopaque, dl_info: *DlInfo, extra_infos: *anyopaque
                 continue;
             }
 
-            // TODO we should cache and reuse produce link maps (store them in a hasmap, keyed by dyn object name)
+            // TODO we should cache and reuse produced link maps (store them in a hasmap, keyed by dyn object name)
             const link_map = allocator.create(DlLinkMap) catch @panic("OOM");
             extra_link_maps.append(allocator, link_map) catch @panic("OOM");
 
@@ -3659,7 +3661,7 @@ fn dlFindDsoForObjectSubstitute(addr: *anyopaque) callconv(.c) ?*DlLinkMap {
 
     Logger.warn("_dl_find_dso_for_object: partial implementation: link maps should be reused as they can be compared by address", .{});
 
-    // TODO we should cache and reuse produce link maps (store them in a hasmap, keyed by dyn object name)
+    // TODO we should cache and reuse produced link maps (store them in a hasmap, keyed by dyn object name)
     const link_map = allocator.create(DlLinkMap) catch @panic("OOM");
     extra_link_maps.append(allocator, link_map) catch @panic("OOM");
 
