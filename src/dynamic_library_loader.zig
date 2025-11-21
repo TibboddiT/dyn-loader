@@ -757,11 +757,34 @@ var initialized: bool = false;
 var allocator: std.mem.Allocator = undefined;
 
 const LibcSpecifics = struct {
+    const WriteOps = struct {
+        const ValueKind = enum {
+            auxv,
+            tls_size,
+            tls_align,
+            tls_count,
+            page_size,
+            tp,
+            tid,
+            addr,
+        };
+
+        addr: usize,
+        relative_to: enum { zero, tp },
+        value: union(ValueKind) {
+            auxv: void,
+            tls_size: void,
+            tls_align: void,
+            tls_count: void,
+            page_size: void,
+            tp: void,
+            tid: void,
+            addr: usize,
+        },
+    };
+
     kind: enum { custom, glibc, musl },
-    tid_tp_mem_offsets: []usize,
-    auxv_addr: usize,
-    tls_static_size_addr: usize,
-    tls_static_align_addr: usize,
+    write_ops: std.ArrayList(WriteOps),
 };
 
 // TODO global state
@@ -862,7 +885,7 @@ pub fn deinit() void {
     thread_infos.clearAndFree(allocator);
 
     if (libc_specifics != null) {
-        allocator.free(libc_specifics.?.tid_tp_mem_offsets);
+        libc_specifics.?.write_ops.deinit(allocator);
     }
 
     CustomSelfInfo.clearExtraElfs(allocator);
@@ -2182,16 +2205,48 @@ fn detectLibC(dyn_object: *DynObject) !void {
                     Logger.debug("libc detection: __libc: real addr: 0x{x}", .{libc.address});
                 }
 
-                var tp_offsets = try allocator.alloc(usize, 1);
-                tp_offsets[0] = 48;
-
                 libc_specifics = .{
                     .kind = .musl,
-                    .auxv_addr = libc_addr + 8,
-                    .tls_static_size_addr = libc_addr + 24,
-                    .tls_static_align_addr = libc_addr + 32,
-                    .tid_tp_mem_offsets = tp_offsets,
+                    .write_ops = .empty,
                 };
+
+                try libc_specifics.?.write_ops.appendSlice(allocator, &.{
+                    .{
+                        .addr = libc_addr + 8,
+                        .relative_to = .zero,
+                        .value = .auxv,
+                    },
+                    .{
+                        .addr = libc_addr + 24,
+                        .relative_to = .zero,
+                        .value = .tls_size,
+                    },
+                    .{
+                        .addr = libc_addr + 32,
+                        .relative_to = .zero,
+                        .value = .tls_align,
+                    },
+                    .{
+                        .addr = libc_addr + 48,
+                        .relative_to = .zero,
+                        .value = .page_size,
+                    },
+                    .{
+                        .addr = 0,
+                        .relative_to = .tp,
+                        .value = .tp,
+                    },
+                    .{
+                        .addr = 48,
+                        .relative_to = .tp,
+                        .value = .tid,
+                    },
+                    .{
+                        .addr = 200,
+                        .relative_to = .tp,
+                        .value = .tp,
+                    },
+                });
 
                 return;
             }
@@ -2204,16 +2259,43 @@ fn detectLibC(dyn_object: *DynObject) !void {
 
         const rtld_addr = rtld_global_ro_sym.address;
 
-        var tp_offsets = try allocator.alloc(usize, 1);
-        tp_offsets[0] = 720;
-
         libc_specifics = .{
             .kind = .glibc,
-            .auxv_addr = rtld_addr + 104,
-            .tls_static_size_addr = rtld_addr + 704,
-            .tls_static_align_addr = rtld_addr + 712,
-            .tid_tp_mem_offsets = tp_offsets,
+            .write_ops = .empty,
         };
+
+        try libc_specifics.?.write_ops.appendSlice(allocator, &.{
+            .{
+                .addr = rtld_addr + 104,
+                .relative_to = .zero,
+                .value = .auxv,
+            },
+            .{
+                .addr = rtld_addr + 704,
+                .relative_to = .zero,
+                .value = .tls_size,
+            },
+            .{
+                .addr = rtld_addr + 712,
+                .relative_to = .zero,
+                .value = .tls_align,
+            },
+            .{
+                .addr = 0,
+                .relative_to = .tp,
+                .value = .tp,
+            },
+            .{
+                .addr = 16,
+                .relative_to = .tp,
+                .value = .tp,
+            },
+            .{
+                .addr = 720,
+                .relative_to = .tp,
+                .value = .tid,
+            },
+        });
 
         return;
     }
@@ -2471,36 +2553,68 @@ fn mapTlsBlock(dyn_object: *DynObject) !void {
         const pthread_self: *usize = @ptrFromInt(new_tp + 16);
         pthread_self.* = new_tp;
 
+        // for pthread->self
+        const pthread_self_2: *usize = @ptrFromInt(new_tp + 200);
+        pthread_self_2.* = new_tp;
+
         Logger.debug("tls: tls space mapped, new TP: 0x{x}", .{new_tp});
 
         const e_set_fs = std.os.linux.syscall2(.arch_prctl, std.os.linux.ARCH.SET_FS, new_tp);
         std.debug.assert(e_set_fs == 0);
 
         if (libc_specifics != null) {
-            Logger.debug("tls: setting tls details for libc", .{});
+            Logger.debug("libc: setting details for libc: {t}", .{libc_specifics.?.kind});
 
-            const seg_infos = try findDynObjectSegmentForLoadedAddr(libc_specifics.?.auxv_addr);
+            for (libc_specifics.?.write_ops.items) |op| {
+                const addr = op.addr + if (op.relative_to == .tp) new_tp else 0;
+                const val: usize = switch (op.value) {
+                    .auxv => @intFromPtr(std.os.linux.elf_aux_maybe.?),
+                    .page_size => std.heap.pageSize(),
+                    .tid => std.Thread.getCurrentId(),
+                    .tls_size => new_tls_area_desc.block.size + current_surplus_size,
+                    .tls_align => new_tls_area_desc.alignment,
+                    .tls_count => 1, // TODO,
+                    .tp => new_tp,
+                    .addr => |a| a,
+                };
 
-            const dl_auxv: *volatile *anyopaque = @ptrFromInt(libc_specifics.?.auxv_addr);
-            const dl_tls_static_size: *volatile c_ulonglong = @ptrFromInt(libc_specifics.?.tls_static_size_addr);
-            const dl_tls_static_align: *volatile c_ulonglong = @ptrFromInt(libc_specifics.?.tls_static_align_addr);
+                Logger.debug("libc: writing {t} [0x{x}] at 0x{x}", .{ op.value, val, addr });
 
-            try unprotectSegment(seg_infos.dyn_object, seg_infos.segment_index);
+                const seg_infos = findDynObjectSegmentForLoadedAddr(addr) catch null;
+                if (seg_infos != null) {
+                    try unprotectSegment(seg_infos.?.dyn_object, seg_infos.?.segment_index);
+                }
 
-            if (std.os.linux.elf_aux_maybe) |auxv| {
-                dl_auxv.* = auxv;
+                const ptr: *volatile usize = @ptrFromInt(addr);
+                ptr.* = val;
+
+                if (seg_infos != null) {
+                    try reprotectSegment(seg_infos.?.dyn_object, seg_infos.?.segment_index);
+                }
             }
 
-            dl_tls_static_size.* = new_tls_area_desc.block.size + current_surplus_size;
-            dl_tls_static_align.* = new_tls_area_desc.alignment;
+            // const seg_infos = try findDynObjectSegmentForLoadedAddr(libc_specifics.?.auxv_addr);
 
-            try reprotectSegment(seg_infos.dyn_object, seg_infos.segment_index);
+            // const dl_auxv: *volatile *anyopaque = @ptrFromInt(libc_specifics.?.auxv_addr);
+            // const dl_tls_static_size: *volatile c_ulonglong = @ptrFromInt(libc_specifics.?.tls_static_size_addr);
+            // const dl_tls_static_align: *volatile c_ulonglong = @ptrFromInt(libc_specifics.?.tls_static_align_addr);
 
-            // TODO maybe multiple occurrences must be set
-            const tid = std.Thread.getCurrentId();
-            Logger.debug("tls: setting thread id {d} for pthread at 0x{x}", .{ tid, new_tp + libc_specifics.?.tid_tp_mem_offsets[0] });
-            const tid_ptr: *volatile i32 = @ptrFromInt(new_tp + libc_specifics.?.tid_tp_mem_offsets[0]);
-            tid_ptr.* = @intCast(tid);
+            // try unprotectSegment(seg_infos.dyn_object, seg_infos.segment_index);
+
+            // if (std.os.linux.elf_aux_maybe) |auxv| {
+            //     dl_auxv.* = auxv;
+            // }
+
+            // dl_tls_static_size.* = new_tls_area_desc.block.size + current_surplus_size;
+            // dl_tls_static_align.* = new_tls_area_desc.alignment;
+
+            // try reprotectSegment(seg_infos.dyn_object, seg_infos.segment_index);
+
+            // // TODO maybe multiple occurrences must be set
+            // const tid = std.Thread.getCurrentId();
+            // Logger.debug("tls: setting thread id {d} for pthread at 0x{x}", .{ tid, new_tp + libc_specifics.?.tid_tp_mem_offsets[0] });
+            // const tid_ptr: *volatile i32 = @ptrFromInt(new_tp + libc_specifics.?.tid_tp_mem_offsets[0]);
+            // tid_ptr.* = @intCast(tid);
         }
 
         dyn_object.tls_offset = new_abi_tcb_offset;
