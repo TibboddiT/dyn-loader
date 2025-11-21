@@ -585,6 +585,7 @@ const ResolvedSymbol = struct {
     name: []const u8,
     version: []const u8,
     dyn_object_idx: usize,
+    sym_idx: usize,
 };
 
 const Reloc = struct {
@@ -755,6 +756,17 @@ export fn _dl_debug_state() callconv(.c) void {
 var initialized: bool = false;
 var allocator: std.mem.Allocator = undefined;
 
+const LibcSpecifics = struct {
+    kind: enum { custom, glibc, musl },
+    tid_tp_mem_offsets: []usize,
+    auxv_addr: usize,
+    tls_static_size_addr: usize,
+    tls_static_align_addr: usize,
+};
+
+// TODO global state
+var libc_specifics: ?LibcSpecifics = null;
+
 const InitOptions = struct {
     allocator: std.mem.Allocator,
     log_level: Logger.Level = .warn,
@@ -848,6 +860,10 @@ pub fn deinit() void {
     }
 
     thread_infos.clearAndFree(allocator);
+
+    if (libc_specifics != null) {
+        allocator.free(libc_specifics.?.tid_tp_mem_offsets);
+    }
 
     CustomSelfInfo.clearExtraElfs(allocator);
 
@@ -947,6 +963,8 @@ pub fn load(f_path: []const u8) !DynamicLibrary {
         if (dyn_obj.loaded) {
             continue;
         }
+
+        try detectLibC(dyn_obj);
 
         computeTcbOffset(dyn_obj);
         try processRelocations(dyn_obj);
@@ -2103,6 +2121,106 @@ fn computeTcbOffset(dyn_object: *DynObject) void {
 var current_surplus_size: usize = 0x8000;
 var normal_current_tls_area_desc: ?@TypeOf(std.os.linux.tls.area_desc) = null;
 
+fn detectLibC(dyn_object: *DynObject) !void {
+    if (!std.mem.startsWith(u8, dyn_object.name, "libc.so")) {
+        return;
+    }
+
+    std.debug.assert(libc_specifics == null);
+
+    Logger.debug("libc detection: {s} is detected as libc", .{dyn_object.path});
+
+    const maybe_issetugid_sym = getResolvedSymbolByName(dyn_object, "issetugid") catch |err| switch (err) {
+        error.UnresolvedSymbol => null,
+        else => |e| return e,
+    };
+
+    const maybe_rtld_global_ro_sym = getResolvedSymbolByName(dyn_object, "_rtld_global_ro") catch |err| switch (err) {
+        error.UnresolvedSymbol => null,
+        else => |e| return e,
+    };
+
+    std.debug.assert(maybe_issetugid_sym == null or maybe_rtld_global_ro_sym == null);
+
+    if (maybe_issetugid_sym) |issetugid_sym| {
+        // musl
+        Logger.debug("libc detection: {s} is detected as musl, searching __libc symbol", .{dyn_object.path});
+
+        std.debug.assert(dyn_objects.values()[issetugid_sym.dyn_object_idx].mapped_at == dyn_object.mapped_at);
+
+        const sym = dyn_object.syms_array.items[issetugid_sym.sym_idx];
+
+        const sym_addr = issetugid_sym.address;
+        const sym_size = sym.size;
+
+        const sym_content: []const u8 = @as([*]const u8, @ptrFromInt(sym_addr))[0..sym_size];
+        Logger.debug("libc detection: issetugid content: {x}", .{sym_content});
+
+        for (sym_content[2..], 2..) |b, i| {
+            if (b == 0x05 and i + 4 < sym_content.len) {
+                var offset: usize = 0;
+                // TODO assume LE
+                offset = sym_content[i + 4];
+                offset = (offset << 8) + sym_content[i + 3];
+                offset = (offset << 8) + sym_content[i + 2];
+                offset = (offset << 8) + sym_content[i + 1];
+
+                Logger.debug("libc detection: __libc: before 0x05: 0x{x}", .{sym_content[i - 1]});
+                const f_off: usize = switch (sym_content[i - 1]) {
+                    0x8d => 0,
+                    0xbe => 2,
+                    else => continue,
+                };
+
+                const r_offset = i + 4 + 1 + offset - f_off;
+                const libc_addr = sym_addr + r_offset;
+
+                Logger.debug("libc detection: __libc: offset: 0x{x}, addr: 0x{x} (0x{x})", .{ offset, libc_addr, sym.value + r_offset });
+
+                const maybe_libc = resolveSymbolByName("__libc") catch null;
+                if (maybe_libc) |libc| {
+                    Logger.debug("libc detection: __libc: real addr: 0x{x}", .{libc.address});
+                }
+
+                var tp_offsets = try allocator.alloc(usize, 1);
+                tp_offsets[0] = 48;
+
+                libc_specifics = .{
+                    .kind = .musl,
+                    .auxv_addr = libc_addr + 8,
+                    .tls_static_size_addr = libc_addr + 24,
+                    .tls_static_align_addr = libc_addr + 32,
+                    .tid_tp_mem_offsets = tp_offsets,
+                };
+
+                return;
+            }
+        }
+    }
+
+    if (maybe_rtld_global_ro_sym) |rtld_global_ro_sym| {
+        // musl
+        Logger.debug("libc detection: {s} is detected as glibc, using _rtld_global_ro symbol", .{dyn_object.path});
+
+        const rtld_addr = rtld_global_ro_sym.address;
+
+        var tp_offsets = try allocator.alloc(usize, 1);
+        tp_offsets[0] = 720;
+
+        libc_specifics = .{
+            .kind = .glibc,
+            .auxv_addr = rtld_addr + 104,
+            .tls_static_size_addr = rtld_addr + 704,
+            .tls_static_align_addr = rtld_addr + 712,
+            .tid_tp_mem_offsets = tp_offsets,
+        };
+
+        return;
+    }
+
+    return error.UnableToDetectLibc;
+}
+
 fn mapTlsBlock(dyn_object: *DynObject) !void {
     Logger.debug("mapping tls block of library {s}", .{dyn_object.name});
 
@@ -2344,97 +2462,45 @@ fn mapTlsBlock(dyn_object: *DynObject) !void {
     std.os.linux.tls.area_desc = new_tls_area_desc;
 
     if (new_area != null) {
-        if (!area_was_extended) {
-            const new_tp = @intFromPtr(new_area.?.ptr) + new_abi_tcb_offset;
+        const new_tp = @intFromPtr(new_area.?.ptr) + new_abi_tcb_offset;
 
-            // TODO unmap previous area
+        const new_tcb: *usize = @ptrFromInt(new_tp);
+        new_tcb.* = new_tp;
 
-            const new_tcb: *usize = @ptrFromInt(new_tp);
-            new_tcb.* = new_tp;
+        // for pthread->self
+        const pthread_self: *usize = @ptrFromInt(new_tp + 16);
+        pthread_self.* = new_tp;
 
-            // for pthread->self
-            const pthread_self: *usize = @ptrFromInt(new_tp + 16);
-            pthread_self.* = new_tp;
+        Logger.debug("tls: tls space mapped, new TP: 0x{x}", .{new_tp});
 
-            Logger.debug("tls: tls space mapped, new TP: 0x{x}", .{new_tp});
+        const e_set_fs = std.os.linux.syscall2(.arch_prctl, std.os.linux.ARCH.SET_FS, new_tp);
+        std.debug.assert(e_set_fs == 0);
 
-            const e_set_fs = std.os.linux.syscall2(.arch_prctl, std.os.linux.ARCH.SET_FS, new_tp);
-            std.debug.assert(e_set_fs == 0);
+        if (libc_specifics != null) {
+            Logger.debug("tls: setting tls details for libc", .{});
 
-            {
-                // glibc
-                const maybe_rtld_global_ro = resolveSymbolByName("_rtld_global_ro") catch null;
+            const seg_infos = try findDynObjectSegmentForLoadedAddr(libc_specifics.?.auxv_addr);
 
-                if (maybe_rtld_global_ro) |rtld_global_ro| {
-                    Logger.debug("tls: rtld_global_ro: 0x{x}", .{rtld_global_ro.address});
+            const dl_auxv: *volatile *anyopaque = @ptrFromInt(libc_specifics.?.auxv_addr);
+            const dl_tls_static_size: *volatile c_ulonglong = @ptrFromInt(libc_specifics.?.tls_static_size_addr);
+            const dl_tls_static_align: *volatile c_ulonglong = @ptrFromInt(libc_specifics.?.tls_static_align_addr);
 
-                    const seg_infos = try findDynObjectSegmentForLoadedAddr(rtld_global_ro.address);
+            try unprotectSegment(seg_infos.dyn_object, seg_infos.segment_index);
 
-                    // TODO we should find a way to get those field offsets at runtime
-                    const dl_auxv: *volatile *anyopaque = @ptrFromInt(rtld_global_ro.address + 104);
-                    const dl_tls_static_size: *volatile c_ulonglong = @ptrFromInt(rtld_global_ro.address + 704);
-                    const dl_tls_static_align: *volatile c_ulonglong = @ptrFromInt(rtld_global_ro.address + 712);
-
-                    try unprotectSegment(seg_infos.dyn_object, seg_infos.segment_index);
-
-                    if (std.os.linux.elf_aux_maybe) |auxv| {
-                        dl_auxv.* = auxv;
-                    }
-
-                    dl_tls_static_size.* = new_tls_area_desc.block.size + current_surplus_size;
-                    dl_tls_static_align.* = new_tls_area_desc.alignment;
-
-                    try reprotectSegment(seg_infos.dyn_object, seg_infos.segment_index);
-
-                    // TODO we should find a way to get this offset at runtime
-                    const tid = std.Thread.getCurrentId();
-                    Logger.debug("tls: setting thread id {d} for pthread at 0x{x}", .{ tid, new_tp + 720 });
-                    const tid_ptr: *volatile i32 = @ptrFromInt(new_tp + 720);
-                    tid_ptr.* = @intCast(tid);
-                } else {
-                    Logger.info("tls: no rtld_global_ro symbol found", .{});
-                }
+            if (std.os.linux.elf_aux_maybe) |auxv| {
+                dl_auxv.* = auxv;
             }
 
-            {
-                // musl
-                // TODO this symbol is not exported by default,
-                // we should find it in another way:
-                // - resolve `getauxval` and `issetugid`
-                // - they both should start with `lea [offset](%rip),%rax`
-                // this offset points to the __libc static variable
-                const maybe_libc = resolveSymbolByName("__libc") catch null;
+            dl_tls_static_size.* = new_tls_area_desc.block.size + current_surplus_size;
+            dl_tls_static_align.* = new_tls_area_desc.alignment;
 
-                if (maybe_libc) |libc| {
-                    Logger.debug("tls: __libc: 0x{x}", .{libc.address});
+            try reprotectSegment(seg_infos.dyn_object, seg_infos.segment_index);
 
-                    const seg_infos = try findDynObjectSegmentForLoadedAddr(libc.address);
-
-                    // TODO we should find a way to get those field offsets at runtime
-                    const libc_auxv: *volatile *anyopaque = @ptrFromInt(libc.address + 8);
-                    const libc_tls_static_size: *volatile c_ulonglong = @ptrFromInt(libc.address + 24);
-                    const libc_tls_static_align: *volatile c_ulonglong = @ptrFromInt(libc.address + 32);
-
-                    try unprotectSegment(seg_infos.dyn_object, seg_infos.segment_index);
-
-                    if (std.os.linux.elf_aux_maybe) |auxv| {
-                        libc_auxv.* = auxv;
-                    }
-
-                    libc_tls_static_size.* = new_tls_area_desc.block.size + current_surplus_size;
-                    libc_tls_static_align.* = new_tls_area_desc.alignment;
-
-                    try reprotectSegment(seg_infos.dyn_object, seg_infos.segment_index);
-
-                    // TODO we should find a way to get this offset at runtime
-                    const tid = std.Thread.getCurrentId();
-                    Logger.debug("tls: setting thread id {d} for pthread at 0x{x}", .{ tid, new_tp + 48 });
-                    const tid_ptr: *volatile i32 = @ptrFromInt(new_tp + 48);
-                    tid_ptr.* = @intCast(tid);
-                } else {
-                    Logger.info("tls: no __libc symbol found", .{});
-                }
-            }
+            // TODO maybe multiple occurrences must be set
+            const tid = std.Thread.getCurrentId();
+            Logger.debug("tls: setting thread id {d} for pthread at 0x{x}", .{ tid, new_tp + libc_specifics.?.tid_tp_mem_offsets[0] });
+            const tid_ptr: *volatile i32 = @ptrFromInt(new_tp + libc_specifics.?.tid_tp_mem_offsets[0]);
+            tid_ptr.* = @intCast(tid);
         }
 
         dyn_object.tls_offset = new_abi_tcb_offset;
@@ -2657,6 +2723,7 @@ fn resolveSymbolByName(sym_name: []const u8) !ResolvedSymbol {
                         .name = dep_sym.name,
                         .version = dep_sym.version,
                         .dyn_object_idx = dyn_objects.getIndex(dep_object.name).?,
+                        .sym_idx = dep_sym_idx,
                     };
                 }
 
@@ -2713,6 +2780,7 @@ fn getResolvedSymbolByName(maybe_dyn_object: ?*DynObject, sym_name: []const u8) 
                             .name = dep_sym.name,
                             .version = dep_sym.version,
                             .dyn_object_idx = dyn_objects.getIndex(dep_object.name).?,
+                            .sym_idx = dep_sym_idx,
                         };
 
                         if (getSubstituteAddress(res_sym, dep_object)) |a| {
@@ -2767,6 +2835,7 @@ fn getResolvedSymbolByName(maybe_dyn_object: ?*DynObject, sym_name: []const u8) 
                             .name = dep_sym.name,
                             .version = dep_sym.version,
                             .dyn_object_idx = dyn_objects.getIndex(dep_object.name).?,
+                            .sym_idx = dep_sym_idx,
                         };
 
                         if (getSubstituteAddress(res_sym, dep_object)) |a| {
@@ -2828,6 +2897,7 @@ fn getResolvedSymbolByNameAndVersion(maybe_dyn_object: ?*DynObject, sym_name: []
                             .name = dep_sym.name,
                             .version = dep_sym.version,
                             .dyn_object_idx = dyn_objects.getIndex(dep_object.name).?,
+                            .sym_idx = dep_sym_idx,
                         };
 
                         if (getSubstituteAddress(res_sym, dep_object)) |a| {
@@ -2882,6 +2952,7 @@ fn getResolvedSymbolByNameAndVersion(maybe_dyn_object: ?*DynObject, sym_name: []
                             .name = dep_sym.name,
                             .version = dep_sym.version,
                             .dyn_object_idx = dyn_objects.getIndex(dep_object.name).?,
+                            .sym_idx = dep_sym_idx,
                         };
 
                         if (getSubstituteAddress(res_sym, dep_object)) |a| {
@@ -2946,6 +3017,7 @@ fn resolveSymbol(dyn_object: *DynObject, sym_idx: usize) !ResolvedSymbol {
             .name = sym.name,
             .version = sym.version,
             .dyn_object_idx = dyn_objects.getIndex(dyn_object.name).?,
+            .sym_idx = sym_idx,
         };
     }
 
@@ -2995,6 +3067,7 @@ fn resolveSymbol(dyn_object: *DynObject, sym_idx: usize) !ResolvedSymbol {
                         .name = dep_sym.name,
                         .version = dep_sym.version,
                         .dyn_object_idx = dep_idx,
+                        .sym_idx = dep_sym_idx,
                     };
                 }
 
@@ -3018,6 +3091,7 @@ fn resolveSymbol(dyn_object: *DynObject, sym_idx: usize) !ResolvedSymbol {
             .name = sym.name,
             .version = sym.version,
             .dyn_object_idx = std.math.maxInt(usize),
+            .sym_idx = std.math.maxInt(usize),
         };
     }
 
