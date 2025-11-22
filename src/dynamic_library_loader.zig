@@ -624,6 +624,8 @@ const DynObject = struct {
     eh_init_mem_size: usize,
     eh_align: usize,
     dyn_section_offset: usize,
+    plt_got_section_offset: usize,
+    plt_got_section_size: usize,
     syms: DynSymList,
     syms_array: std.ArrayList(DynSym),
     dependencies: std.ArrayList(usize),
@@ -662,6 +664,8 @@ const DynObject = struct {
             .eh_init_mem_size = 0,
             .eh_align = 0,
             .dyn_section_offset = 0,
+            .plt_got_section_offset = 0,
+            .plt_got_section_size = 0,
             .syms = .empty,
             .syms_array = .empty,
             .relocs = .empty,
@@ -804,6 +808,10 @@ pub fn init(options: InitOptions) !void {
     allocator = options.allocator;
     Logger.level = options.log_level;
 
+    alloc_arena = .init(allocator);
+    alloc_allocator = alloc_arena.allocator();
+    // alloc_allocator = allocator;
+
     // TODO
     // - pre restructure TLS
     // - assert linux x86_64
@@ -887,6 +895,17 @@ pub fn deinit() void {
     if (libc_specifics != null) {
         libc_specifics.?.write_ops.deinit(allocator);
     }
+
+    if (extra_allocations.count() > 0) {
+        var not_freed: usize = 0;
+        for (extra_allocations.values()) |ea| {
+            not_freed += ea.r_size;
+        }
+
+        Logger.warn("{B:.2} of memory allocated ({d} allocations) from libraries not freed", .{ not_freed, extra_allocations.count() });
+    }
+    extra_allocations.clearAndFree(allocator);
+    alloc_arena.deinit();
 
     CustomSelfInfo.clearExtraElfs(allocator);
 
@@ -1186,6 +1205,9 @@ fn loadDso(o_path: []const u8) !usize {
     var verdef_tab_addr: usize = undefined;
     var verneed_tab_addr: usize = undefined;
 
+    var plt_got_addr: usize = 0;
+    var plt_got_size: usize = 0;
+
     var dyn_symtab_addr: usize = undefined;
     var dyn_symtab_size: usize = undefined;
 
@@ -1269,6 +1291,13 @@ fn loadDso(o_path: []const u8) !usize {
                 verneed_tab_addr = file_addr + sh.offset;
             } else {
                 Logger.debug("    == TODO: GNU_VERDEF: {s}", .{std.mem.sliceTo(name, 0)});
+            }
+        } else if (sh.type == std.elf.SHT.PROGBITS) {
+            if (std.mem.eql(u8, std.mem.sliceTo(name, 0), ".plt.got")) {
+                plt_got_addr = sh.offset;
+                plt_got_size = sh.size;
+            } else {
+                // Logger.debug("    == TODO: PROGBITS: {s}", .{std.mem.sliceTo(name, 0)});
             }
         } else {
             switch (sh.type) {
@@ -1613,7 +1642,7 @@ fn loadDso(o_path: []const u8) !usize {
             var plt_reloc_tbl_size: usize = 0;
             var plt_reloc_tbl_addr: usize = 0;
 
-            var plt_got_addr: usize = 0;
+            var dt_plt_got_addr: usize = 0;
 
             var j: usize = 0;
             while (dyns[j].d_tag != 0) : (j += 1) {
@@ -1653,8 +1682,8 @@ fn loadDso(o_path: []const u8) !usize {
                     plt_reloc_tbl_addr = file_addr + dyns[j].d_val;
                     Logger.debug("        => plt reloc table addr: 0x{x}", .{plt_reloc_tbl_addr});
                 } else if (dyns[j].d_tag == std.elf.DT_PLTGOT) {
-                    plt_got_addr = file_addr + dyns[j].d_val;
-                    Logger.debug("        => plt got addr: 0x{x}", .{plt_got_addr});
+                    dt_plt_got_addr = file_addr + dyns[j].d_val;
+                    Logger.debug("        => plt got addr: 0x{x}", .{dt_plt_got_addr});
                 } else if (dyns[j].d_tag == std.elf.DT_INIT) {
                     init_addr = dyns[j].d_val;
                     Logger.debug("        => init addr: 0x{x}", .{init_addr});
@@ -1860,6 +1889,8 @@ fn loadDso(o_path: []const u8) !usize {
         .eh_init_mem_size = eh_init_mem_size,
         .eh_align = eh_align,
         .dyn_section_offset = dyn_addr,
+        .plt_got_section_offset = plt_got_addr,
+        .plt_got_section_size = plt_got_size,
         .syms = syms,
         .syms_array = syms_array,
         .relocs = relocs,
@@ -2241,11 +2272,6 @@ fn detectLibC(dyn_object: *DynObject) !void {
                         .relative_to = .tp,
                         .value = .tid,
                     },
-                    .{
-                        .addr = 200,
-                        .relative_to = .tp,
-                        .value = .tp,
-                    },
                 });
 
                 return;
@@ -2549,13 +2575,13 @@ fn mapTlsBlock(dyn_object: *DynObject) !void {
         const new_tcb: *usize = @ptrFromInt(new_tp);
         new_tcb.* = new_tp;
 
-        // for pthread->self
-        const pthread_self: *usize = @ptrFromInt(new_tp + 16);
-        pthread_self.* = new_tp;
+        // // for pthread->self
+        // const pthread_self: *usize = @ptrFromInt(new_tp + 16);
+        // pthread_self.* = new_tp;
 
-        // for pthread->self
-        const pthread_self_2: *usize = @ptrFromInt(new_tp + 200);
-        pthread_self_2.* = new_tp;
+        // // for pthread->self
+        // const pthread_self_2: *usize = @ptrFromInt(new_tp + 200);
+        // pthread_self_2.* = new_tp;
 
         Logger.debug("tls: tls space mapped, new TP: 0x{x}", .{new_tp});
 
@@ -2662,7 +2688,10 @@ fn processRelocations(dyn_object: *DynObject) !void {
                 reloc_count += 1;
                 // R_X86_64_64: S + A
                 const sym = try resolveSymbol(dyn_object, reloc.sym_idx);
-                const value = sym.address + @as(usize, @intCast(reloc.addend));
+                const value = r64_blk: {
+                    if (reloc.addend != 0) break :r64_blk sym.address + @as(usize, @intCast(reloc.addend));
+                    break :r64_blk if (getSubstituteAddress(sym, dyn_object)) |a| a else sym.address;
+                };
                 Logger.debug("  64: 0x{x} (0x{x}): 0x{x} -> 0x{x} (0x{x}, {s}@{s} + 0x{x})", .{ reloc_addr, reloc.offset, ptr.*, value, sym.value, sym.name, sym.version, reloc.addend });
                 ptr.* = value;
             },
@@ -2670,7 +2699,7 @@ fn processRelocations(dyn_object: *DynObject) !void {
                 reloc_count += 1;
                 // R_X86_64_GLOB_DAT: S
                 const sym = try resolveSymbol(dyn_object, reloc.sym_idx);
-                const value = sym.address;
+                const value = if (getSubstituteAddress(sym, dyn_object)) |a| a else sym.address;
                 Logger.debug("  GLOB_DAT: 0x{x} (0x{x}): 0x{x} -> 0x{x} (0x{x}, {s}@{s} + 0x{x})", .{ reloc_addr, reloc.offset, ptr.*, value, sym.value, sym.name, sym.version, reloc.addend });
                 ptr.* = value;
             },
@@ -2769,6 +2798,81 @@ fn processRelocations(dyn_object: *DynObject) !void {
                 return error.UnhandledReloctationType;
             },
         }
+    }
+
+    // patch .plt.got
+    if (dyn_object.plt_got_section_size > 0) {
+        const PltGotEntry = packed struct {
+            inst: u16,
+            offset: u32,
+            rem: u16,
+        };
+
+        std.debug.assert(dyn_object.plt_got_section_size % @sizeOf(PltGotEntry) == 0);
+
+        const nb_entries = dyn_object.plt_got_section_size / @sizeOf(PltGotEntry);
+
+        const entries: []PltGotEntry = @as([*]PltGotEntry, @ptrFromInt(try vAddressToLoadedAddress(dyn_object, dyn_object.plt_got_section_offset, false)))[0..nb_entries];
+
+        for (entries, 0..) |*entry, i| {
+            const entry_address = dyn_object.plt_got_section_offset + i * @sizeOf(PltGotEntry);
+            const target_address = entry_address + @offsetOf(PltGotEntry, "offset") + entry.offset + 4;
+            Logger.debug(".PLT.GOT entry {d}: faddr: 0x{x}, offset: 0x{x}, target: 0x{x}", .{ i, entry_address, entry.offset, target_address });
+
+            // TODO extremely inefficient
+            for (dyn_object.relocs.items) |r| {
+                if (r.offset == target_address) {
+                    const sym = dyn_object.syms_array.items[r.sym_idx];
+                    const r_sym = try resolveSymbol(dyn_object, r.sym_idx);
+
+                    const substitute_addr = getSubstituteAddress(r_sym, dyn_object);
+                    if (substitute_addr == null) {
+                        break;
+                    }
+
+                    Logger.debug(" => .PLT.GOT: sym: {s}, substitute addr: 0x{x}", .{ sym.name, substitute_addr.? });
+
+                    // replace `jmp *{offset}(%rip)`
+
+                    const write_addr = @intFromPtr(entry);
+                    // const jump_offset: i32 = @intCast(substitute_addr.? - write_addr + 1 + 4);
+
+                    const seg_infos = findDynObjectSegmentForLoadedAddr(write_addr) catch null;
+
+                    if (seg_infos != null) {
+                        try unprotectSegment(seg_infos.?.dyn_object, seg_infos.?.segment_index);
+                    }
+
+                    const entry_bytes = @as([*]volatile u8, @ptrFromInt(write_addr));
+                    entry_bytes[0] = 0xb8; // mov eax
+                    entry_bytes[1] = @intCast(substitute_addr.? & 0xff); // imm
+                    entry_bytes[2] = @intCast((substitute_addr.? >> 8) & 0xff);
+                    entry_bytes[3] = @intCast((substitute_addr.? >> 16) & 0xff);
+                    entry_bytes[4] = @intCast((substitute_addr.? >> 24) & 0xff);
+                    entry_bytes[5] = 0xff; // jmp rax
+                    entry_bytes[6] = 0xe0;
+
+                    if (seg_infos != null) {
+                        try reprotectSegment(seg_infos.?.dyn_object, seg_infos.?.segment_index);
+                    }
+
+                    break;
+                }
+            }
+
+            // const loaded_target_addr = try vAddressToLoadedAddress(dyn_object, target_address, false);
+
+            // const infos = try findDynObjectSegmentForLoadedAddr(loaded_target_addr);
+            // if (infos.sym_index) |sidx| {
+            //     const sym = infos.dyn_object.syms_array.items[sidx];
+            //     Logger.debug("  => sym: {s}", .{sym.name});
+
+            //     // const sym_addr = vAddressToLoadedAddress(infos.dyn_object, sym.value, false) catch unreachable;
+            // }
+        }
+
+        // Logger.err("{s}: .plt.got section [at: 0x{x}, size: 0x{x}] should be checked for substitutions", .{ dyn_object.name, dyn_object.plt_got_section_offset, dyn_object.plt_got_section_size });
+        // return error.UncheckedPltGot;
     }
 
     Logger.debug("processed {d} relocations for {s}", .{ reloc_count, dyn_object.name });
@@ -3467,6 +3571,39 @@ fn getSubstituteAddress(sym: ResolvedSymbol, for_obj: *DynObject) ?usize {
 
     const dyn_object = &dyn_objects.values()[sym.dyn_object_idx];
 
+    // alloc functions
+    // TODO errno handling
+    if (std.mem.eql(u8, sym.name, "malloc")) {
+        addr = @intFromPtr(&mallocSubstitute);
+    } else if (std.mem.eql(u8, sym.name, "free")) {
+        addr = @intFromPtr(&freeSubstitute);
+    } else if (std.mem.eql(u8, sym.name, "calloc")) {
+        addr = @intFromPtr(&callocSubstitute);
+    } else if (std.mem.eql(u8, sym.name, "realloc")) {
+        addr = @intFromPtr(&reallocSubstitute);
+    } else if (std.mem.eql(u8, sym.name, "reallocarray")) {
+        addr = @intFromPtr(&reallocarraySubstitute);
+    } else if (std.mem.eql(u8, sym.name, "aligned_alloc")) {
+        addr = @intFromPtr(&alignedAllocSubstitute);
+    } else if (std.mem.eql(u8, sym.name, "posix_memalign")) {
+        addr = @intFromPtr(&posixMemalignSubstitute);
+    } else if (std.mem.eql(u8, sym.name, "memalign")) {
+        if (!std.mem.startsWith(u8, for_obj.name, "libc.so")) {
+            Logger.warn("substitutes: {s}: dangerous unsubstituted posix alloc function [{s}] {s} at 0x{x}", .{ for_obj.name, dyn_object.name, sym.name, sym.address });
+        }
+        addr = @intFromPtr(&unsubstitutedTrap);
+    } else if (std.mem.eql(u8, sym.name, "valloc")) {
+        if (!std.mem.startsWith(u8, for_obj.name, "libc.so")) {
+            Logger.warn("substitutes: {s}: dangerous unsubstituted posix alloc function [{s}] {s} at 0x{x}", .{ for_obj.name, dyn_object.name, sym.name, sym.address });
+        }
+        addr = @intFromPtr(&unsubstitutedTrap);
+    } else if (std.mem.eql(u8, sym.name, "palloc")) {
+        if (!std.mem.startsWith(u8, for_obj.name, "libc.so")) {
+            Logger.warn("substitutes: {s}: dangerous unsubstituted posix alloc function [{s}] {s} at 0x{x}", .{ for_obj.name, dyn_object.name, sym.name, sym.address });
+        }
+        addr = @intFromPtr(&unsubstitutedTrap);
+    }
+
     // dl functions
     if (std.mem.eql(u8, sym.name, "dlopen")) {
         addr = @intFromPtr(&dlopenSubstitute);
@@ -3542,6 +3679,14 @@ fn unsubstitutedTrap() void {
     @panic("unsupported call to a dangerous function");
 }
 
+const ExtraAlloc = struct {
+    addr: usize,
+    size: usize,
+    r_size: usize,
+};
+
+const alloc_zero_val: usize = 0xffffffffffffffff;
+
 // TODO global state
 var extra_strs: std.ArrayList([]const u8) = .empty;
 var extra_strs_z: std.ArrayList([:0]const u8) = .empty;
@@ -3549,6 +3694,247 @@ var extra_phdrs: std.ArrayList(*std.posix.dl_phdr_info) = .empty;
 var extra_link_maps: std.ArrayList(*DlLinkMap) = .empty;
 var extra_threads: std.ArrayList(*std.Thread) = .empty;
 var last_dl_error: ?[:0]const u8 = null;
+var extra_allocations: std.AutoArrayHashMapUnmanaged(usize, ExtraAlloc) = .empty;
+var alloc_mutex: std.Thread.Mutex = .{};
+var alloc_arena: std.heap.ArenaAllocator = undefined;
+var alloc_allocator: std.mem.Allocator = undefined;
+
+fn mallocSubstitute(size: usize) callconv(.c) ?*anyopaque {
+    alloc_mutex.lock();
+
+    Logger.debug("intercepted call: malloc({d})", .{size});
+
+    const result = alloc_allocator.alloc(u8, 16 + size) catch @panic("OOM");
+
+    const aligned_result = @as([*]u8, @ptrFromInt(std.mem.alignForward(usize, @intFromPtr(result.ptr), 16)));
+
+    extra_allocations.put(allocator, @intFromPtr(aligned_result), .{
+        .addr = @intFromPtr(result.ptr),
+        .size = 16 + size,
+        .r_size = size,
+    }) catch @panic("OOM");
+
+    Logger.info("intercepted call: success: malloc({d}) = 0x{x}", .{ size, @intFromPtr(aligned_result) });
+
+    alloc_mutex.unlock();
+
+    return aligned_result;
+}
+
+fn alignedAllocSubstitute(alignment: usize, size: usize) callconv(.c) ?*anyopaque {
+    alloc_mutex.lock();
+
+    Logger.debug("intercepted call: aligned_alloc({d}, {d})", .{ alignment, size });
+
+    const result = alloc_allocator.alloc(u8, alignment + size) catch @panic("OOM");
+
+    const aligned_result = @as([*]u8, @ptrFromInt(std.mem.alignForward(usize, @intFromPtr(result.ptr), alignment)));
+
+    extra_allocations.put(allocator, @intFromPtr(aligned_result), .{
+        .addr = @intFromPtr(result.ptr),
+        .size = alignment + size,
+        .r_size = size,
+    }) catch @panic("OOM");
+
+    Logger.info("intercepted call: success: aligned_alloc({d}, {d}) = 0x{x}", .{ alignment, size, @intFromPtr(aligned_result) });
+
+    alloc_mutex.unlock();
+
+    return aligned_result;
+}
+
+fn posixMemalignSubstitute(memptr: **anyopaque, alignment: usize, size: usize) callconv(.c) c_int {
+    alloc_mutex.lock();
+
+    Logger.debug("intercepted call: posix_memalign(0x{x}, {d}, {d})", .{ @intFromPtr(memptr), alignment, size });
+
+    const result = alloc_allocator.alloc(u8, alignment + size) catch @panic("OOM");
+
+    const aligned_result = @as([*]u8, @ptrFromInt(std.mem.alignForward(usize, @intFromPtr(result.ptr), alignment)));
+
+    extra_allocations.put(allocator, @intFromPtr(aligned_result), .{
+        .addr = @intFromPtr(result.ptr),
+        .size = alignment + size,
+        .r_size = size,
+    }) catch @panic("OOM");
+
+    Logger.info("intercepted call: success: posix_memalign(0x{x} [-> 0x{x}], {d}, {d}) = 0", .{ @intFromPtr(memptr), @intFromPtr(aligned_result), alignment, size });
+
+    memptr.* = aligned_result;
+
+    alloc_mutex.unlock();
+
+    return 0;
+}
+
+fn freeSubstitute(p: ?*anyopaque) callconv(.c) void {
+    alloc_mutex.lock();
+
+    Logger.debug("intercepted call: free(0x{x})", .{@intFromPtr(p)});
+
+    if (p != null) {
+        const maybe_alloc = extra_allocations.get(@intFromPtr(p));
+
+        if (maybe_alloc) |alloc| {
+            const arr = @as([*]u8, @ptrFromInt(alloc.addr));
+            const slice = arr[0..alloc.size];
+
+            alloc_allocator.free(slice);
+
+            if (@intFromPtr(p) != alloc_zero_val) {
+                _ = extra_allocations.swapRemove(@intFromPtr(p));
+            }
+        } else {
+            Logger.err("free(0x{x}) failed: externally allocated memory", .{@intFromPtr(p)});
+            @panic("free failed: externally allocated memory");
+        }
+    }
+
+    Logger.info("intercepted call: success: free(0x{x}) [{d} allocs remaining, mem used: {B:.2}]", .{ @intFromPtr(p), extra_allocations.count(), alloc_arena.queryCapacity() });
+
+    alloc_mutex.unlock();
+}
+
+fn callocSubstitute(n: usize, size: usize) callconv(.c) *anyopaque {
+    alloc_mutex.lock();
+
+    Logger.debug("intercepted call: calloc({d}, {d})", .{ n, size });
+
+    const result = alloc_allocator.alloc(u8, 16 + n * size) catch @panic("OOM");
+    @memset(result, 0x0);
+
+    const aligned_result = @as([*]u8, @ptrFromInt(std.mem.alignForward(usize, @intFromPtr(result.ptr), 16)));
+
+    extra_allocations.put(allocator, @intFromPtr(aligned_result), .{
+        .addr = @intFromPtr(result.ptr),
+        .size = 16 + n * size,
+        .r_size = n * size,
+    }) catch @panic("OOM");
+
+    Logger.info("intercepted call: success: calloc({d}, {d}) = 0x{x}", .{ n, size, @intFromPtr(aligned_result) });
+
+    alloc_mutex.unlock();
+
+    return aligned_result;
+}
+
+fn reallocSubstitute(p: ?*anyopaque, size: usize) callconv(.c) *anyopaque {
+    alloc_mutex.lock();
+
+    Logger.debug("intercepted call: realloc(0x{x}, {d})", .{ @intFromPtr(p), size });
+
+    var result: []u8 = undefined;
+    var aligned_result: [*]u8 = undefined;
+
+    if (p != null) {
+        const maybe_prev_alloc = extra_allocations.get(@intFromPtr(p));
+
+        if (maybe_prev_alloc) |prev_alloc| {
+            Logger.debug("REALLOC: PREV: size: {d}, content: {x}", .{ prev_alloc.r_size, @as([*]u8, @ptrCast(p))[0..@min(@min(size, prev_alloc.r_size), 20)] });
+
+            const n_prev_bad_bytes = @intFromPtr(p) - prev_alloc.addr;
+
+            const prev_arr = @as([*]u8, @ptrFromInt(prev_alloc.addr));
+            const prev_slice = prev_arr[0..prev_alloc.size];
+
+            if (n_prev_bad_bytes > 0) {
+                @memmove(prev_slice.ptr, @as([*]u8, @ptrCast(p))[0..prev_alloc.r_size]);
+            }
+
+            result = alloc_allocator.realloc(prev_slice, size + 16) catch @panic("OOM");
+
+            aligned_result = @as([*]u8, @ptrFromInt(std.mem.alignForward(usize, @intFromPtr(result.ptr), 16)));
+
+            _ = extra_allocations.swapRemove(@intFromPtr(p));
+
+            const n_post_bad_bytes = @intFromPtr(aligned_result) - @intFromPtr(result.ptr);
+
+            if (n_post_bad_bytes > 0) {
+                @memmove(aligned_result, result[0..size]);
+            }
+
+            Logger.debug("REALLOC: POST: size: {d},: {x}", .{ size, @as([*]u8, @ptrCast(aligned_result))[0..@min(@min(size, prev_alloc.r_size), 20)] });
+        } else {
+            Logger.err("realloc(0x{x}, {d}) failed: externally allocated memory", .{ @intFromPtr(p), size });
+            @panic("realloc failed: externally allocated memory");
+        }
+    } else {
+        result = alloc_allocator.alloc(u8, size + 16) catch @panic("OOM");
+
+        aligned_result = @as([*]u8, @ptrFromInt(std.mem.alignForward(usize, @intFromPtr(result.ptr), 16)));
+    }
+
+    extra_allocations.put(allocator, @intFromPtr(aligned_result), .{
+        .addr = @intFromPtr(result.ptr),
+        .r_size = size,
+        .size = size + 16,
+    }) catch @panic("OOM");
+
+    Logger.info("intercepted call: success: realloc(0x{x}, {d}) = 0x{x}", .{ @intFromPtr(p), size, @intFromPtr(aligned_result) });
+
+    alloc_mutex.unlock();
+
+    return aligned_result;
+}
+
+fn reallocarraySubstitute(p: ?*anyopaque, n: usize, size: usize) callconv(.c) *anyopaque {
+    alloc_mutex.lock();
+
+    Logger.debug("intercepted call: reallocarray(0x{x}, {d}, {d})", .{ @intFromPtr(p), n, size });
+
+    var result: []u8 = undefined;
+    var aligned_result: [*]u8 = undefined;
+
+    if (p != null) {
+        const maybe_prev_alloc = extra_allocations.get(@intFromPtr(p));
+
+        if (maybe_prev_alloc) |prev_alloc| {
+            Logger.debug("REALLOCARRAY: PREV: size: {d}, content: {x}", .{ prev_alloc.r_size, @as([*]u8, @ptrCast(p))[0..@min(@min(n * size, prev_alloc.r_size), 20)] });
+
+            const n_prev_bad_bytes = @intFromPtr(p) - prev_alloc.addr;
+
+            const prev_arr = @as([*]u8, @ptrFromInt(prev_alloc.addr));
+            const prev_slice = prev_arr[0..prev_alloc.size];
+
+            if (n_prev_bad_bytes > 0) {
+                @memmove(prev_slice.ptr, @as([*]u8, @ptrCast(p))[0..prev_alloc.r_size]);
+            }
+
+            result = alloc_allocator.realloc(prev_slice, n * size + 16) catch @panic("OOM");
+
+            aligned_result = @as([*]u8, @ptrFromInt(std.mem.alignForward(usize, @intFromPtr(result.ptr), 16)));
+
+            _ = extra_allocations.swapRemove(@intFromPtr(p));
+
+            const n_post_bad_bytes = @intFromPtr(aligned_result) - @intFromPtr(result.ptr);
+
+            if (n_post_bad_bytes > 0) {
+                @memmove(aligned_result, result[0 .. n * size]);
+            }
+
+            Logger.debug("REALLOCARRAY: POST: size: {d}, content: {x}", .{ n * size, @as([*]u8, @ptrCast(aligned_result))[0..@min(@min(n * size, prev_alloc.r_size), 20)] });
+        } else {
+            Logger.err("reallocarray(0x{x}, {d}. {d}) failed: externally allocated memory", .{ @intFromPtr(p), n, size });
+            @panic("reallocarray failed: externally allocated memory");
+        }
+    } else {
+        result = alloc_allocator.alloc(u8, n * size + 16) catch @panic("OOM");
+
+        aligned_result = @as([*]u8, @ptrFromInt(std.mem.alignForward(usize, @intFromPtr(result.ptr), 16)));
+    }
+
+    extra_allocations.put(allocator, @intFromPtr(aligned_result), .{
+        .addr = @intFromPtr(result.ptr),
+        .size = n * size + 16,
+        .r_size = n * size,
+    }) catch @panic("OOM");
+
+    Logger.info("intercepted call: success: reallocarray(0x{x}, {d}, {d}) = 0x{x}", .{ @intFromPtr(p), n, size, @intFromPtr(aligned_result) });
+
+    alloc_mutex.unlock();
+
+    return aligned_result;
+}
 
 fn dlopenSubstitute(path: ?[*:0]const u8, flags: c_int) callconv(.c) ?*anyopaque {
     Logger.debug("intercepted call: dlopen(\"{?s}\", 0x{x})", .{ path, flags });
