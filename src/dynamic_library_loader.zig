@@ -1330,12 +1330,12 @@ fn loadDso(o_path: []const u8) !usize {
     }) {
         const ph: *std.elf.Elf64.Phdr = @ptrFromInt(ph_addr);
 
-        dyn_addr = file_addr + ph.offset;
-        const dyns: [*]std.elf.Dyn = @ptrFromInt(dyn_addr);
-
-        var libName: [*:0]u8 = undefined;
-
         if (ph.type == .DYNAMIC) {
+            dyn_addr = file_addr + ph.offset;
+            const dyns: [*]std.elf.Dyn = @ptrFromInt(dyn_addr);
+
+            var libName: [*:0]u8 = undefined;
+
             var has_unloaded_deps = false;
             var j: usize = 0;
             while (dyns[j].d_tag != 0) : (j += 1) {
