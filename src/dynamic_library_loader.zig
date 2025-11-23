@@ -1994,6 +1994,10 @@ fn mapSegments(dyn_object: *DynObject, file_bytes: []const u8) !void {
         mem_end = @max(mem_end, aligned_mem_end);
     }
 
+    const original_mem_end = mem_end;
+
+    mem_end += 0x1000; // add spce in case we would want to use it
+
     const total_mem_size = mem_end;
 
     Logger.debug("mapping segments: from file, library loaded size: 0x{x} (0x{x} to 0x{x})", .{ total_mem_size, 0, mem_end });
@@ -2014,6 +2018,32 @@ fn mapSegments(dyn_object: *DynObject, file_bytes: []const u8) !void {
 
     dyn_object.loaded_at = base_addr;
     dyn_object.loaded_size = total_mem_size;
+
+    const extra_segment: LoadSegment = .{
+        .file_offset = 0,
+        .file_size = 0,
+        .mem_offset = original_mem_end,
+        .mem_size = 0x1000,
+        .mem_align = std.heap.pageSize(),
+        .mapped_from_file = false,
+        .flags_first = .{
+            .read = true,
+            .write = true,
+            .exec = true,
+            .mem_offset = original_mem_end,
+            .mem_size = 0x1000,
+        },
+        .flags_last = .{
+            .read = true,
+            .write = false,
+            .exec = true,
+            .mem_offset = original_mem_end,
+            .mem_size = 0x1000,
+        },
+        .loaded_at = dyn_object.loaded_at.? + original_mem_end,
+    };
+
+    try dyn_object.segments.put(allocator, original_mem_end, extra_segment);
 
     Logger.debug("mapping segments: reserved 0x{x} bytes from 0x{x} to 0x{x}", .{ total_mem_size, base_addr, base_addr + total_mem_size });
 
@@ -2204,6 +2234,32 @@ fn detectLibC(dyn_object: *DynObject) !void {
 
         std.debug.assert(dyn_objects.values()[issetugid_sym.dyn_object_idx].mapped_at == dyn_object.mapped_at);
 
+        // write address of substitutes at the end of the dyn object mapped memory
+
+        const extra_addr = dyn_object.loaded_at.? + dyn_object.loaded_size - 0x1000;
+
+        Logger.debug("libc detection: using extra segment at 0x{x}", .{extra_addr});
+
+        const malloc_substitute_ptr: [*]u8 = @ptrFromInt(extra_addr + 0x0);
+        const calloc_substitute_ptr: [*]u8 = @ptrFromInt(extra_addr + 0x10);
+
+        const seg_infos = try findDynObjectSegmentForLoadedAddr(extra_addr);
+        try unprotectSegment(seg_infos.dyn_object, seg_infos.segment_index);
+
+        malloc_substitute_ptr[0] = 0x48;
+        malloc_substitute_ptr[1] = 0xb8;
+        std.mem.writeInt(usize, malloc_substitute_ptr[2..10], @intFromPtr(&mallocSubstitute), .little);
+        malloc_substitute_ptr[10] = 0xff;
+        malloc_substitute_ptr[11] = 0xe0;
+
+        calloc_substitute_ptr[0] = 0x48;
+        calloc_substitute_ptr[1] = 0xb8;
+        std.mem.writeInt(usize, calloc_substitute_ptr[2..10], @intFromPtr(&callocSubstitute), .little);
+        calloc_substitute_ptr[10] = 0xff;
+        calloc_substitute_ptr[11] = 0xe0;
+
+        try reprotectSegment(seg_infos.dyn_object, seg_infos.segment_index);
+
         const sym = dyn_object.syms_array.items[issetugid_sym.sym_idx];
 
         const sym_addr = issetugid_sym.address;
@@ -2243,6 +2299,16 @@ fn detectLibC(dyn_object: *DynObject) !void {
                     .write_ops = .empty,
                 };
 
+                const progname_sym = try resolveSymbolByName("program_invocation_name");
+                const progname_loc = progname_sym.address;
+                Logger.debug("libc detection: program_name: addr: 0x{x} (0x{x})", .{ progname_loc, progname_sym.value });
+                const argv: [*c]const [*c]const u8 = @ptrCast(std.os.argv);
+
+                const environ_sym = try resolveSymbolByName("environ");
+                const environ_loc = environ_sym.address;
+                Logger.debug("libc detection: environ: addr: 0x{x} (0x{x})", .{ environ_loc, environ_sym.value });
+                const environ: [*c]const [*c]const u8 = @ptrCast(std.os.environ);
+
                 try libc_specifics.?.write_ops.appendSlice(allocator, &.{
                     .{
                         .addr = libc_addr + 8,
@@ -2265,6 +2331,16 @@ fn detectLibC(dyn_object: *DynObject) !void {
                         .value = .page_size,
                     },
                     .{
+                        .addr = progname_loc,
+                        .relative_to = .zero,
+                        .value = .{ .addr = @intFromPtr(argv[0]) },
+                    },
+                    .{
+                        .addr = environ_loc,
+                        .relative_to = .zero,
+                        .value = .{ .addr = @intFromPtr(environ) },
+                    },
+                    .{
                         .addr = 0,
                         .relative_to = .tp,
                         .value = .tp,
@@ -2281,9 +2357,181 @@ fn detectLibC(dyn_object: *DynObject) !void {
                     },
                 });
 
-                return;
+                break;
             }
         }
+
+        {
+            // patch direct calls to __libc_malloc
+            const pthread_atfork_rsym = getResolvedSymbolByName(dyn_object, "pthread_atfork") catch |err| switch (err) {
+                error.UnresolvedSymbol => return error.RequiredPatchedSymbolNotFound,
+                else => |e| return e,
+            };
+
+            const paf_sym = dyn_object.syms_array.items[pthread_atfork_rsym.sym_idx];
+
+            const paf_sym_addr = pthread_atfork_rsym.address;
+            const paf_sym_size = paf_sym.size;
+
+            const paf_sym_content: []const u8 = @as([*]const u8, @ptrFromInt(paf_sym_addr))[0..paf_sym_size];
+            Logger.debug("libc detection: pthread_atfork content: {x}", .{paf_sym_content});
+
+            const start = std.mem.find(u8, paf_sym_content, &.{ 0xbf, 0x28, 0x00, 0x00, 0x00 }).?;
+            const pat_start = std.mem.find(u8, paf_sym_content[start + 5 ..], &.{0xe8}).?;
+            std.debug.assert(std.mem.eql(u8, paf_sym_content[start + 5 + pat_start + 5 ..][0..3], &.{ 0x48, 0x85, 0xc0 }));
+
+            const offset = std.mem.readInt(i32, paf_sym_content[start + 5 + pat_start + 1 ..][0..4], .little);
+
+            const from_addr = @intFromPtr(paf_sym_content.ptr) + start + 5 + pat_start + 1 + 4;
+            const libc_malloc_addr: usize = if (offset < 0) from_addr - @as(usize, @intCast(-offset)) else from_addr + @as(usize, @intCast(offset));
+
+            const from_offset = paf_sym.value + start + 5 + pat_start + 1 + 4;
+            const libc_malloc_offset: usize = if (offset < 0) from_offset - @as(usize, @intCast(-offset)) else from_offset + @as(usize, @intCast(offset));
+
+            Logger.debug("libc detection: __libc_malloc: at 0x{x} [0x{x}] (0x{x} [0x{x}] + 0x{x})", .{ libc_malloc_addr, libc_malloc_offset, from_addr, from_offset, offset });
+
+            for (dyn_object.segments.values()) |*s| {
+                if (!s.flags_first.exec) {
+                    continue;
+                }
+
+                const s_data = @as([*]const u8, @ptrFromInt(s.loaded_at))[0..s.mem_size];
+                var curr_offset: usize = 0;
+                while (curr_offset < s.mem_size - 5) {
+                    if (s_data[curr_offset] == 0xe8) {
+                        const c_offset = std.mem.readInt(i32, s_data[curr_offset + 1 ..][0..4], .little);
+                        const c_from_addr = s.loaded_at + curr_offset + 1 + 4;
+                        const c_target_addr = if (c_offset < 0) c_from_addr - @as(usize, @intCast(-c_offset)) else c_from_addr + @as(usize, @intCast(c_offset));
+                        const c_from_offset = s.mem_offset + curr_offset + 1 + 4;
+
+                        if (c_offset < 0 and -c_offset <= c_from_offset or c_offset > 0) {
+                            const c_target_offset = if (c_offset < 0) c_from_offset - @as(usize, @intCast(-c_offset)) else c_from_offset + @as(usize, @intCast(c_offset));
+                            if (c_target_offset == libc_malloc_offset) {
+                                if (std.mem.find(u8, s_data[curr_offset + 1 + 4 ..][0..32], &.{ 0x48, 0x85, 0xc0 }) != null or
+                                    std.mem.find(u8, s_data[curr_offset + 1 + 4 ..][0..48], &.{ 0x48, 0x89 }) != null or
+                                    std.mem.find(u8, s_data[curr_offset + 1 + 4 ..][0..48], &.{ 0x49, 0x89 }) != null)
+                                {
+                                    const offset_to_substitute: i32 = @intCast(@intFromPtr(malloc_substitute_ptr) - c_from_addr);
+
+                                    Logger.debug("libc detection: __libc_malloc: found call at 0x{x} [0x{x}] => to 0x{x} [0x{x}], next byte: 0x{x} | dist to substitute: 0x{x}", .{
+                                        curr_offset + s.loaded_at,
+                                        curr_offset + s.mem_offset,
+                                        c_target_addr,
+                                        c_target_offset,
+                                        s_data[curr_offset + 1 + 4],
+                                        offset_to_substitute,
+                                    });
+
+                                    const si = try findDynObjectSegmentForLoadedAddr(curr_offset + s.loaded_at);
+                                    try unprotectSegment(si.dyn_object, si.segment_index);
+
+                                    const to_patch_ptr: [*]u8 = @ptrFromInt(curr_offset + s.loaded_at + 1);
+                                    std.mem.writeInt(i32, to_patch_ptr[0..4], offset_to_substitute, .little);
+
+                                    try reprotectSegment(si.dyn_object, si.segment_index);
+                                } else {
+                                    Logger.warn("libc detection: __libc_malloc: found potential call at 0x{x} [0x{x}] => to 0x{x} [0x{x}], but will not patch because following bytes are sus", .{
+                                        curr_offset + s.loaded_at,
+                                        curr_offset + s.mem_offset,
+                                        c_target_addr,
+                                        c_target_offset,
+                                    });
+                                }
+                            }
+                        }
+                    }
+
+                    curr_offset += 1;
+                }
+            }
+        }
+
+        {
+            // patch direct calls to __libc_calloc
+            const cxa_atexit_rsym = getResolvedSymbolByName(dyn_object, "__cxa_atexit") catch |err| switch (err) {
+                error.UnresolvedSymbol => return error.RequiredPatchedSymbolNotFound,
+                else => |e| return e,
+            };
+
+            const cae_sym = dyn_object.syms_array.items[cxa_atexit_rsym.sym_idx];
+
+            const cae_sym_addr = cxa_atexit_rsym.address;
+            const cae_sym_size = cae_sym.size;
+
+            const cae_sym_content: []const u8 = @as([*]const u8, @ptrFromInt(cae_sym_addr))[0..cae_sym_size];
+            Logger.debug("libc detection: __cxa_atexit content: {x}", .{cae_sym_content});
+
+            const start = std.mem.find(u8, cae_sym_content, &.{ 0xbf, 0x08, 0x02, 0x00, 0x00 }).?;
+            const pat_start = std.mem.find(u8, cae_sym_content[start + 5 ..], &.{0xe8}).?;
+            std.debug.assert(cae_sym_content[start + 5 + pat_start + 5] == 0x48);
+
+            const offset = std.mem.readInt(i32, cae_sym_content[start + 5 + pat_start + 1 ..][0..4], .little);
+
+            const from_addr = @intFromPtr(cae_sym_content.ptr) + start + 5 + pat_start + 1 + 4;
+            const libc_calloc_addr: usize = if (offset < 0) from_addr - @as(usize, @intCast(-offset)) else from_addr + @as(usize, @intCast(offset));
+
+            const from_offset = cae_sym.value + start + 5 + pat_start + 1 + 4;
+            const libc_calloc_offset: usize = if (offset < 0) from_offset - @as(usize, @intCast(-offset)) else from_offset + @as(usize, @intCast(offset));
+
+            Logger.debug("libc detection: __libc_calloc: at 0x{x} [0x{x}] (0x{x} [0x{x}] + 0x{x})", .{ libc_calloc_addr, libc_calloc_offset, from_addr, from_offset, offset });
+
+            for (dyn_object.segments.values()) |*s| {
+                if (!s.flags_first.exec) {
+                    continue;
+                }
+
+                const s_data = @as([*]const u8, @ptrFromInt(s.loaded_at))[0..s.mem_size];
+                var curr_offset: usize = 0;
+                while (curr_offset < s.mem_size - 5) {
+                    if (s_data[curr_offset] == 0xe8) {
+                        const c_offset = std.mem.readInt(i32, s_data[curr_offset + 1 ..][0..4], .little);
+                        const c_from_addr = s.loaded_at + curr_offset + 1 + 4;
+                        const c_target_addr = if (c_offset < 0) c_from_addr - @as(usize, @intCast(-c_offset)) else c_from_addr + @as(usize, @intCast(c_offset));
+                        const c_from_offset = s.mem_offset + curr_offset + 1 + 4;
+
+                        if (c_offset < 0 and -c_offset <= c_from_offset or c_offset > 0) {
+                            const c_target_offset = if (c_offset < 0) c_from_offset - @as(usize, @intCast(-c_offset)) else c_from_offset + @as(usize, @intCast(c_offset));
+                            if (c_target_offset == libc_calloc_offset) {
+                                if (std.mem.find(u8, s_data[curr_offset + 1 + 4 ..][0..32], &.{ 0x48, 0x85, 0xc0 }) != null or
+                                    std.mem.find(u8, s_data[curr_offset + 1 + 4 ..][0..48], &.{ 0x48, 0x89 }) != null or
+                                    std.mem.find(u8, s_data[curr_offset + 1 + 4 ..][0..48], &.{ 0x49, 0x89 }) != null)
+                                {
+                                    const offset_to_substitute: i32 = @intCast(@intFromPtr(calloc_substitute_ptr) - c_from_addr);
+
+                                    Logger.debug("libc detection: __libc_calloc: found call at 0x{x} [0x{x}] => to 0x{x} [0x{x}], next byte: 0x{x} | dist to substitute: 0x{x}", .{
+                                        curr_offset + s.loaded_at,
+                                        curr_offset + s.mem_offset,
+                                        c_target_addr,
+                                        c_target_offset,
+                                        s_data[curr_offset + 1 + 4],
+                                        offset_to_substitute,
+                                    });
+
+                                    const si = try findDynObjectSegmentForLoadedAddr(curr_offset + s.loaded_at);
+                                    try unprotectSegment(si.dyn_object, si.segment_index);
+
+                                    const to_patch_ptr: [*]u8 = @ptrFromInt(curr_offset + s.loaded_at + 1);
+                                    std.mem.writeInt(i32, to_patch_ptr[0..4], offset_to_substitute, .little);
+
+                                    try reprotectSegment(si.dyn_object, si.segment_index);
+                                } else {
+                                    Logger.warn("libc detection: __libc_calloc: found potential call at 0x{x} [0x{x}] => to 0x{x} [0x{x}], but will not patch because following bytes are sus", .{
+                                        curr_offset + s.loaded_at,
+                                        curr_offset + s.mem_offset,
+                                        c_target_addr,
+                                        c_target_offset,
+                                    });
+                                }
+                            }
+                        }
+                    }
+
+                    curr_offset += 1;
+                }
+            }
+        }
+
+        return;
     }
 
     if (maybe_rtld_global_ro_sym) |rtld_global_ro_sym| {
@@ -2859,7 +3107,6 @@ fn processRelocations(dyn_object: *DynObject) !void {
                     // replace `jmp *{offset}(%rip)`
 
                     const write_addr = @intFromPtr(entry);
-                    // const jump_offset: i32 = @intCast(substitute_addr.? - write_addr + 1 + 4);
 
                     const seg_infos = findDynObjectSegmentForLoadedAddr(write_addr) catch null;
 
@@ -2883,20 +3130,7 @@ fn processRelocations(dyn_object: *DynObject) !void {
                     break;
                 }
             }
-
-            // const loaded_target_addr = try vAddressToLoadedAddress(dyn_object, target_address, false);
-
-            // const infos = try findDynObjectSegmentForLoadedAddr(loaded_target_addr);
-            // if (infos.sym_index) |sidx| {
-            //     const sym = infos.dyn_object.syms_array.items[sidx];
-            //     Logger.debug("  => sym: {s}", .{sym.name});
-
-            //     // const sym_addr = vAddressToLoadedAddress(infos.dyn_object, sym.value, false) catch unreachable;
-            // }
         }
-
-        // Logger.err("{s}: .plt.got section [at: 0x{x}, size: 0x{x}] should be checked for substitutions", .{ dyn_object.name, dyn_object.plt_got_section_offset, dyn_object.plt_got_section_size });
-        // return error.UncheckedPltGot;
     }
 
     Logger.debug("processed {d} relocations for {s}", .{ reloc_count, dyn_object.name });
@@ -3671,6 +3905,8 @@ fn getSubstituteAddress(sym: ResolvedSymbol, for_obj: *DynObject) ?usize {
         addr = @intFromPtr(&pthreadDetachSubstitute);
     } else if (std.mem.eql(u8, sym.name, "pthread_join")) {
         addr = @intFromPtr(&pthreadJoinSubstitute);
+    } else if (std.mem.eql(u8, sym.name, "pthread_once")) {
+        // addr = @intFromPtr(&pthreadOnceSubstitute);
     }
     // TODO check if those functions really needs to be subsituted, it seems they only acts on the pthread struct
     // else if (std.mem.eql(u8, sym.name, "pthread_key_create")) {
@@ -3722,6 +3958,8 @@ var extra_allocations: std.AutoArrayHashMapUnmanaged(usize, ExtraAlloc) = .empty
 var alloc_mutex: std.Thread.Mutex = .{};
 var alloc_arena: std.heap.ArenaAllocator = undefined;
 var alloc_allocator: std.mem.Allocator = undefined;
+var extra_onces: std.AutoHashMapUnmanaged(usize, void) = .empty;
+var once_mutex: std.Thread.Mutex = .{};
 
 fn mallocSubstitute(size: usize) callconv(.c) ?*anyopaque {
     alloc_mutex.lock();
@@ -4415,6 +4653,22 @@ fn pthreadJoinSubstitute(thread_handle: c_ulong, retval: **anyopaque) callconv(.
 
     Logger.err("pthread_join(0x{x}, 0x{x}) failed: thread not found", .{ thread_handle, @intFromPtr(retval) });
     @panic("pthread_join: thread not found");
+}
+
+fn pthreadOnceSubstitute(once_control: *anyopaque, init_routine: *const fn () callconv(.c) void) callconv(.c) void {
+    // once_mutex.lock();
+
+    Logger.debug("intercepted call: pthread_once(0x{x}, 0x{x})", .{ @intFromPtr(once_control), @intFromPtr(init_routine) });
+
+    if (!extra_onces.contains(@intFromPtr(init_routine))) {
+        extra_onces.putNoClobber(allocator, @intFromPtr(init_routine), {}) catch @panic("OOM");
+        init_routine();
+        // once_control.* = @bitCast(@as(c_uint, 0xaaaaaaaa));
+    }
+
+    Logger.debug("intercepted call: success: pthread_once(0x{x}, 0x{x})", .{ @intFromPtr(once_control), @intFromPtr(init_routine) });
+
+    // once_mutex.unlock();
 }
 
 const TlsIndex = extern struct {
