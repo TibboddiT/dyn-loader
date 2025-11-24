@@ -60,7 +60,7 @@ pub fn main() !void {
     const version = try vkb.enumerateInstanceVersion();
     std.log.info("got vulkan version: {d}.{d}.{d}", .{ version >> 22, (version >> 12) & 0x3ff, (version & 0xfff) });
 
-    std.log.info("creating vulkan instance (will fail for now)...", .{});
+    std.log.info("creating vulkan instance...", .{});
 
     const app_name = "Test";
 
@@ -87,5 +87,5 @@ pub fn main() !void {
         // .flags = .{ .enumerate_portability_bit_khr = true },
     }, null);
 
-    _ = instance;
+    std.log.info("successfully created vulkan instance: 0x{x}", .{instance});
 }

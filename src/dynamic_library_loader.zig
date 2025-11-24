@@ -3724,7 +3724,7 @@ fn vAddressToLoadedAddress(dyn_object: *DynObject, addr: usize, allow_outside: b
             return error.AddressNotInMappedSegments;
         }
 
-        Logger.warn("addr 0x{x} not in any mapped segment", .{addr});
+        Logger.debug("warning: offset 0x{x} was requested to be resolved to a loaded address, but is not in any mapped segment", .{addr});
         return dyn_object.loaded_at.? + addr;
     }
 
