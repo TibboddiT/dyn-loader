@@ -22,9 +22,9 @@ pub fn main() !void {
     try dll.init(.{ .allocator = allocator });
     defer dll.deinit();
 
-    std.log.info("loading 'libc.so.6'...", .{});
+    std.log.info("loading system libc...", .{});
 
-    const lib_c = try dll.load("libc.so.6");
+    const lib_c = try dll.loadSystemLibC();
 
     std.log.info("testing libc printf...", .{});
 

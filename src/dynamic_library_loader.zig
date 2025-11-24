@@ -987,6 +987,45 @@ fn logSummary() void {
 
 // TODO thread safety
 // TODO handle errors gracefully
+pub fn loadSystemLibC() !DynamicLibrary {
+    const candidates = [_][]const u8{
+        "libc.so.6",
+        "libc.so",
+    };
+
+    Logger.debug("libc: searching system libc", .{});
+
+    var buf: [4]u8 = undefined;
+
+    for (candidates) |c| {
+        Logger.debug("libc: trying {s}", .{c});
+
+        const path = resolvePath(c) catch |err| switch (err) {
+            error.LibraryNotFound => continue,
+            else => |e| return e,
+        };
+        defer allocator.free(path);
+
+        const f = try std.fs.openFileAbsolute(path, .{ .mode = .read_only });
+        defer f.close();
+
+        const stat = try f.stat();
+        const size = std.math.cast(usize, stat.size) orelse return error.FileTooBig;
+
+        if (size < 4) continue;
+
+        const read = try f.read(&buf);
+
+        if (read != 4 or !std.mem.eql(u8, &buf, std.elf.MAGIC)) continue;
+
+        return load(c);
+    }
+
+    return error.SystemLibcNotFound;
+}
+
+// TODO thread safety
+// TODO handle errors gracefully
 pub fn load(f_path: []const u8) !DynamicLibrary {
     if (!initialized) {
         return error.Unitialized;
