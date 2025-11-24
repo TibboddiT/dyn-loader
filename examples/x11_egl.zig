@@ -87,8 +87,8 @@ pub fn main() !void {
     std.log.info("loading 'libX11.so.6'...", .{});
     const lib_x11 = try dll.load("libX11.so.6");
 
-    std.log.info("loading 'libEGL.so'...", .{});
-    const lib_egl = try dll.load("libEGL.so");
+    std.log.info("loading 'libEGL.so.1'...", .{});
+    const lib_egl = try dll.load("libEGL.so.1");
 
     std.log.info("testing X11 + EGL...", .{});
 
