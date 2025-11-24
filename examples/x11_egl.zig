@@ -69,7 +69,21 @@ pub const EGL = struct {
     pub const EGLCreateContext = fn (display: EGLDisplay, config: EGLConfig, share_context: EGLContext, attrib_list: [*c]const EGLint) callconv(.c) EGLContext;
     pub const EGLDestroySurface = fn (display: EGLDisplay, surface: EGLSurface) callconv(.c) EGLBoolean;
     pub const EGLDestroyContext = fn (display: EGLDisplay, context: EGLContext) callconv(.c) EGLBoolean;
-    pub const EGLMakeCurrent = fn (display: EGLDisplay, surface: EGLSurface, surface: EGLSurface, context: EGLContext) callconv(.c) EGLBoolean;
+    pub const EGLMakeCurrent = fn (display: EGLDisplay, draw: EGLSurface, read: EGLSurface, context: EGLContext) callconv(.c) EGLBoolean;
+    pub const EGLSwapBuffers = fn (display: EGLDisplay, surface: EGLSurface) callconv(.c) EGLBoolean;
+};
+
+pub const GL = struct {
+    pub const GLint = c_int;
+    pub const GLsizei = c_int;
+    pub const GLclampf = f32;
+    pub const GLbitfield = c_uint;
+
+    pub const GL_COLOR_BUFFER_BIT = 0x00004000;
+
+    const GLViewport = fn (x: GLint, y: GLint, width: GLsizei, height: GLsizei) callconv(.c) void;
+    const GLClearColor = fn (red: GLclampf, green: GLclampf, blue: GLclampf, alpha: GLclampf) callconv(.c) void;
+    const GLClear = fn (mask: GLbitfield) callconv(.c) void;
 };
 
 pub fn main() !void {
@@ -89,6 +103,9 @@ pub fn main() !void {
 
     std.log.info("loading 'libEGL.so.1'...", .{});
     const lib_egl = try dll.load("libEGL.so.1");
+
+    std.log.info("loading 'libGL.so.1'...", .{});
+    const lib_gl = try dll.load("libGL.so.1");
 
     std.log.info("testing X11 + EGL...", .{});
 
@@ -113,6 +130,13 @@ pub fn main() !void {
     const eglDestroySurface: *EGL.EGLDestroySurface = @ptrFromInt((try lib_egl.getSymbol("eglDestroySurface")).addr);
     const eglDestroyContext: *EGL.EGLDestroyContext = @ptrFromInt((try lib_egl.getSymbol("eglDestroyContext")).addr);
     const eglMakeCurrent: *EGL.EGLMakeCurrent = @ptrFromInt((try lib_egl.getSymbol("eglMakeCurrent")).addr);
+    const eglSwapBuffers: *EGL.EGLSwapBuffers = @ptrFromInt((try lib_egl.getSymbol("eglSwapBuffers")).addr);
+
+    const glViewport: *GL.GLViewport = @ptrFromInt((try lib_gl.getSymbol("glViewport")).addr);
+    const glClearColor: *GL.GLClearColor = @ptrFromInt((try lib_gl.getSymbol("glClearColor")).addr);
+    const glClear: *GL.GLClear = @ptrFromInt((try lib_gl.getSymbol("glClear")).addr);
+
+    std.log.info("creating an X11 window...", .{});
 
     const display = xOpenDisplay(null) orelse return error.X11OpenDisplayError;
     defer _ = xCloseDisplay(display);
@@ -126,6 +150,8 @@ pub fn main() !void {
     _ = xMapWindow(display, window);
 
     _ = xFlush(display);
+
+    std.log.info("initializing EGL...", .{});
 
     const egl_display: EGL.EGLDisplay = eglGetDisplay(display);
     if (egl_display == EGL.EGL_NO_DISPLAY) {
@@ -181,6 +207,16 @@ pub fn main() !void {
     if (make_current_status == 0) {
         return error.EGLMakeCurrentError;
     }
+
+    std.log.info("executing GL commands...", .{});
+
+    glViewport(0, 0, 400, 300);
+    glClearColor(1.0, 0.0, 0.0, 1.0);
+    glClear(GL.GL_COLOR_BUFFER_BIT);
+
+    std.log.info("swapping buffers...", .{});
+
+    _ = eglSwapBuffers(egl_display, surface);
 
     std.log.info("the window will be closed in 3 seconds", .{});
 

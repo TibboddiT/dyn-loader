@@ -798,7 +798,7 @@ var libc_specifics: ?LibcSpecifics = null;
 
 const InitOptions = struct {
     allocator: std.mem.Allocator,
-    log_level: Logger.Level = .warn,
+    log_level: Logger.Level = .err,
 };
 
 // TODO thread safety
@@ -1056,7 +1056,13 @@ pub fn load(f_path: []const u8) !DynamicLibrary {
         try processIRelativeRelocations(dyn_obj);
     }
 
+    const nb_indices = dyn_objects_sorted_indices.items.len;
+
     for (dyn_objects_sorted_indices.items) |idx| {
+        if (nb_indices != dyn_objects_sorted_indices.items.len) {
+            break; // an init function has loaded new libs, so this loop has already ran
+        }
+
         const dyn_obj = &dyn_objects.values()[idx];
 
         if (dyn_obj.loaded) {
@@ -1082,12 +1088,6 @@ pub fn load(f_path: []const u8) !DynamicLibrary {
         try CustomSelfInfo.addExtraElf(allocator, dl_phdr_info);
 
         try callInitFunctions(dyn_obj);
-    }
-
-    for (dyn_objects.values()) |*dyn_obj| {
-        if (dyn_obj.loaded) {
-            continue;
-        }
     }
 
     return lib;
