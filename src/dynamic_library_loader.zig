@@ -2601,13 +2601,18 @@ fn detectLibC(dyn_object: *DynObject) !void {
                 .relative_to = .zero,
                 .value = .auxv,
             },
+            // TODO the two next offsets are notoriously not stable
+            // we should search for patterns corrsponding to `__nptl_tls_static_size_for_stack`
+            // which use them both
+            // it currently kinda works, because tls align is generally either 712 or 720,
+            // so a division by 0 is avoided
             .{
-                .addr = rtld_addr + 704,
+                .addr = rtld_addr + 712,
                 .relative_to = .zero,
                 .value = .tls_size,
             },
             .{
-                .addr = rtld_addr + 712,
+                .addr = rtld_addr + 720,
                 .relative_to = .zero,
                 .value = .tls_align,
             },

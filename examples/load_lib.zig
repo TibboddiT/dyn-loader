@@ -30,11 +30,13 @@ pub fn main() !void {
         return error.MissingLibName;
     }
 
-    const lib_name = args[1];
+    for (args[1..]) |arg| {
+        const lib_name = arg;
 
-    std.log.info("loading '{s}'...", .{lib_name});
+        std.log.info("loading '{s}'...", .{lib_name});
 
-    _ = try dll.load(lib_name);
+        _ = try dll.load(lib_name);
+    }
 
     std.log.info("success", .{});
 }
