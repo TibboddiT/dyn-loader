@@ -2040,7 +2040,7 @@ fn mapSegments(dyn_object: *DynObject, file_bytes: []const u8) !void {
 
     const original_mem_end = mem_end;
 
-    mem_end += 0x1000; // add spce in case we would want to use it
+    mem_end += 0x1000; // add space in case we would want to use it
 
     const total_mem_size = mem_end;
 
