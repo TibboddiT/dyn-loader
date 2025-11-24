@@ -815,7 +815,7 @@ pub fn init(options: InitOptions) !void {
     // alloc_allocator = allocator;
 
     // TODO
-    // - pre restructure TLS
+    // - pre restructure TLS early
     // - assert linux x86_64
     // - assert statically linked
     // - assert only one thread
@@ -904,7 +904,7 @@ pub fn deinit() void {
             not_freed += ea.r_size;
         }
 
-        Logger.warn("{B:.2} of memory allocated ({d} allocations) from libraries not freed", .{ not_freed, extra_allocations.count() });
+        Logger.info("{B:.2} of memory allocated ({d} allocations) from libraries not freed", .{ not_freed, extra_allocations.count() });
     }
     extra_allocations.clearAndFree(allocator);
     alloc_arena.deinit();
@@ -1777,7 +1777,6 @@ fn loadDso(o_path: []const u8) !usize {
 
                     // TODO type might be std.elf.Elf64_Rel
                     const plt_reloc: *std.elf.Elf64_Rela = @ptrFromInt(plt_reloc_addr);
-                    // logger.debug("           0x{x}: {d}", .{ plt_reloc_addr - file_addr, plt_reloc.r_type() });
                     Logger.debug("          - [{d}] plt reloc: {s}, sym: 0x{x}, offset: 0x{x}, addend: 0x{x}", .{
                         r,
                         @tagName(@as(std.elf.R_X86_64, @enumFromInt(plt_reloc.r_type()))),
@@ -1986,12 +1985,14 @@ fn mapSegments(dyn_object: *DynObject, file_bytes: []const u8) !void {
 
     Logger.debug("mapping library {s} with {d} segments", .{ dyn_object.name, dyn_object.segments.count() });
 
-    var mem_end: usize = std.math.minInt(usize);
+    var mem_end: usize = 0;
+    var max_align: usize = 0x1000;
 
     for (dyn_object.segments.values()) |*segment| {
         std.debug.assert(segment.mem_align >= std.heap.pageSize() and segment.mem_align % std.heap.pageSize() == 0);
         const aligned_mem_end = std.mem.alignForward(usize, segment.mem_offset + segment.mem_size, segment.mem_align);
         mem_end = @max(mem_end, aligned_mem_end);
+        max_align = @max(max_align, segment.mem_align);
     }
 
     const original_mem_end = mem_end;
@@ -2004,7 +2005,7 @@ fn mapSegments(dyn_object: *DynObject, file_bytes: []const u8) !void {
 
     const mapped_space = std.posix.mmap(
         null,
-        total_mem_size,
+        total_mem_size + max_align,
         std.posix.PROT.NONE,
         .{ .TYPE = .PRIVATE, .ANONYMOUS = true },
         -1,
@@ -2014,7 +2015,7 @@ fn mapSegments(dyn_object: *DynObject, file_bytes: []const u8) !void {
         return err;
     };
 
-    const base_addr = @intFromPtr(mapped_space.ptr);
+    const base_addr = std.mem.alignForward(usize, @intFromPtr(mapped_space.ptr), max_align);
 
     dyn_object.loaded_at = base_addr;
     dyn_object.loaded_size = total_mem_size;
@@ -2024,7 +2025,7 @@ fn mapSegments(dyn_object: *DynObject, file_bytes: []const u8) !void {
         .file_size = 0,
         .mem_offset = original_mem_end,
         .mem_size = 0x1000,
-        .mem_align = std.heap.pageSize(),
+        .mem_align = 0x1000,
         .mapped_from_file = false,
         .flags_first = .{
             .read = true,
@@ -2047,6 +2048,8 @@ fn mapSegments(dyn_object: *DynObject, file_bytes: []const u8) !void {
 
     Logger.debug("mapping segments: reserved 0x{x} bytes from 0x{x} to 0x{x}", .{ total_mem_size, base_addr, base_addr + total_mem_size });
 
+    var prev_end: usize = 0;
+
     for (dyn_object.segments.values(), 0..) |*segment, s| {
         Logger.debug("  segment {d}: foff: 0x{x}, moff: 0x{x}, fsize: 0x{x}, msize: 0x{x}", .{ s, segment.file_offset, segment.mem_offset, segment.file_size, segment.mem_size });
 
@@ -2065,6 +2068,9 @@ fn mapSegments(dyn_object: *DynObject, file_bytes: []const u8) !void {
 
         Logger.debug("  segment {d}: mapping: foff: 0x{x}, aligned foff: 0x{x}, from 0x{x} to 0x{x}, size: 0x{x}", .{ s, segment.file_offset, aligned_file_offset, @as(usize, @intFromPtr(aligned_ptr)), aligned_end, aligned_size });
         Logger.debug("  segment {d}: data: from 0x{x} to 0x{x}, size: 0x{x}", .{ s, segment.loaded_at, segment.loaded_at + segment.mem_size, segment.mem_size });
+
+        std.debug.assert(prev_end <= @intFromPtr(aligned_ptr));
+        prev_end = aligned_end;
 
         _ = try std.posix.mmap(
             aligned_ptr,
@@ -2361,6 +2367,7 @@ fn detectLibC(dyn_object: *DynObject) !void {
             }
         }
 
+        // TODO factorize, and use libc_specifics.write_ops
         {
             // patch direct calls to __libc_malloc
             const pthread_atfork_rsym = getResolvedSymbolByName(dyn_object, "pthread_atfork") catch |err| switch (err) {
@@ -2535,7 +2542,7 @@ fn detectLibC(dyn_object: *DynObject) !void {
     }
 
     if (maybe_rtld_global_ro_sym) |rtld_global_ro_sym| {
-        // musl
+        // glibc
         Logger.debug("libc detection: {s} is detected as glibc, using _rtld_global_ro symbol", .{dyn_object.path});
 
         const rtld_addr = rtld_global_ro_sym.address;
@@ -2812,7 +2819,7 @@ fn mapTlsBlock(dyn_object: *DynObject) !void {
         allocator.free(current_tls_area_desc.block.init);
     }
 
-    // TODO keep a copy of the normal area desc,
+    // keep a copy of the normal area desc,
     // and create another one to be set to `std.os.linux.tls.area_desc`
     // that is adapted to the `std.os.linux.tls.prepareArea` call
     // when spawning a thread
@@ -2830,14 +2837,6 @@ fn mapTlsBlock(dyn_object: *DynObject) !void {
         const new_tcb: *usize = @ptrFromInt(new_tp);
         new_tcb.* = new_tp;
 
-        // // for pthread->self
-        // const pthread_self: *usize = @ptrFromInt(new_tp + 16);
-        // pthread_self.* = new_tp;
-
-        // // for pthread->self
-        // const pthread_self_2: *usize = @ptrFromInt(new_tp + 200);
-        // pthread_self_2.* = new_tp;
-
         Logger.debug("tls: tls space mapped, new TP: 0x{x}", .{new_tp});
 
         const e_set_fs = std.os.linux.syscall2(.arch_prctl, std.os.linux.ARCH.SET_FS, new_tp);
@@ -2845,37 +2844,6 @@ fn mapTlsBlock(dyn_object: *DynObject) !void {
 
         if (libc_specifics != null) {
             try applyLibcWriteOps(new_tp, false);
-
-            // Logger.debug("libc: setting details for libc: {t}", .{libc_specifics.?.kind});
-
-            // for (libc_specifics.?.write_ops.items) |op| {
-            //     const addr = op.addr + if (op.relative_to == .tp) new_tp else 0;
-            //     const val: usize = switch (op.value) {
-            //         .auxv => @intFromPtr(std.os.linux.elf_aux_maybe.?),
-            //         .page_size => std.heap.pageSize(),
-            //         .tid => std.Thread.getCurrentId(),
-            //         .tls_size => new_tls_area_desc.block.size + current_surplus_size,
-            //         .tls_align => new_tls_area_desc.alignment,
-            //         .tls_count => 1, // TODO,
-            //         .tp => new_tp,
-            //         .self => addr,
-            //         .addr => |a| a,
-            //     };
-
-            //     Logger.debug("libc: writing {t} [0x{x}] at 0x{x}", .{ op.value, val, addr });
-
-            //     const seg_infos = findDynObjectSegmentForLoadedAddr(addr) catch null;
-            //     if (seg_infos != null) {
-            //         try unprotectSegment(seg_infos.?.dyn_object, seg_infos.?.segment_index);
-            //     }
-
-            //     const ptr: *volatile usize = @ptrFromInt(addr);
-            //     ptr.* = val;
-
-            //     if (seg_infos != null) {
-            //         try reprotectSegment(seg_infos.?.dyn_object, seg_infos.?.segment_index);
-            //     }
-            // }
         }
 
         dyn_object.tls_offset = new_abi_tcb_offset;
@@ -3905,9 +3873,11 @@ fn getSubstituteAddress(sym: ResolvedSymbol, for_obj: *DynObject) ?usize {
         addr = @intFromPtr(&pthreadDetachSubstitute);
     } else if (std.mem.eql(u8, sym.name, "pthread_join")) {
         addr = @intFromPtr(&pthreadJoinSubstitute);
-    } else if (std.mem.eql(u8, sym.name, "pthread_once")) {
-        // addr = @intFromPtr(&pthreadOnceSubstitute);
     }
+    // TODO substitution not really needed, but keep it in mind
+    // else if (std.mem.eql(u8, sym.name, "pthread_once")) {
+    //     addr = @intFromPtr(&pthreadOnceSubstitute);
+    // }
     // TODO check if those functions really needs to be subsituted, it seems they only acts on the pthread struct
     // else if (std.mem.eql(u8, sym.name, "pthread_key_create")) {
     //     Logger.warn("substitutes: {s}: dangerous unsubstituted pthread function [{s}] {s} as 0x{x}", .{ for_obj.name, dyn_object.name, sym.name, sym.address });
@@ -3958,8 +3928,9 @@ var extra_allocations: std.AutoArrayHashMapUnmanaged(usize, ExtraAlloc) = .empty
 var alloc_mutex: std.Thread.Mutex = .{};
 var alloc_arena: std.heap.ArenaAllocator = undefined;
 var alloc_allocator: std.mem.Allocator = undefined;
-var extra_onces: std.AutoHashMapUnmanaged(usize, void) = .empty;
-var once_mutex: std.Thread.Mutex = .{};
+// var extra_onces: std.AutoHashMapUnmanaged(usize, void) = .empty;
+
+// TODO general thread safety for the substitutes
 
 fn mallocSubstitute(size: usize) callconv(.c) ?*anyopaque {
     alloc_mutex.lock();
@@ -4293,7 +4264,7 @@ const DlLinkMap = extern struct {
     l_ld: *std.elf.Dyn,
     l_next: ?*DlLinkMap,
     l_prev: ?*DlLinkMap,
-    _others: [1168]u8, // implementation dependent
+    _others: [1168]u8, // TODO implementation dependent
 };
 
 const DlFindObject = extern struct {
@@ -4302,7 +4273,7 @@ const DlFindObject = extern struct {
     dlfo_map_end: ?*anyopaque,
     dlfo_link_map: ?*DlLinkMap,
     dlfo_eh_frame: ?*anyopaque,
-    __dlfo_reserved: [7]c_ulonglong, // implementation dependent
+    __dlfo_reserved: [7]c_ulonglong, // TODO implementation dependent
 };
 
 fn dladdrSubstitute(addr: *anyopaque, dl_info: *DlInfo) callconv(.c) c_int {
@@ -4655,21 +4626,16 @@ fn pthreadJoinSubstitute(thread_handle: c_ulong, retval: **anyopaque) callconv(.
     @panic("pthread_join: thread not found");
 }
 
-fn pthreadOnceSubstitute(once_control: *anyopaque, init_routine: *const fn () callconv(.c) void) callconv(.c) void {
-    // once_mutex.lock();
+// fn pthreadOnceSubstitute(once_control: *anyopaque, init_routine: *const fn () callconv(.c) void) callconv(.c) void {
+//     Logger.debug("intercepted call: pthread_once(0x{x}, 0x{x})", .{ @intFromPtr(once_control), @intFromPtr(init_routine) });
 
-    Logger.debug("intercepted call: pthread_once(0x{x}, 0x{x})", .{ @intFromPtr(once_control), @intFromPtr(init_routine) });
+//     if (!extra_onces.contains(@intFromPtr(init_routine))) {
+//         extra_onces.putNoClobber(allocator, @intFromPtr(init_routine), {}) catch @panic("OOM");
+//         init_routine();
+//     }
 
-    if (!extra_onces.contains(@intFromPtr(init_routine))) {
-        extra_onces.putNoClobber(allocator, @intFromPtr(init_routine), {}) catch @panic("OOM");
-        init_routine();
-        // once_control.* = @bitCast(@as(c_uint, 0xaaaaaaaa));
-    }
-
-    Logger.debug("intercepted call: success: pthread_once(0x{x}, 0x{x})", .{ @intFromPtr(once_control), @intFromPtr(init_routine) });
-
-    // once_mutex.unlock();
-}
+//     Logger.debug("intercepted call: success: pthread_once(0x{x}, 0x{x})", .{ @intFromPtr(once_control), @intFromPtr(init_routine) });
+// }
 
 const TlsIndex = extern struct {
     ti_module: usize,
