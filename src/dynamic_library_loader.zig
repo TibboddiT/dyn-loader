@@ -1000,7 +1000,7 @@ pub fn loadSystemLibC() !DynamicLibrary {
     for (candidates) |c| {
         Logger.debug("libc: trying {s}", .{c});
 
-        const path = resolvePath(c) catch |err| switch (err) {
+        const path = resolvePath(c, true) catch |err| switch (err) {
             error.LibraryNotFound => continue,
             else => |e| return e,
         };
@@ -1141,7 +1141,7 @@ fn loadDepTree(o_path: []const u8) !DynamicLibrary {
 }
 
 // TODO mimic path resolution of linux-ld better
-fn resolvePath(r_path: []const u8) ![]const u8 {
+fn resolvePath(r_path: []const u8, check_mode: bool) ![]const u8 {
     const lib_dirs = [_][]const u8{
         "/usr/local/lib/x86_64-linux-gnu",
         "/lib/x86_64-linux-gnu",
@@ -1178,7 +1178,11 @@ fn resolvePath(r_path: []const u8) ![]const u8 {
     }
 
     if (path == null) {
-        Logger.err("cannot find library {s}", .{r_path});
+        if (check_mode) {
+            Logger.debug("cannot find library {s}", .{r_path});
+        } else {
+            Logger.err("cannot find library {s}", .{r_path});
+        }
     }
 
     return path orelse error.LibraryNotFound;
@@ -1187,7 +1191,7 @@ fn resolvePath(r_path: []const u8) ![]const u8 {
 fn loadDso(o_path: []const u8) !usize {
     var scratch_buf: [1024]u8 = undefined;
 
-    const path: []const u8 = if (std.mem.findScalar(u8, o_path, '/') != null) try allocator.dupe(u8, o_path) else try resolvePath(o_path);
+    const path: []const u8 = if (std.mem.findScalar(u8, o_path, '/') != null) try allocator.dupe(u8, o_path) else try resolvePath(o_path, false);
     defer allocator.free(path);
 
     Logger.debug("loading: {s} [{s}]", .{ o_path, path });
