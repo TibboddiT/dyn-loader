@@ -1199,9 +1199,9 @@ fn loadDso(o_path: []const u8) !usize {
     const dyn_object_name = try allocator.dupe(u8, std.fs.path.basename(path));
     errdefer allocator.free(dyn_object_name);
 
-    if (std.mem.find(u8, dyn_object_name, "libc.so") != null) {
+    if (isLibcName(dyn_object_name)) {
         for (dyn_objects.values()) |*do| {
-            if (do.loaded and std.mem.find(u8, do.name, "libc.so") != null and !std.mem.eql(u8, do.path, path)) {
+            if (do.loaded and isLibcName(do.name) and !std.mem.eql(u8, do.path, path)) {
                 return error.MultipleLibcs;
             }
         }
@@ -2256,8 +2256,16 @@ fn computeTcbOffset(dyn_object: *DynObject) void {
 var current_surplus_size: usize = 0x8000;
 var normal_current_tls_area_desc: ?@TypeOf(std.os.linux.tls.area_desc) = null;
 
+fn isLibcName(name: []const u8) bool {
+    if (std.mem.startsWith(u8, name, "libc.so")) {
+        return true;
+    }
+
+    return false;
+}
+
 fn detectLibC(dyn_object: *DynObject) !void {
-    if (!std.mem.startsWith(u8, dyn_object.name, "libc.so")) {
+    if (!isLibcName(dyn_object.name)) {
         return;
     }
 
@@ -2280,6 +2288,8 @@ fn detectLibC(dyn_object: *DynObject) !void {
     if (maybe_issetugid_sym) |issetugid_sym| {
         // musl
         Logger.debug("libc detection: {s} is detected as musl, searching __libc symbol", .{dyn_object.path});
+
+        // TODO detect version
 
         std.debug.assert(dyn_objects.values()[issetugid_sym.dyn_object_idx].mapped_at == dyn_object.mapped_at);
 
@@ -2588,6 +2598,8 @@ fn detectLibC(dyn_object: *DynObject) !void {
         // glibc
         Logger.debug("libc detection: {s} is detected as glibc, using _rtld_global_ro symbol", .{dyn_object.path});
 
+        // TODO detect version
+
         const rtld_addr = rtld_global_ro_sym.address;
 
         libc_specifics = .{
@@ -2595,24 +2607,46 @@ fn detectLibC(dyn_object: *DynObject) !void {
             .write_ops = .empty,
         };
 
+        const ei_rsym = getResolvedSymbolByName(dyn_object, "__libc_early_init") catch |err| switch (err) {
+            error.UnresolvedSymbol => return error.RequiredPatchedSymbolNotFound,
+            else => |e| return e,
+        };
+
+        const ei_sym = dyn_object.syms_array.items[ei_rsym.sym_idx];
+
+        const ei_sym_addr = ei_rsym.address;
+        const ei_sym_size = ei_sym.size;
+
+        const ei_sym_content: []const u8 = @as([*]const u8, @ptrFromInt(ei_sym_addr))[0..ei_sym_size];
+        Logger.debug("libc detection: __libc_early_init content: {x}", .{ei_sym_content});
+
+        const div_offset = std.mem.find(u8, ei_sym_content, &.{ 0x49, 0xf7, 0xf0 });
+        const search_start_offset = @max(0, div_offset.? - 64);
+        const use_offset = std.mem.find(u8, ei_sym_content[search_start_offset..div_offset.?], &.{ 0x4c, 0x8b, 0x80 });
+
+        Logger.debug("libc detection: __libc_early_init div offset: 0x{x}, search offset: 0x{x}", .{ div_offset.?, search_start_offset });
+
+        const tls_size_use_offset = search_start_offset + use_offset.? + 10;
+        const tls_align_use_offset = search_start_offset + use_offset.? + 3;
+
+        const tls_size_offset = std.mem.readInt(u32, ei_sym_content[tls_size_use_offset..][0..4], .little);
+        const tls_align_offset = std.mem.readInt(u32, ei_sym_content[tls_align_use_offset..][0..4], .little);
+
+        Logger.debug("libc detection: tls_size field offset: {d}, tls_align field offset: {d}", .{ tls_size_offset, tls_align_offset });
+
         try libc_specifics.?.write_ops.appendSlice(allocator, &.{
             .{
                 .addr = rtld_addr + 104,
                 .relative_to = .zero,
                 .value = .auxv,
             },
-            // TODO the two next offsets are notoriously not stable
-            // we should search for patterns corrsponding to `__nptl_tls_static_size_for_stack`
-            // which use them both
-            // it currently kinda works, because tls align is generally either 712 or 720,
-            // so a division by 0 is avoided
             .{
-                .addr = rtld_addr + 712,
+                .addr = rtld_addr + tls_size_offset,
                 .relative_to = .zero,
                 .value = .tls_size,
             },
             .{
-                .addr = rtld_addr + 720,
+                .addr = rtld_addr + tls_align_offset,
                 .relative_to = .zero,
                 .value = .tls_align,
             },
@@ -3777,9 +3811,10 @@ fn dumpSegments(dyn_obj: *DynObject) !void {
 }
 
 fn callInitFunctions(dyn_obj: *DynObject) !void {
-    const is_libc_so = std.mem.startsWith(u8, dyn_obj.name, "libc.so");
+    const is_libc_so = isLibcName(dyn_obj.name);
 
     if (is_libc_so) {
+        // TODO use libc_specifics.call_ops
         var maybe_sym: ?ResolvedSymbol = undefined;
         maybe_sym = resolveSymbolByName("__libc_early_init") catch null;
         if (maybe_sym) |sym| {
@@ -3862,17 +3897,17 @@ fn getSubstituteAddress(sym: ResolvedSymbol, for_obj: *DynObject) ?usize {
     } else if (std.mem.eql(u8, sym.name, "posix_memalign")) {
         addr = @intFromPtr(&posixMemalignSubstitute);
     } else if (std.mem.eql(u8, sym.name, "memalign")) {
-        if (!std.mem.startsWith(u8, for_obj.name, "libc.so")) {
+        if (isLibcName(for_obj.name)) {
             Logger.warn("substitutes: {s}: dangerous unsubstituted posix alloc function [{s}] {s} at 0x{x}", .{ for_obj.name, dyn_object.name, sym.name, sym.address });
         }
         addr = @intFromPtr(&unsubstitutedTrap);
     } else if (std.mem.eql(u8, sym.name, "valloc")) {
-        if (!std.mem.startsWith(u8, for_obj.name, "libc.so")) {
+        if (isLibcName(for_obj.name)) {
             Logger.warn("substitutes: {s}: dangerous unsubstituted posix alloc function [{s}] {s} at 0x{x}", .{ for_obj.name, dyn_object.name, sym.name, sym.address });
         }
         addr = @intFromPtr(&unsubstitutedTrap);
     } else if (std.mem.eql(u8, sym.name, "palloc")) {
-        if (!std.mem.startsWith(u8, for_obj.name, "libc.so")) {
+        if (isLibcName(for_obj.name)) {
             Logger.warn("substitutes: {s}: dangerous unsubstituted posix alloc function [{s}] {s} at 0x{x}", .{ for_obj.name, dyn_object.name, sym.name, sym.address });
         }
         addr = @intFromPtr(&unsubstitutedTrap);
@@ -3904,7 +3939,7 @@ fn getSubstituteAddress(sym: ResolvedSymbol, for_obj: *DynObject) ?usize {
     } else if (std.mem.eql(u8, sym.name, "dl_iterate_phdr")) {
         addr = @intFromPtr(&dlIteratePhdrSubstitute);
     } else if (std.mem.startsWith(u8, sym.name, "dl") or std.mem.startsWith(u8, sym.name, "_dl")) {
-        if (!std.mem.startsWith(u8, for_obj.name, "libc.so")) {
+        if (isLibcName(for_obj.name)) {
             Logger.warn("substitutes: {s}: dangerous unsubstituted dl function [{s}] {s} at 0x{x}", .{ for_obj.name, dyn_object.name, sym.name, sym.address });
         }
         addr = @intFromPtr(&unsubstitutedTrap);
