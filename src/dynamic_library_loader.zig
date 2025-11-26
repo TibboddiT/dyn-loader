@@ -2368,6 +2368,37 @@ fn detectLibC(dyn_object: *DynObject) !void {
                 Logger.debug("libc detection: environ: addr: 0x{x} (0x{x})", .{ environ_loc, environ_sym.value });
                 const environ: [*c]const [*c]const u8 = @ptrCast(std.os.environ);
 
+                // TODO validate these offsets
+                //
+                // - these offsets work from musl 1.2.1, with:
+                //
+                // struct __libc {
+                //     char can_do_threads;
+                //     char threaded;
+                //     char secure;
+                //     volatile signed char need_locks;
+                //     int threads_minus_1;
+                //     size_t *auxv;
+                //     struct tls_module *tls_head;
+                //     size_t tls_size, tls_align, tls_cnt;
+                //     size_t page_size;
+                //     struct __locale_struct global_locale;
+                // };
+                //
+                // before that, it was:
+                //
+                // struct __libc {
+                //     int can_do_threads;
+                //     int threaded;
+                //     int secure;
+                //     volatile int threads_minus_1;
+                //     size_t *auxv;
+                //     struct tls_module *tls_head;
+                //     size_t tls_size, tls_align, tls_cnt;
+                //     size_t page_size;
+                //     struct __locale_struct global_locale;
+                // };
+
                 try libc_specifics.?.write_ops.appendSlice(allocator, &.{
                     .{
                         .addr = libc_addr + 8,
@@ -2607,48 +2638,11 @@ fn detectLibC(dyn_object: *DynObject) !void {
             .write_ops = .empty,
         };
 
-        const ei_rsym = getResolvedSymbolByName(dyn_object, "__libc_early_init") catch |err| switch (err) {
-            error.UnresolvedSymbol => return error.RequiredPatchedSymbolNotFound,
-            else => |e| return e,
-        };
-
-        const ei_sym = dyn_object.syms_array.items[ei_rsym.sym_idx];
-
-        const ei_sym_addr = ei_rsym.address;
-        const ei_sym_size = ei_sym.size;
-
-        const ei_sym_content: []const u8 = @as([*]const u8, @ptrFromInt(ei_sym_addr))[0..ei_sym_size];
-        Logger.debug("libc detection: __libc_early_init content: {x}", .{ei_sym_content});
-
-        const div_offset = std.mem.find(u8, ei_sym_content, &.{ 0x49, 0xf7, 0xf0 });
-        const search_start_offset = @max(0, div_offset.? - 64);
-        const use_offset = std.mem.find(u8, ei_sym_content[search_start_offset..div_offset.?], &.{ 0x4c, 0x8b, 0x80 });
-
-        Logger.debug("libc detection: __libc_early_init div offset: 0x{x}, search offset: 0x{x}", .{ div_offset.?, search_start_offset });
-
-        const tls_size_use_offset = search_start_offset + use_offset.? + 10;
-        const tls_align_use_offset = search_start_offset + use_offset.? + 3;
-
-        const tls_size_offset = std.mem.readInt(u32, ei_sym_content[tls_size_use_offset..][0..4], .little);
-        const tls_align_offset = std.mem.readInt(u32, ei_sym_content[tls_align_use_offset..][0..4], .little);
-
-        Logger.debug("libc detection: tls_size field offset: {d}, tls_align field offset: {d}", .{ tls_size_offset, tls_align_offset });
-
         try libc_specifics.?.write_ops.appendSlice(allocator, &.{
             .{
-                .addr = rtld_addr + 104,
+                .addr = rtld_addr + 104, // TODO we should check this offset stability
                 .relative_to = .zero,
                 .value = .auxv,
-            },
-            .{
-                .addr = rtld_addr + tls_size_offset,
-                .relative_to = .zero,
-                .value = .tls_size,
-            },
-            .{
-                .addr = rtld_addr + tls_align_offset,
-                .relative_to = .zero,
-                .value = .tls_align,
             },
             .{
                 .addr = 0,
@@ -2661,11 +2655,69 @@ fn detectLibC(dyn_object: *DynObject) !void {
                 .value = .tp,
             },
             .{
-                .addr = 720,
+                .addr = 720, // TODO we should check this offset stability
                 .relative_to = .tp,
                 .value = .tid,
             },
         });
+
+        const maybe_ei_rsym = getResolvedSymbolByName(dyn_object, "__libc_early_init") catch |err| switch (err) {
+            error.UnresolvedSymbol => null,
+            else => |e| return e,
+        };
+
+        if (maybe_ei_rsym) |ei_rsym| {
+            const ei_sym = dyn_object.syms_array.items[ei_rsym.sym_idx];
+
+            const ei_sym_addr = ei_rsym.address;
+            const ei_sym_size = ei_sym.size;
+
+            const ei_sym_content: []const u8 = @as([*]const u8, @ptrFromInt(ei_sym_addr))[0..ei_sym_size];
+            Logger.debug("libc detection: __libc_early_init content: {x}", .{ei_sym_content});
+
+            const div_offset = do_blk: {
+                if (std.mem.find(u8, ei_sym_content, &.{ 0x49, 0xf7, 0xf0 })) |do| break :do_blk do;
+                if (std.mem.find(u8, ei_sym_content, &.{ 0x48, 0xf7, 0xf6 })) |do| break :do_blk do;
+                return error.UnableToDetectGlibcRtldGlobalFieldOffset;
+            };
+
+            const search_start_offset = @max(div_offset, 64) - 64;
+            const use_offset = uo_blk: {
+                if (std.mem.find(u8, ei_sym_content[search_start_offset..div_offset], &.{ 0x4c, 0x8b, 0x80 })) |uo| break :uo_blk uo;
+                if (std.mem.find(u8, ei_sym_content[search_start_offset..div_offset], &.{ 0x48, 0x8b, 0xb0 })) |uo| break :uo_blk uo;
+                return error.UnableToDetectGlibcRtldGlobalFieldOffset;
+            };
+
+            Logger.debug("libc detection: __libc_early_init div offset: 0x{x}, search offset: 0x{x}", .{ div_offset, search_start_offset });
+
+            const tls_size_use_offset = search_start_offset + use_offset + 10;
+            const tls_align_use_offset = search_start_offset + use_offset + 3;
+
+            const tls_size_offset = std.mem.readInt(u32, ei_sym_content[tls_size_use_offset..][0..4], .little);
+            const tls_align_offset = std.mem.readInt(u32, ei_sym_content[tls_align_use_offset..][0..4], .little);
+
+            Logger.debug("libc detection: tls_size field offset: {d}, tls_align field offset: {d}", .{ tls_size_offset, tls_align_offset });
+
+            try libc_specifics.?.write_ops.appendSlice(allocator, &.{
+                .{
+                    .addr = rtld_addr + 104,
+                    .relative_to = .zero,
+                    .value = .auxv,
+                },
+                .{
+                    .addr = rtld_addr + tls_size_offset,
+                    .relative_to = .zero,
+                    .value = .tls_size,
+                },
+                .{
+                    .addr = rtld_addr + tls_align_offset,
+                    .relative_to = .zero,
+                    .value = .tls_align,
+                },
+            });
+        } else {
+            Logger.debug("libc detection: no __libc_early_init symbol found, maybe an old glibc version", .{});
+        }
 
         return;
     }
@@ -3829,9 +3881,25 @@ fn callInitFunctions(dyn_obj: *DynObject) !void {
     if (dyn_obj.init_addr != 0) {
         const initial_addr = dyn_obj.init_addr;
         const actual_addr = try vAddressToLoadedAddress(dyn_obj, dyn_obj.init_addr, false);
-        Logger.debug("calling init function for {s} at 0x{x} (initial address: 0x{x})", .{ dyn_obj.name, actual_addr, initial_addr });
-        const func = @as(*const fn () callconv(.c) void, @ptrFromInt(actual_addr));
-        func();
+
+        if (!is_libc_so) {
+            Logger.debug("calling init function for {s} at 0x{x} (initial address: 0x{x})", .{ dyn_obj.name, actual_addr, initial_addr });
+            const func = @as(*const fn () callconv(.c) void, @ptrFromInt(actual_addr));
+            func();
+        } else {
+            Logger.debug("libc: calling init function for {s} at 0x{x} (initial address: 0x{x})", .{ dyn_obj.name, actual_addr, initial_addr });
+
+            const argc: c_int = @intCast(std.os.argv.len);
+            const argv: [*c]const [*c]const u8 = @ptrCast(std.os.argv);
+            const env: [*c]const [*c]const u8 = @ptrCast(std.os.environ);
+
+            const func = @as(*const fn (
+                c_int,
+                [*c]const [*c]const u8,
+                [*c]const [*c]const u8,
+            ) callconv(.c) void, @ptrFromInt(actual_addr));
+            func(argc, argv, env);
+        }
     }
 
     if (dyn_obj.init_array_addr != 0 and dyn_obj.init_array_size > 0) {
