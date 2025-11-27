@@ -4024,6 +4024,8 @@ fn getSubstituteAddress(sym: ResolvedSymbol, for_obj: *DynObject) ?usize {
         addr = @intFromPtr(&pthreadDetachSubstitute);
     } else if (std.mem.eql(u8, sym.name, "pthread_join")) {
         addr = @intFromPtr(&pthreadJoinSubstitute);
+    } else if (std.mem.eql(u8, sym.name, "pthread_kill")) {
+        addr = @intFromPtr(&pthreadKillSubstitute);
     }
     // TODO substitution not really needed, but keep it in mind
     // else if (std.mem.eql(u8, sym.name, "pthread_once")) {
@@ -4701,6 +4703,7 @@ fn threadRoutine(ctx: ThreadRoutineContext) void {
         ctypeInit();
     }
 
+    // TODO thread safety
     thread_infos.putNoClobber(allocator, ctx.idx, .{ .idx = ctx.idx, .handle = new_tp, .t = ctx.thread, .ret = undefined }) catch @panic("OOM");
     var r = thread_infos.getOrPut(allocator, ctx.idx) catch @panic("OOM");
     r.value_ptr.ret = ctx.f(ctx.arg);
@@ -4756,7 +4759,7 @@ fn pthreadDetachSubstitute() callconv(.c) void {
     @panic("unimplemented pthread_detach");
 }
 
-fn pthreadJoinSubstitute(thread_handle: c_ulong, retval: **anyopaque) callconv(.c) void {
+fn pthreadJoinSubstitute(thread_handle: c_ulong, retval: ?**anyopaque) callconv(.c) c_int {
     Logger.debug("intercepted call: pthread_join(0x{x}, 0x{x})", .{ thread_handle, @intFromPtr(retval) });
 
     for (thread_infos.values()) |*entry| {
@@ -4766,15 +4769,23 @@ fn pthreadJoinSubstitute(thread_handle: c_ulong, retval: **anyopaque) callconv(.
 
         entry.t.join();
 
-        retval.* = entry.ret;
+        if (retval != null) {
+            retval.?.* = entry.ret;
+        }
 
         Logger.info("intercepted call: success: pthread_join(0x{x}, 0x{x})", .{ thread_handle, @intFromPtr(retval) });
 
-        return;
+        return 0;
     }
 
     Logger.err("pthread_join(0x{x}, 0x{x}) failed: thread not found", .{ thread_handle, @intFromPtr(retval) });
     @panic("pthread_join: thread not found");
+}
+
+fn pthreadKillSubstitute() callconv(.c) void {
+    // TODO real implementation
+    Logger.err("unimplemented: pthread_kill()", .{});
+    @panic("unimplemented pthread_kill");
 }
 
 // fn pthreadOnceSubstitute(once_control: *anyopaque, init_routine: *const fn () callconv(.c) void) callconv(.c) void {

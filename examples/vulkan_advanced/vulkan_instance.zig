@@ -4,6 +4,8 @@ const builtin = @import("builtin");
 const dll = @import("dll");
 const vk = @import("vk.zig");
 
+const VulkanProcResolver = @import("vulkan_proc_resolver.zig").VulkanProcResolver;
+
 // pub const std_options: std.Options = .{
 //     .log_scope_levels = &.{.{
 //         .scope = .dynamic_library_loader,
@@ -13,24 +15,6 @@ const vk = @import("vk.zig");
 
 pub const debug = struct {
     pub const SelfInfo = dll.CustomSelfInfo;
-};
-
-const VulkanProcResolver = struct {
-    var lib_vulkan: dll.DynamicLibrary = undefined;
-
-    fn resolver(instance: vk.Instance, procname: [*:0]const u8) vk.PfnVoidFunction {
-        _ = instance;
-
-        std.log.debug("getting vulkan symbol {s}", .{procname});
-        const maybe_sym = lib_vulkan.getSymbol(std.mem.span(procname)) catch null;
-        if (maybe_sym) |sym| {
-            std.log.debug("vulkan symbol {s}: got address 0x{x}", .{ procname, sym.addr });
-            return @ptrFromInt(sym.addr);
-        }
-
-        std.log.warn("vulkan symbol not found", .{});
-        return null;
-    }
 };
 
 pub fn main() !void {
