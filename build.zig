@@ -1,7 +1,13 @@
 const std = @import("std");
 
 pub fn build(b: *std.Build) void {
-    const target = b.standardTargetOptions(.{});
+    // const target = b.standardTargetOptions(.{});
+
+    const target: std.Build.ResolvedTarget = b.resolveTargetQuery(.{
+        .cpu_model = .baseline,
+        .os_tag = .linux,
+        .cpu_arch = .x86_64,
+    });
 
     const optimize = b.standardOptimizeOption(.{});
 

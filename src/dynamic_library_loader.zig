@@ -1233,6 +1233,7 @@ fn loadDso(o_path: []const u8) !usize {
 
     const eh: *std.elf.Elf64_Ehdr = @ptrCast(file_bytes);
     if (!std.mem.eql(u8, eh.e_ident[0..4], std.elf.MAGIC)) return error.NotAnElfFile;
+    if (eh.e_machine != std.elf.EM.X86_64) return error.UnsupportedElfMachine;
 
     Logger.debug("elf type: {s}", .{@tagName(eh.e_type)});
 
@@ -3965,18 +3966,15 @@ fn getSubstituteAddress(sym: ResolvedSymbol, for_obj: *DynObject) ?usize {
     } else if (std.mem.eql(u8, sym.name, "posix_memalign")) {
         addr = @intFromPtr(&posixMemalignSubstitute);
     } else if (std.mem.eql(u8, sym.name, "memalign")) {
-        if (isLibcName(for_obj.name)) {
-            Logger.warn("substitutes: {s}: dangerous unsubstituted posix alloc function [{s}] {s} at 0x{x}", .{ for_obj.name, dyn_object.name, sym.name, sym.address });
-        }
-        addr = @intFromPtr(&unsubstitutedTrap);
+        addr = @intFromPtr(&alignedAllocSubstitute);
     } else if (std.mem.eql(u8, sym.name, "valloc")) {
         if (isLibcName(for_obj.name)) {
-            Logger.warn("substitutes: {s}: dangerous unsubstituted posix alloc function [{s}] {s} at 0x{x}", .{ for_obj.name, dyn_object.name, sym.name, sym.address });
+            Logger.warn("substitutes: {s}: dangerous unsubstituted valloc function [{s}] {s} at 0x{x}", .{ for_obj.name, dyn_object.name, sym.name, sym.address });
         }
         addr = @intFromPtr(&unsubstitutedTrap);
     } else if (std.mem.eql(u8, sym.name, "palloc")) {
         if (isLibcName(for_obj.name)) {
-            Logger.warn("substitutes: {s}: dangerous unsubstituted posix alloc function [{s}] {s} at 0x{x}", .{ for_obj.name, dyn_object.name, sym.name, sym.address });
+            Logger.warn("substitutes: {s}: dangerous unsubstituted palloc function [{s}] {s} at 0x{x}", .{ for_obj.name, dyn_object.name, sym.name, sym.address });
         }
         addr = @intFromPtr(&unsubstitutedTrap);
     }
@@ -4075,6 +4073,7 @@ var extra_strs: std.ArrayList([]const u8) = .empty;
 var extra_strs_z: std.ArrayList([:0]const u8) = .empty;
 var extra_phdrs: std.ArrayList(*std.posix.dl_phdr_info) = .empty;
 var extra_link_maps: std.ArrayList(*DlLinkMap) = .empty;
+var thread_mutex: std.Thread.Mutex = .{};
 var extra_threads: std.ArrayList(*std.Thread) = .empty;
 var last_dl_error: ?[:0]const u8 = null;
 var extra_allocations: std.AutoArrayHashMapUnmanaged(usize, ExtraAlloc) = .empty;
@@ -4703,10 +4702,16 @@ fn threadRoutine(ctx: ThreadRoutineContext) void {
         ctypeInit();
     }
 
-    // TODO thread safety
+    thread_mutex.lock();
     thread_infos.putNoClobber(allocator, ctx.idx, .{ .idx = ctx.idx, .handle = new_tp, .t = ctx.thread, .ret = undefined }) catch @panic("OOM");
+    thread_mutex.unlock();
+
+    const ret = ctx.f(ctx.arg);
+
+    thread_mutex.lock();
     var r = thread_infos.getOrPut(allocator, ctx.idx) catch @panic("OOM");
-    r.value_ptr.ret = ctx.f(ctx.arg);
+    r.value_ptr.ret = ret;
+    thread_mutex.unlock();
 
     Logger.info("thread {d} completed: 0x{x}", .{ ctx.idx, @intFromPtr(r.value_ptr.ret) });
 }
@@ -4725,7 +4730,9 @@ fn pthreadCreateSubstitute(newthread: *c_ulong, attr: ?*const anyopaque, start_r
     tls_offset = bytes + std.os.linux.tls.area_desc.abi_tcb.offset;
 
     const thread = allocator.create(std.Thread) catch @panic("OOM");
+    thread_mutex.lock();
     extra_threads.append(allocator, thread) catch @panic("OOM");
+    thread_mutex.unlock();
 
     const idx = @atomicRmw(usize, &currentIdx, .Add, 1, .seq_cst);
     thread.* = std.Thread.spawn(.{}, threadRoutine, .{ThreadRoutineContext{ .idx = idx, .thread = thread, .f = start_routine, .arg = arg }}) catch |err| {
@@ -4762,10 +4769,16 @@ fn pthreadDetachSubstitute() callconv(.c) void {
 fn pthreadJoinSubstitute(thread_handle: c_ulong, retval: ?**anyopaque) callconv(.c) c_int {
     Logger.debug("intercepted call: pthread_join(0x{x}, 0x{x})", .{ thread_handle, @intFromPtr(retval) });
 
+    thread_mutex.lock();
+
     for (thread_infos.values()) |*entry| {
         if (entry.handle != thread_handle) {
             continue;
         }
+
+        thread_mutex.unlock();
+
+        // TODO bad things can happen here...
 
         entry.t.join();
 
@@ -4777,6 +4790,8 @@ fn pthreadJoinSubstitute(thread_handle: c_ulong, retval: ?**anyopaque) callconv(
 
         return 0;
     }
+
+    thread_mutex.unlock();
 
     Logger.err("pthread_join(0x{x}, 0x{x}) failed: thread not found", .{ thread_handle, @intFromPtr(retval) });
     @panic("pthread_join: thread not found");

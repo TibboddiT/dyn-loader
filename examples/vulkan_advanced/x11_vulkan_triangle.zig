@@ -81,8 +81,6 @@ pub fn main() !void {
 
     var extent = vk.Extent2D{ .width = 800, .height = 600 };
 
-    std.log.info("creating an x11 window...", .{});
-
     const x11_display = xOpenDisplay(null) orelse return error.UnableToCreateDisplay;
     defer _ = xCloseDisplay(x11_display);
 
@@ -90,7 +88,7 @@ pub fn main() !void {
     const x11_root = xRootWindow(x11_display, x11_screen);
     const x11_window = xCreateSimpleWindow(x11_display, x11_root, 100, 100, extent.width, extent.height, 1, xBlackPixel(x11_display, x11_screen), xWhitePixel(x11_display, x11_screen));
 
-    _ = xStoreName(x11_display, x11_window, "x11_window.zig");
+    _ = xStoreName(x11_display, x11_window, "x11_vulkan_triangle.zig");
 
     _ = xSelectInput(x11_display, x11_window, Xlib.StructureNotifyMask | Xlib.ExposureMask | Xlib.KeyPressMask);
     const wmDeleteMessage = xInternAtom(x11_display, "WM_DELETE_WINDOW", Xlib.False);
@@ -99,12 +97,10 @@ pub fn main() !void {
     _ = xMapWindow(x11_display, x11_window);
     _ = xFlush(x11_display);
 
-    std.log.info("x11 window created: {d}", .{x11_window});
-
     const gc = try GraphicsContext.init(allocator, app_name, x11_display, x11_window);
     defer gc.deinit();
 
-    std.log.debug("Using device: {s}", .{gc.deviceName()});
+    std.log.info("Using device: {s}", .{gc.deviceName()});
 
     var swapchain = try Swapchain.init(&gc, allocator, extent);
     defer swapchain.deinit();
@@ -216,7 +212,7 @@ pub fn main() !void {
         while (xPending(x11_display) != 0) {
             var ev: Xlib.XEvent = undefined;
             _ = xNextEvent(x11_display, &ev);
-            std.log.info("x11 event: {d}", .{ev.type});
+            // std.log.info("x11 event: {d}", .{ev.type});
 
             if (ev.type == Xlib.DestroyNotify) {
                 std.log.info("exiting due to DestroyNotify", .{});
@@ -225,7 +221,7 @@ pub fn main() !void {
 
             if (ev.type == Xlib.ClientMessage) {
                 if (ev.xclient.data.l[0] == wmDeleteMessage) {
-                    std.log.info("exiting due to WM message", .{});
+                    std.log.info("exiting...", .{});
                     break :main_loop;
                 }
             }
