@@ -166,7 +166,7 @@ pub fn main() !void {
             while (xPending(x11_display) != 0) {
                 var ev: Xlib.XEvent = undefined;
                 _ = xNextEvent(x11_display, &ev);
-                std.log.info("x11 event: {d}", .{ev.type});
+                // std.log.info("x11 event: {d}", .{ev.type});
 
                 if (ev.type == Xlib.DestroyNotify) {
                     std.log.info("exiting due to DestroyNotify", .{});
@@ -175,11 +175,13 @@ pub fn main() !void {
 
                 if (ev.type == Xlib.ClientMessage) {
                     if (ev.xclient.data.l[0] == wmDeleteMessage) {
-                        std.log.info("exiting due to WM message", .{});
+                        std.log.info("exiting...", .{});
                         break :main_loop;
                     }
                 }
             }
+
+            continue;
         }
 
         const cmdbuf = cmdbufs[swapchain.image_index];
