@@ -72,9 +72,12 @@ zig build run-vulkan_version
 zig build run-vulkan_version_musl
 zig build run-x11_window
 zig build run-x11_egl
+zig build run-x11_vulkan_triangle
 ```
 
-The following examples will only work on glibc based systems:
+The vulkan examples might need validation layer. The EGL one will need `libEGL.so`.
+
+The following examples will only work on glibc based systems (because this lib is compiled against glibc):
 
 ```
 zig build run-raylib
