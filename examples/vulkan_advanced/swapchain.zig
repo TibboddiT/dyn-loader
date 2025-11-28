@@ -125,6 +125,11 @@ pub const Swapchain = struct {
         const gc = self.gc;
         const allocator = self.allocator;
         const old_handle = self.handle;
+
+        try self.gc.dev.queueWaitIdle(self.gc.graphics_queue.handle);
+        try self.gc.dev.queueWaitIdle(self.gc.present_queue.handle);
+        try self.waitForAllFences();
+
         self.deinitExceptSwapchain();
         // set current handle to NULL_HANDLE to signal that the current swapchain does no longer need to be
         // de-initialized if we fail to recreate it.

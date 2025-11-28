@@ -7,6 +7,17 @@ const GraphicsContext = @import("graphics_context.zig").GraphicsContext;
 const Swapchain = @import("swapchain.zig").Swapchain;
 const Allocator = std.mem.Allocator;
 
+// pub const std_options: std.Options = .{
+//     .log_scope_levels = &.{.{
+//         .scope = .dynamic_library_loader,
+//         .level = .debug,
+//     }},
+// };
+
+pub const debug = struct {
+    pub const SelfInfo = dll.CustomSelfInfo;
+};
+
 const vert_spv align(@alignOf(u32)) = @embedFile("vert.spv").*;
 const frag_spv align(@alignOf(u32)) = @embedFile("frag.spv").*;
 
