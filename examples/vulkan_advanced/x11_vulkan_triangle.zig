@@ -56,9 +56,11 @@ const vertices = [_]Vertex{
 };
 
 pub fn main() !void {
-    var gpa: std.heap.DebugAllocator(.{}) = .init;
-    const allocator = gpa.allocator();
-    defer if (gpa.deinit() != .ok) @panic("memory check failed");
+    // var gpa: std.heap.DebugAllocator(.{}) = .init;
+    // const allocator = gpa.allocator();
+    // defer if (gpa.deinit() != .ok) @panic("memory check failed");
+
+    const allocator = std.heap.smp_allocator;
 
     try dll.init(.{ .allocator = allocator });
     defer dll.deinit();
