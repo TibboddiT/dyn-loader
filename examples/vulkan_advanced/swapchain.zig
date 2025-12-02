@@ -128,6 +128,7 @@ pub const Swapchain = struct {
 
         try self.gc.dev.queueWaitIdle(self.gc.graphics_queue.handle);
         try self.gc.dev.queueWaitIdle(self.gc.present_queue.handle);
+        try self.gc.dev.deviceWaitIdle();
         try self.waitForAllFences();
 
         self.deinitExceptSwapchain();
