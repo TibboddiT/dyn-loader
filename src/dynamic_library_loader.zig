@@ -811,8 +811,8 @@ pub fn init(options: InitOptions) !void {
     Logger.level = options.log_level;
 
     alloc_arena = .init(allocator);
-    alloc_allocator = alloc_arena.allocator();
-    // alloc_allocator = allocator;
+    // alloc_allocator = alloc_arena.allocator();
+    alloc_allocator = allocator;
 
     // TODO
     // - pre restructure TLS early
@@ -902,6 +902,7 @@ pub fn deinit() void {
         var not_freed: usize = 0;
         for (extra_allocations.values()) |ea| {
             not_freed += ea.r_size;
+            alloc_allocator.free(@as([*]u8, @ptrFromInt(ea.addr))[0..ea.size]);
         }
 
         Logger.info("{B:.2} of memory allocated ({d} allocations) from libraries not freed", .{ not_freed, extra_allocations.count() });
