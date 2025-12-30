@@ -19,15 +19,19 @@ pub fn main() !void {
     const allocator = gpa.allocator();
     defer if (gpa.deinit() != .ok) @panic("memory check failed");
 
-    try dll.init(.{ .allocator = allocator });
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    try dll.init(.{ .allocator = allocator, .io = io });
     defer dll.deinit();
 
     var cwd_buf: [1024]u8 = undefined;
-    const cwd = try std.fs.selfExeDirPath(&cwd_buf);
+    const cwd_idx = try std.process.executableDirPath(io, &cwd_buf);
 
     var lib_path: [1024]u8 = undefined;
 
-    const lib_raylib_path = try std.fmt.bufPrint(&lib_path, "{s}/{s}", .{ cwd, "resources/raylib/libraylib.so.5.5.0" });
+    const lib_raylib_path = try std.fmt.bufPrint(&lib_path, "{s}/{s}", .{ cwd_buf[0..cwd_idx], "resources/raylib/libraylib.so.5.5.0" });
 
     std.log.info("loading '{s}'...", .{lib_raylib_path});
 

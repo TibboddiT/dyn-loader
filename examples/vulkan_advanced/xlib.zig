@@ -6,6 +6,8 @@ pub const Xlib = struct {
     pub const False: c_int = 0;
     pub const True: c_int = 1;
 
+    pub const None: c_ulong = 0;
+
     pub const Display = opaque {};
     pub const Window = XID;
     pub const Status = c_int;
@@ -14,6 +16,10 @@ pub const Xlib = struct {
     pub const Colormap = XID;
     pub const Atom = c_ulong;
     pub const Drawable = XID;
+    pub const Pixmap = XID;
+    pub const Cursor = XID;
+
+    pub const CWBackPixmap: c_ulong = (1 << 0);
 
     pub const NoEventMask: c_ulong = 0;
     pub const KeyPressMask: c_ulong = (1 << 0);
@@ -521,6 +527,24 @@ pub const Xlib = struct {
         screen: *Screen,
     };
 
+    pub const XSetWindowAttributes = extern struct {
+        background_pixmap: Pixmap = 0,
+        background_pixel: c_ulong = 0,
+        border_pixmap: Pixmap = 0,
+        border_pixel: c_ulong = 0,
+        bit_gravity: c_int = 0,
+        win_gravity: c_int = 0,
+        backing_store: c_int = 0,
+        backing_planes: c_ulong = 0,
+        backing_pixel: c_ulong = 0,
+        save_under: c_int = 0,
+        event_mask: c_long = 0,
+        do_not_propagate_mask: c_long = 0,
+        override_redirect: c_int = 0,
+        colormap: Colormap = 0,
+        cursor: Cursor = 0,
+    };
+
     pub const XOpenDisplay = fn (display_name: [*c]const u8) callconv(.c) ?*Display;
     pub const XDefaultScreen = fn (display: ?*Display) callconv(.c) c_int;
     pub const XRootWindow = fn (display: ?*Display, screen: c_int) callconv(.c) Window;
@@ -532,6 +556,7 @@ pub const Xlib = struct {
     pub const XBlackPixel = fn (display: ?*Display, screen: c_int) callconv(.c) c_ulong;
     pub const XWhitePixel = fn (display: ?*Display, screen: c_int) callconv(.c) c_ulong;
     pub const XGetWindowAttributes = fn (display: ?*Display, window: Window, attributes: *XWindowAttributes) callconv(.c) Status;
+    pub const XChangeWindowAttributes = fn (display: ?*Display, window: Window, value_mask: c_ulong, attrs: *XSetWindowAttributes) callconv(.c) Status;
     pub const XPending = fn (display: ?*Display) callconv(.c) c_int;
     pub const XNextEvent = fn (display: ?*Display, event: *XEvent) callconv(.c) c_int;
     pub const XSelectInput = fn (display: ?*Display, window: Window, event_mask: c_long) callconv(.c) c_int;

@@ -50,13 +50,12 @@ pub const CustomSelfInfo = struct {
     }
 
     pub fn getSymbol(si: *SelfInfo, gpa: std.mem.Allocator, io: std.Io, address: usize) std.debug.SelfInfoError!std.debug.Symbol {
-        _ = io;
         const module = try si.findModule(gpa, address, .exclusive);
         defer si.rwlock.unlock();
 
         const vaddr = address - module.load_offset;
 
-        const loaded_elf = try module.getLoadedElf(gpa);
+        const loaded_elf = try module.getLoadedElf(gpa, io);
         if (loaded_elf.file.dwarf) |*dwarf| {
             if (!loaded_elf.scanned_dwarf) {
                 dwarf.open(gpa, builtin.target.cpu.arch.endian()) catch |err| switch (err) {
@@ -100,6 +99,11 @@ pub const CustomSelfInfo = struct {
         defer si.rwlock.unlockShared();
         if (module.name.len == 0) return error.MissingDebugInfo;
         return module.name;
+    }
+    pub fn getModuleSlide(si: *SelfInfo, gpa: std.mem.Allocator, address: usize) std.debug.SelfInfoError!usize {
+        const module = try si.findModule(gpa, address, .shared);
+        defer si.rwlock.unlockShared();
+        return module.load_offset;
     }
 
     pub const can_unwind: bool = s: {
@@ -196,7 +200,7 @@ pub const CustomSelfInfo = struct {
         }
     }
     pub const UnwindContext = std.debug.Dwarf.SelfUnwinder;
-    pub fn unwindFrame(si: *SelfInfo, gpa: std.mem.Allocator, context: *UnwindContext) std.debug.SelfInfoError!usize {
+    pub fn unwindFrame(si: *SelfInfo, gpa: std.mem.Allocator, io: std.Io, context: *UnwindContext) std.debug.SelfInfoError!usize {
         comptime std.debug.assert(can_unwind);
 
         {
@@ -217,7 +221,7 @@ pub const CustomSelfInfo = struct {
             @memset(si.unwind_cache.?, .empty);
         }
 
-        const unwind_sections = try module.getUnwindSections(gpa);
+        const unwind_sections = try module.getUnwindSections(gpa, io);
         for (unwind_sections) |*unwind| {
             if (context.computeRules(gpa, unwind, module.load_offset, null)) |entry| {
                 entry.populate(si.unwind_cache.?);
@@ -277,12 +281,12 @@ pub const CustomSelfInfo = struct {
         };
 
         /// Assumes we already hold an exclusive lock.
-        fn getUnwindSections(mod: *Module, gpa: std.mem.Allocator) std.debug.SelfInfoError![]std.debug.Dwarf.Unwind {
-            if (mod.unwind == null) mod.unwind = loadUnwindSections(mod, gpa);
+        fn getUnwindSections(mod: *Module, gpa: std.mem.Allocator, io: std.Io) std.debug.SelfInfoError![]std.debug.Dwarf.Unwind {
+            if (mod.unwind == null) mod.unwind = loadUnwindSections(mod, gpa, io);
             const us = &(mod.unwind.? catch |err| return err);
             return us.buf[0..us.len];
         }
-        fn loadUnwindSections(mod: *Module, gpa: std.mem.Allocator) std.debug.SelfInfoError!UnwindSections {
+        fn loadUnwindSections(mod: *Module, gpa: std.mem.Allocator, io: std.Io) std.debug.SelfInfoError!UnwindSections {
             var us: UnwindSections = .{
                 .buf = undefined,
                 .len = 0,
@@ -300,7 +304,7 @@ pub const CustomSelfInfo = struct {
             } else {
                 // There is no `.eh_frame_hdr` section. There may still be an `.eh_frame` or `.debug_frame`
                 // section, but we'll have to load the binary to get at it.
-                const loaded = try mod.getLoadedElf(gpa);
+                const loaded = try mod.getLoadedElf(gpa, io);
                 // If both are present, we can't just pick one -- the info could be split between them.
                 // `.debug_frame` is likely to be the more complete section, so we'll prioritize that one.
                 if (loaded.file.debug_frame) |*debug_frame| {
@@ -335,24 +339,24 @@ pub const CustomSelfInfo = struct {
         }
 
         /// Assumes we already hold an exclusive lock.
-        fn getLoadedElf(mod: *Module, gpa: std.mem.Allocator) std.debug.SelfInfoError!*LoadedElf {
-            if (mod.loaded_elf == null) mod.loaded_elf = loadElf(mod, gpa);
+        fn getLoadedElf(mod: *Module, gpa: std.mem.Allocator, io: std.Io) std.debug.SelfInfoError!*LoadedElf {
+            if (mod.loaded_elf == null) mod.loaded_elf = loadElf(mod, gpa, io);
             return if (mod.loaded_elf.?) |*elf| elf else |err| err;
         }
-        fn loadElf(mod: *Module, gpa: std.mem.Allocator) std.debug.SelfInfoError!LoadedElf {
+        fn loadElf(mod: *Module, gpa: std.mem.Allocator, io: std.Io) std.debug.SelfInfoError!LoadedElf {
             const load_result = if (mod.name.len > 0) res: {
-                var file = std.fs.cwd().openFile(mod.name, .{}) catch return error.MissingDebugInfo;
-                defer file.close();
-                break :res std.debug.ElfFile.load(gpa, file, mod.build_id, &.native(mod.name));
+                var file = std.Io.Dir.cwd().openFile(io, mod.name, .{}) catch return error.MissingDebugInfo;
+                defer file.close(io);
+                break :res std.debug.ElfFile.load(gpa, io, file, mod.build_id, &.native(mod.name));
             } else res: {
-                const path = std.fs.selfExePathAlloc(gpa) catch |err| switch (err) {
+                const path = std.process.executablePathAlloc(io, gpa) catch |err| switch (err) {
                     error.OutOfMemory => |e| return e,
                     else => return error.ReadFailed,
                 };
                 defer gpa.free(path);
-                var file = std.fs.cwd().openFile(path, .{}) catch return error.MissingDebugInfo;
-                defer file.close();
-                break :res std.debug.ElfFile.load(gpa, file, mod.build_id, &.native(path));
+                var file = std.Io.Dir.cwd().openFile(io, path, .{}) catch return error.MissingDebugInfo;
+                defer file.close(io);
+                break :res std.debug.ElfFile.load(gpa, io, file, mod.build_id, &.native(path));
             };
 
             var elf_file = load_result catch |err| switch (err) {
@@ -757,8 +761,9 @@ export fn _dl_debug_state() callconv(.c) void {
 }
 
 // TODO global state
-var initialized: bool = false;
-var allocator: std.mem.Allocator = undefined;
+var dll_initialized: bool = false;
+var dll_allocator: std.mem.Allocator = undefined;
+var dll_io: std.Io = undefined;
 
 const LibcSpecifics = struct {
     const WriteOps = struct {
@@ -798,21 +803,23 @@ var libc_specifics: ?LibcSpecifics = null;
 
 const InitOptions = struct {
     allocator: std.mem.Allocator,
+    io: std.Io,
     log_level: Logger.Level = .err,
 };
 
 // TODO thread safety
 pub fn init(options: InitOptions) !void {
-    if (initialized) {
+    if (dll_initialized) {
         return error.AlreadyInitialized;
     }
 
-    allocator = options.allocator;
+    dll_allocator = options.allocator;
+    dll_io = options.io;
     Logger.level = options.log_level;
 
-    alloc_arena = .init(allocator);
+    dll_alloc_arena = .init(dll_allocator);
     // alloc_allocator = alloc_arena.allocator();
-    alloc_allocator = allocator;
+    dll_alloc_allocator = dll_allocator;
 
     // TODO
     // - pre restructure TLS early
@@ -820,97 +827,97 @@ pub fn init(options: InitOptions) !void {
     // - assert statically linked
     // - assert only one thread
 
-    initialized = true;
+    dll_initialized = true;
 }
 
 // TODO thread safety
 pub fn deinit() void {
     for (dyn_objects.values()) |*dyn_object| {
         for (dyn_object.syms_array.items) |*sym| {
-            allocator.free(sym.name);
-            allocator.free(sym.version);
+            dll_allocator.free(sym.name);
+            dll_allocator.free(sym.version);
         }
-        dyn_object.syms_array.deinit(allocator);
+        dyn_object.syms_array.deinit(dll_allocator);
 
         for (dyn_object.syms.values()) |*v| {
-            v.deinit(allocator);
+            v.deinit(dll_allocator);
         }
-        dyn_object.syms.deinit(allocator);
+        dyn_object.syms.deinit(dll_allocator);
 
-        dyn_object.relocs.deinit(allocator);
-        dyn_object.dependencies.deinit(allocator);
-        dyn_object.deps_breadth_first.deinit(allocator);
-        dyn_object.segments.deinit(allocator);
+        dyn_object.relocs.deinit(dll_allocator);
+        dyn_object.dependencies.deinit(dll_allocator);
+        dyn_object.deps_breadth_first.deinit(dll_allocator);
+        dyn_object.segments.deinit(dll_allocator);
 
         if (!dyn_object.name_is_key) {
-            allocator.free(dyn_object.name);
-            allocator.free(dyn_object.path);
+            dll_allocator.free(dyn_object.name);
+            dll_allocator.free(dyn_object.path);
         }
     }
 
     for (dyn_objects.keys()) |k| {
-        allocator.free(k);
+        dll_allocator.free(k);
     }
 
-    dyn_objects.clearAndFree(allocator);
-    dyn_objects_sorted_indices.deinit(allocator);
+    dyn_objects.clearAndFree(dll_allocator);
+    dyn_objects_sorted_indices.deinit(dll_allocator);
 
-    ifunc_resolved_addrs.clearAndFree(allocator);
-    irel_resolved_targets.clearAndFree(allocator);
+    ifunc_resolved_addrs.clearAndFree(dll_allocator);
+    irel_resolved_targets.clearAndFree(dll_allocator);
 
     const current_tls_area_desc = std.os.linux.tls.area_desc;
     if (current_tls_area_desc.gdt_entry_number != @as(usize, @bitCast(@as(isize, -1)))) {
-        allocator.free(current_tls_area_desc.block.init);
+        dll_allocator.free(current_tls_area_desc.block.init);
     }
 
     for (extra_strs.items) |e| {
-        allocator.free(e);
+        dll_allocator.free(e);
     }
-    extra_strs.deinit(allocator);
+    extra_strs.deinit(dll_allocator);
 
     for (extra_strs_z.items) |e| {
-        allocator.free(e);
+        dll_allocator.free(e);
     }
-    extra_strs_z.deinit(allocator);
+    extra_strs_z.deinit(dll_allocator);
 
     for (extra_phdrs.items) |e| {
-        allocator.destroy(e);
+        dll_allocator.destroy(e);
     }
-    extra_phdrs.deinit(allocator);
+    extra_phdrs.deinit(dll_allocator);
 
     for (extra_link_maps.items) |e| {
-        allocator.destroy(e);
+        dll_allocator.destroy(e);
     }
-    extra_link_maps.deinit(allocator);
+    extra_link_maps.deinit(dll_allocator);
 
     for (extra_threads.items) |e| {
-        allocator.destroy(e);
+        dll_allocator.destroy(e);
     }
-    extra_threads.deinit(allocator);
+    extra_threads.deinit(dll_allocator);
 
     if (last_dl_error) |dle| {
-        allocator.free(dle);
+        dll_allocator.free(dle);
     }
 
-    thread_infos.clearAndFree(allocator);
+    thread_infos.clearAndFree(dll_allocator);
 
     if (libc_specifics != null) {
-        libc_specifics.?.write_ops.deinit(allocator);
+        libc_specifics.?.write_ops.deinit(dll_allocator);
     }
 
     if (extra_allocations.count() > 0) {
         var not_freed: usize = 0;
         for (extra_allocations.values()) |ea| {
             not_freed += ea.r_size;
-            alloc_allocator.free(@as([*]u8, @ptrFromInt(ea.addr))[0..ea.size]);
+            dll_alloc_allocator.free(@as([*]u8, @ptrFromInt(ea.addr))[0..ea.size]);
         }
 
         Logger.info("{B:.2} of memory allocated ({d} allocations) from libraries not freed", .{ not_freed, extra_allocations.count() });
     }
-    extra_allocations.clearAndFree(allocator);
-    alloc_arena.deinit();
+    extra_allocations.clearAndFree(dll_allocator);
+    dll_alloc_arena.deinit();
 
-    CustomSelfInfo.clearExtraElfs(allocator);
+    CustomSelfInfo.clearExtraElfs(dll_allocator);
 
     // TODO
     // - unmap unnecessary maps
@@ -996,8 +1003,6 @@ pub fn loadSystemLibC() !DynamicLibrary {
 
     Logger.debug("libc: searching system libc", .{});
 
-    var buf: [4]u8 = undefined;
-
     for (candidates) |c| {
         Logger.debug("libc: trying {s}", .{c});
 
@@ -1005,17 +1010,18 @@ pub fn loadSystemLibC() !DynamicLibrary {
             error.LibraryNotFound => continue,
             else => |e| return e,
         };
-        defer allocator.free(path);
+        defer dll_allocator.free(path);
 
-        const f = try std.fs.openFileAbsolute(path, .{ .mode = .read_only });
-        defer f.close();
+        const f = try std.Io.Dir.openFileAbsolute(dll_io, path, .{ .mode = .read_only });
+        defer f.close(dll_io);
 
-        const stat = try f.stat();
+        const stat = try f.stat(dll_io);
         const size = std.math.cast(usize, stat.size) orelse return error.FileTooBig;
 
         if (size < 4) continue;
 
-        const read = try f.read(&buf);
+        var buf: [4]u8 = undefined;
+        const read = try f.readPositional(dll_io, &.{&buf}, 0);
 
         if (read != 4 or !std.mem.eql(u8, &buf, std.elf.MAGIC)) continue;
 
@@ -1028,7 +1034,7 @@ pub fn loadSystemLibC() !DynamicLibrary {
 // TODO thread safety
 // TODO handle errors gracefully
 pub fn load(f_path: []const u8) !DynamicLibrary {
-    if (!initialized) {
+    if (!dll_initialized) {
         return error.Unitialized;
     }
 
@@ -1075,7 +1081,7 @@ pub fn load(f_path: []const u8) !DynamicLibrary {
 
         dyn_obj.loaded = true;
 
-        const dl_phdr_info = try allocator.create(std.posix.dl_phdr_info);
+        const dl_phdr_info = try dll_allocator.create(std.posix.dl_phdr_info);
 
         dl_phdr_info.* = .{
             .addr = dyn_obj.loaded_at.?,
@@ -1086,7 +1092,7 @@ pub fn load(f_path: []const u8) !DynamicLibrary {
 
         Logger.debug("unwinding: registering {s} at 0x{x}", .{ dyn_obj.name, dyn_obj.loaded_at.? });
 
-        try CustomSelfInfo.addExtraElf(allocator, dl_phdr_info);
+        try CustomSelfInfo.addExtraElf(dll_allocator, dl_phdr_info);
 
         try callInitFunctions(dyn_obj);
     }
@@ -1169,9 +1175,9 @@ fn resolvePath(r_path: []const u8, check_mode: bool) ![]const u8 {
             r_path,
         });
 
-        std.fs.accessAbsolute(a_path, .{ .read = true }) catch continue;
+        std.Io.Dir.accessAbsolute(dll_io, a_path, .{ .read = true }) catch continue;
 
-        path = try std.fmt.allocPrint(allocator, "{s}", .{a_path});
+        path = try std.fmt.allocPrint(dll_allocator, "{s}", .{a_path});
 
         Logger.debug("found {s}: {s}", .{ r_path, path.? });
 
@@ -1192,13 +1198,13 @@ fn resolvePath(r_path: []const u8, check_mode: bool) ![]const u8 {
 fn loadDso(o_path: []const u8) !usize {
     var scratch_buf: [1024]u8 = undefined;
 
-    const path: []const u8 = if (std.mem.findScalar(u8, o_path, '/') != null) try allocator.dupe(u8, o_path) else try resolvePath(o_path, false);
-    defer allocator.free(path);
+    const path: []const u8 = if (std.mem.findScalar(u8, o_path, '/') != null) try dll_allocator.dupe(u8, o_path) else try resolvePath(o_path, false);
+    defer dll_allocator.free(path);
 
     Logger.debug("loading: {s} [{s}]", .{ o_path, path });
 
-    const dyn_object_name = try allocator.dupe(u8, std.fs.path.basename(path));
-    errdefer allocator.free(dyn_object_name);
+    const dyn_object_name = try dll_allocator.dupe(u8, std.fs.path.basename(path));
+    errdefer dll_allocator.free(dyn_object_name);
 
     if (isLibcName(dyn_object_name)) {
         for (dyn_objects.values()) |*do| {
@@ -1208,8 +1214,8 @@ fn loadDso(o_path: []const u8) !usize {
         }
     }
 
-    const f = try std.fs.openFileAbsolute(path, .{ .mode = .read_only });
-    const stat = try f.stat();
+    const f = try std.Io.Dir.openFileAbsolute(dll_io, path, .{ .mode = .read_only });
+    const stat = try f.stat(dll_io);
     const size = std.math.cast(usize, stat.size) orelse return error.FileTooBig;
 
     const file_bytes = try std.posix.mmap(
@@ -1225,10 +1231,10 @@ fn loadDso(o_path: []const u8) !usize {
     const file_addr = @intFromPtr(file_bytes.ptr);
 
     if (!dyn_objects.contains(dyn_object_name)) {
-        const key = try std.fmt.allocPrint(allocator, "{s}", .{dyn_object_name});
-        try dyn_objects.putNoClobber(allocator, key, .init(key));
+        const key = try std.fmt.allocPrint(dll_allocator, "{s}", .{dyn_object_name});
+        try dyn_objects.putNoClobber(dll_allocator, key, .init(key));
     } else if (dyn_objects.get(dyn_object_name).?.loaded) {
-        defer allocator.free(dyn_object_name);
+        defer dll_allocator.free(dyn_object_name);
         return dyn_objects.getIndex(dyn_object_name).?;
     }
 
@@ -1262,9 +1268,9 @@ fn loadDso(o_path: []const u8) !usize {
     var dependencies: std.ArrayList(usize) = .empty;
     var relocs: RelocList = .empty;
     errdefer {
-        relocs.deinit(allocator);
-        dependencies.deinit(allocator);
-        segments.deinit(allocator);
+        relocs.deinit(dll_allocator);
+        dependencies.deinit(dll_allocator);
+        segments.deinit(dll_allocator);
     }
 
     Logger.debug("sections headers:", .{});
@@ -1392,15 +1398,15 @@ fn loadDso(o_path: []const u8) !usize {
                     const libNameLen = std.mem.len(libName);
 
                     if (!dyn_objects.contains(libName[0..libNameLen])) {
-                        const key = try std.fmt.allocPrint(allocator, "{s}", .{libName[0..libNameLen]});
-                        try dyn_objects.putNoClobber(allocator, key, .init(key));
+                        const key = try std.fmt.allocPrint(dll_allocator, "{s}", .{libName[0..libNameLen]});
+                        try dyn_objects.putNoClobber(dll_allocator, key, .init(key));
                         Logger.debug("dep tree: {s} loading deferred", .{dyn_object_name});
                         has_unloaded_deps = true;
                     } else {
                         const dep = dyn_objects.get(libName[0..libNameLen]).?;
                         if (dep.mapped_at != 0) {
                             Logger.debug("dep tree: registering dependency: {s} => {s}", .{ dyn_object_name, libName });
-                            try dependencies.append(allocator, dyn_objects.getIndex(libName[0..libNameLen]).?);
+                            try dependencies.append(dll_allocator, dyn_objects.getIndex(libName[0..libNameLen]).?);
                         } else {
                             Logger.debug("dep tree: {s} loading deferred", .{dyn_object_name});
                             has_unloaded_deps = true;
@@ -1410,8 +1416,8 @@ fn loadDso(o_path: []const u8) !usize {
             }
 
             if (has_unloaded_deps) {
-                dependencies.deinit(allocator);
-                defer allocator.free(dyn_object_name);
+                dependencies.deinit(dll_allocator);
+                defer dll_allocator.free(dyn_object_name);
                 return dyn_objects.getIndex(dyn_object_name).?;
             }
 
@@ -1423,15 +1429,15 @@ fn loadDso(o_path: []const u8) !usize {
     var syms: DynSymList = .empty;
     errdefer {
         for (syms_array.items) |*sym| {
-            allocator.free(sym.name);
-            allocator.free(sym.version);
+            dll_allocator.free(sym.name);
+            dll_allocator.free(sym.version);
         }
-        syms_array.deinit(allocator);
+        syms_array.deinit(dll_allocator);
 
         for (syms.values()) |*v| {
-            v.deinit(allocator);
+            v.deinit(dll_allocator);
         }
-        syms.deinit(allocator);
+        syms.deinit(dll_allocator);
     }
 
     if (versym_tab_addr) |vst_addr| {
@@ -1456,7 +1462,7 @@ fn loadDso(o_path: []const u8) !usize {
             buf_str[k] = strs[k + sym.name];
         }
 
-        const name = try std.fmt.allocPrint(allocator, "{s}", .{buf_str[0..k]});
+        const name = try std.fmt.allocPrint(dll_allocator, "{s}", .{buf_str[0..k]});
 
         const hidden = sym.other.visibility != .DEFAULT;
 
@@ -1469,9 +1475,9 @@ fn loadDso(o_path: []const u8) !usize {
             ver_idx = ver_sym.?.VERSION;
 
             if (ver_sym == std.elf.Versym.GLOBAL) {
-                version = try allocator.dupe(u8, "GLOBAL");
+                version = try dll_allocator.dupe(u8, "GLOBAL");
             } else if (ver_sym == std.elf.Versym.LOCAL) {
-                version = try allocator.dupe(u8, "LOCAL");
+                version = try dll_allocator.dupe(u8, "LOCAL");
             } else {
                 if (sym.shndx == std.elf.SHN_UNDEF) {
                     const ver_table_addr = verneed_tab_addr;
@@ -1488,7 +1494,7 @@ fn loadDso(o_path: []const u8) !usize {
                                     buf_str[k] = strs[k + aux.name];
                                 }
 
-                                version = try std.fmt.allocPrint(allocator, "{s}", .{buf_str[0..k]});
+                                version = try std.fmt.allocPrint(dll_allocator, "{s}", .{buf_str[0..k]});
                                 break :outer;
                             }
 
@@ -1521,7 +1527,7 @@ fn loadDso(o_path: []const u8) !usize {
                                 buf_str[k] = strs[k + aux.name];
                             }
 
-                            version = try std.fmt.allocPrint(allocator, "{s}", .{buf_str[0..k]});
+                            version = try std.fmt.allocPrint(dll_allocator, "{s}", .{buf_str[0..k]});
                             break;
                         }
 
@@ -1570,13 +1576,13 @@ fn loadDso(o_path: []const u8) !usize {
             .size = sym.size,
         };
 
-        const ent = try syms.getOrPut(allocator, s.name);
+        const ent = try syms.getOrPut(dll_allocator, s.name);
         if (!ent.found_existing) {
             ent.value_ptr.* = .empty;
         }
 
-        try ent.value_ptr.append(allocator, syms_array.items.len);
-        try syms_array.append(allocator, s);
+        try ent.value_ptr.append(dll_allocator, syms_array.items.len);
+        try syms_array.append(dll_allocator, s);
     }
 
     Logger.debug("program headers offset: 0x{x}", .{eh.e_phoff});
@@ -1643,7 +1649,7 @@ fn loadDso(o_path: []const u8) !usize {
                 .loaded_at = 0,
             };
 
-            try segments.put(allocator, segment.mem_offset, segment);
+            try segments.put(dll_allocator, segment.mem_offset, segment);
         } else if (ph.type == std.elf.PT.GNU_RELRO) {
             var segment = segments.get(ph.vaddr) orelse return error.SegmentNotFound;
 
@@ -1657,7 +1663,7 @@ fn loadDso(o_path: []const u8) !usize {
                 .mem_size = ph.memsz,
             };
 
-            try segments.put(allocator, segment.mem_offset, segment);
+            try segments.put(dll_allocator, segment.mem_offset, segment);
         } else if (ph.type == .TLS) {
             tls_init_file_offset = ph.offset;
             tls_init_file_size = ph.filesz;
@@ -1797,7 +1803,7 @@ fn loadDso(o_path: []const u8) !usize {
                         rela_reloc.r_addend,
                     });
 
-                    try relocs.append(allocator, .{
+                    try relocs.append(dll_allocator, .{
                         .type = @as(std.elf.R_X86_64, @enumFromInt(rela_reloc.r_type())),
                         .is_relr = false,
                         .sym_idx = rela_reloc.r_sym(),
@@ -1830,7 +1836,7 @@ fn loadDso(o_path: []const u8) !usize {
                         plt_reloc.r_addend,
                     });
 
-                    try relocs.append(allocator, .{
+                    try relocs.append(dll_allocator, .{
                         .type = @as(std.elf.R_X86_64, @enumFromInt(plt_reloc.r_type())),
                         .sym_idx = plt_reloc.r_sym(),
                         .is_relr = false,
@@ -1862,7 +1868,7 @@ fn loadDso(o_path: []const u8) !usize {
                             relr_reloc.*,
                             0,
                         });
-                        try relocs.append(allocator, .{
+                        try relocs.append(dll_allocator, .{
                             .type = .RELATIVE,
                             .is_relr = true,
                             .sym_idx = 0,
@@ -1882,7 +1888,7 @@ fn loadDso(o_path: []const u8) !usize {
                                     next + sr * @sizeOf(std.elf.Elf64_Addr),
                                     0,
                                 });
-                                try relocs.append(allocator, .{
+                                try relocs.append(dll_allocator, .{
                                     .type = .RELATIVE,
                                     .is_relr = true,
                                     .sym_idx = 0,
@@ -1908,15 +1914,15 @@ fn loadDso(o_path: []const u8) !usize {
         }
     }
 
-    const do_entry = try dyn_objects.getOrPut(allocator, dyn_object_name);
+    const do_entry = try dyn_objects.getOrPut(dll_allocator, dyn_object_name);
     defer if (do_entry.found_existing) {
-        allocator.free(dyn_object_name);
+        dll_allocator.free(dyn_object_name);
     };
 
     do_entry.value_ptr.* = .{
         .name_is_key = false,
-        .name = try allocator.dupe(u8, dyn_object_name),
-        .path = try allocator.dupe(u8, path),
+        .name = try dll_allocator.dupe(u8, dyn_object_name),
+        .path = try dll_allocator.dupe(u8, path),
         .file_handle = f.handle,
         .mapped_at = file_addr,
         .mapped_size = file_bytes.len,
@@ -1954,7 +1960,7 @@ fn loadDso(o_path: []const u8) !usize {
     };
 
     const dyn_object = dyn_objects.getEntry(dyn_object_name).?.value_ptr;
-    try dyn_objects_sorted_indices.append(allocator, dyn_objects.getIndex(dyn_object_name).?);
+    try dyn_objects_sorted_indices.append(dll_allocator, dyn_objects.getIndex(dyn_object_name).?);
 
     try mapSegments(dyn_object, file_bytes);
 
@@ -1967,17 +1973,17 @@ fn loadDso(o_path: []const u8) !usize {
 
 fn collectDepsBreadthFirst(dyn_object: *DynObject) !void {
     var queue: std.ArrayList(usize) = .empty;
-    defer queue.deinit(allocator);
+    defer queue.deinit(dll_allocator);
 
-    try queue.append(allocator, dyn_objects.getIndex(dyn_object.name).?);
+    try queue.append(dll_allocator, dyn_objects.getIndex(dyn_object.name).?);
 
     while (queue.items.len > 0) {
         const dep_idx = queue.orderedRemove(0);
-        if (std.mem.findScalar(usize, dyn_object.deps_breadth_first.items, dep_idx)) |_| {} else try dyn_object.deps_breadth_first.append(allocator, dep_idx);
+        if (std.mem.findScalar(usize, dyn_object.deps_breadth_first.items, dep_idx)) |_| {} else try dyn_object.deps_breadth_first.append(dll_allocator, dep_idx);
         const dep = &dyn_objects.values()[dep_idx];
         for (dep.dependencies.items) |sdep_idx| {
             if (std.mem.findScalar(usize, queue.items, sdep_idx)) |_| continue;
-            try queue.append(allocator, sdep_idx);
+            try queue.append(dll_allocator, sdep_idx);
         }
     }
 
@@ -1998,7 +2004,7 @@ fn logDepTree(dyn_object: *const DynObject) !void {
     }
 
     var already_visited: std.ArrayList(usize) = .empty;
-    defer already_visited.deinit(allocator);
+    defer already_visited.deinit(dll_allocator);
 
     try logDepTreeInner(dyn_object, 0, &already_visited);
 }
@@ -2012,7 +2018,7 @@ fn logDepTreeInner(dyn_object: *const DynObject, level: usize, already_visited: 
         return;
     }
 
-    try already_visited.append(allocator, dyn_objects.getIndex(dyn_object.name).?);
+    try already_visited.append(dll_allocator, dyn_objects.getIndex(dyn_object.name).?);
 
     if (dyn_object.dependencies.items.len > 0) {
         for (dyn_object.dependencies.items) |dep_idx| {
@@ -2089,7 +2095,7 @@ fn mapSegments(dyn_object: *DynObject, file_bytes: []const u8) !void {
         .loaded_at = dyn_object.loaded_at.? + original_mem_end,
     };
 
-    try dyn_object.segments.put(allocator, original_mem_end, extra_segment);
+    try dyn_object.segments.put(dll_allocator, original_mem_end, extra_segment);
 
     Logger.debug("mapping segments: reserved 0x{x} bytes from 0x{x} to 0x{x}", .{ total_mem_size, base_addr, base_addr + total_mem_size });
 
@@ -2401,7 +2407,7 @@ fn detectLibC(dyn_object: *DynObject) !void {
                 //     struct __locale_struct global_locale;
                 // };
 
-                try libc_specifics.?.write_ops.appendSlice(allocator, &.{
+                try libc_specifics.?.write_ops.appendSlice(dll_allocator, &.{
                     .{
                         .addr = libc_addr + 8,
                         .relative_to = .zero,
@@ -2640,7 +2646,7 @@ fn detectLibC(dyn_object: *DynObject) !void {
             .write_ops = .empty,
         };
 
-        try libc_specifics.?.write_ops.appendSlice(allocator, &.{
+        try libc_specifics.?.write_ops.appendSlice(dll_allocator, &.{
             .{
                 .addr = rtld_addr + 104, // TODO we should check this offset stability
                 .relative_to = .zero,
@@ -2700,7 +2706,7 @@ fn detectLibC(dyn_object: *DynObject) !void {
 
             Logger.debug("libc detection: tls_size field offset: {d}, tls_align field offset: {d}", .{ tls_size_offset, tls_align_offset });
 
-            try libc_specifics.?.write_ops.appendSlice(allocator, &.{
+            try libc_specifics.?.write_ops.appendSlice(dll_allocator, &.{
                 .{
                     .addr = rtld_addr + 104,
                     .relative_to = .zero,
@@ -2847,7 +2853,7 @@ fn mapTlsBlock(dyn_object: *DynObject) !void {
 
     // TODO this allocation could easily be avoided if loaded dyn object has no static tls data
     Logger.debug("tls: allocating new init block: size: 0x{x}", .{new_abi_tcb_offset});
-    const new_initial_block = try allocator.alloc(u8, new_abi_tcb_offset);
+    const new_initial_block = try dll_allocator.alloc(u8, new_abi_tcb_offset);
 
     Logger.debug("tls: copying initial tdata: from 0x{x} to 0x{x} (size: 0x{x})", .{
         new_abi_tcb_offset - initial_tls_offset,
@@ -2952,7 +2958,7 @@ fn mapTlsBlock(dyn_object: *DynObject) !void {
     };
 
     if (current_tls_area_desc.gdt_entry_number != @as(usize, @bitCast(@as(isize, -1)))) {
-        allocator.free(current_tls_area_desc.block.init);
+        dll_allocator.free(current_tls_area_desc.block.init);
     }
 
     // keep a copy of the normal area desc,
@@ -3264,8 +3270,8 @@ fn processIRelativeRelocations(dyn_object: *DynObject) !void {
                 if (ifunc_resolved_addrs.get(resolver_addr)) |res_val| {
                     std.debug.assert(res_val == value);
                 }
-                try ifunc_resolved_addrs.put(allocator, resolver_addr, value);
-                try irel_resolved_targets.putNoClobber(allocator, reloc_addr, value);
+                try ifunc_resolved_addrs.put(dll_allocator, resolver_addr, value);
+                try irel_resolved_targets.putNoClobber(dll_allocator, reloc_addr, value);
             },
             else => {
                 Logger.err("unhandled relocation type: {s}", .{@tagName(reloc.type)});
@@ -3349,8 +3355,8 @@ fn getResolvedSymbolByName(maybe_dyn_object: ?*DynObject, sym_name: []const u8) 
                             if (ifunc_resolved_addrs.get(resolver_addr)) |res_val| {
                                 std.debug.assert(res_val == value);
                             }
-                            try ifunc_resolved_addrs.put(allocator, resolver_addr, value);
-                            try irel_resolved_targets.putNoClobber(allocator, resolver_addr, value);
+                            try ifunc_resolved_addrs.put(dll_allocator, resolver_addr, value);
+                            try irel_resolved_targets.putNoClobber(dll_allocator, resolver_addr, value);
                             dep_addr = value;
                         }
 
@@ -3404,8 +3410,8 @@ fn getResolvedSymbolByName(maybe_dyn_object: ?*DynObject, sym_name: []const u8) 
                             if (ifunc_resolved_addrs.get(resolver_addr)) |res_val| {
                                 std.debug.assert(res_val == value);
                             }
-                            try ifunc_resolved_addrs.put(allocator, resolver_addr, value);
-                            try irel_resolved_targets.putNoClobber(allocator, resolver_addr, value);
+                            try ifunc_resolved_addrs.put(dll_allocator, resolver_addr, value);
+                            try irel_resolved_targets.putNoClobber(dll_allocator, resolver_addr, value);
                             dep_addr = value;
                         }
 
@@ -3466,8 +3472,8 @@ fn getResolvedSymbolByNameAndVersion(maybe_dyn_object: ?*DynObject, sym_name: []
                             if (ifunc_resolved_addrs.get(resolver_addr)) |res_val| {
                                 std.debug.assert(res_val == value);
                             }
-                            try ifunc_resolved_addrs.put(allocator, resolver_addr, value);
-                            try irel_resolved_targets.putNoClobber(allocator, resolver_addr, value);
+                            try ifunc_resolved_addrs.put(dll_allocator, resolver_addr, value);
+                            try irel_resolved_targets.putNoClobber(dll_allocator, resolver_addr, value);
                             dep_addr = value;
                         }
 
@@ -3521,8 +3527,8 @@ fn getResolvedSymbolByNameAndVersion(maybe_dyn_object: ?*DynObject, sym_name: []
                             if (ifunc_resolved_addrs.get(resolver_addr)) |res_val| {
                                 std.debug.assert(res_val == value);
                             }
-                            try ifunc_resolved_addrs.put(allocator, resolver_addr, value);
-                            try irel_resolved_targets.putNoClobber(allocator, resolver_addr, value);
+                            try ifunc_resolved_addrs.put(dll_allocator, resolver_addr, value);
+                            try irel_resolved_targets.putNoClobber(dll_allocator, resolver_addr, value);
                             dep_addr = value;
                         }
 
@@ -3586,8 +3592,8 @@ fn resolveSymbol(dyn_object: *DynObject, sym_idx: usize) !ResolvedSymbol {
             if (ifunc_resolved_addrs.get(resolver_addr)) |res_val| {
                 std.debug.assert(res_val == value);
             }
-            try ifunc_resolved_addrs.put(allocator, resolver_addr, value);
-            try irel_resolved_targets.putNoClobber(allocator, resolver_addr, value);
+            try ifunc_resolved_addrs.put(dll_allocator, resolver_addr, value);
+            try irel_resolved_targets.putNoClobber(dll_allocator, resolver_addr, value);
             addr = value;
         }
 
@@ -3636,8 +3642,8 @@ fn resolveSymbol(dyn_object: *DynObject, sym_idx: usize) !ResolvedSymbol {
                         if (ifunc_resolved_addrs.get(resolver_addr)) |res_val| {
                             std.debug.assert(res_val == value);
                         }
-                        try ifunc_resolved_addrs.put(allocator, resolver_addr, value);
-                        try irel_resolved_targets.putNoClobber(allocator, resolver_addr, value);
+                        try ifunc_resolved_addrs.put(dll_allocator, resolver_addr, value);
+                        try irel_resolved_targets.putNoClobber(dll_allocator, resolver_addr, value);
                         dep_addr = value;
                     }
 
@@ -4079,8 +4085,8 @@ var extra_threads: std.ArrayList(*std.Thread) = .empty;
 var last_dl_error: ?[:0]const u8 = null;
 var extra_allocations: std.AutoArrayHashMapUnmanaged(usize, ExtraAlloc) = .empty;
 var alloc_mutex: std.Thread.Mutex = .{};
-var alloc_arena: std.heap.ArenaAllocator = undefined;
-var alloc_allocator: std.mem.Allocator = undefined;
+var dll_alloc_arena: std.heap.ArenaAllocator = undefined;
+var dll_alloc_allocator: std.mem.Allocator = undefined;
 // var extra_onces: std.AutoHashMapUnmanaged(usize, void) = .empty;
 
 // TODO general thread safety for the substitutes
@@ -4090,11 +4096,11 @@ fn mallocSubstitute(size: usize) callconv(.c) ?*anyopaque {
 
     Logger.debug("intercepted call: malloc({d})", .{size});
 
-    const result = alloc_allocator.alloc(u8, 16 + size) catch @panic("OOM");
+    const result = dll_alloc_allocator.alloc(u8, 16 + size) catch @panic("OOM");
 
     const aligned_result = @as([*]u8, @ptrFromInt(std.mem.alignForward(usize, @intFromPtr(result.ptr), 16)));
 
-    extra_allocations.put(allocator, @intFromPtr(aligned_result), .{
+    extra_allocations.put(dll_allocator, @intFromPtr(aligned_result), .{
         .addr = @intFromPtr(result.ptr),
         .size = 16 + size,
         .r_size = size,
@@ -4112,11 +4118,11 @@ fn alignedAllocSubstitute(alignment: usize, size: usize) callconv(.c) ?*anyopaqu
 
     Logger.debug("intercepted call: aligned_alloc({d}, {d})", .{ alignment, size });
 
-    const result = alloc_allocator.alloc(u8, alignment + size) catch @panic("OOM");
+    const result = dll_alloc_allocator.alloc(u8, alignment + size) catch @panic("OOM");
 
     const aligned_result = @as([*]u8, @ptrFromInt(std.mem.alignForward(usize, @intFromPtr(result.ptr), alignment)));
 
-    extra_allocations.put(allocator, @intFromPtr(aligned_result), .{
+    extra_allocations.put(dll_allocator, @intFromPtr(aligned_result), .{
         .addr = @intFromPtr(result.ptr),
         .size = alignment + size,
         .r_size = size,
@@ -4134,11 +4140,11 @@ fn posixMemalignSubstitute(memptr: **anyopaque, alignment: usize, size: usize) c
 
     Logger.debug("intercepted call: posix_memalign(0x{x}, {d}, {d})", .{ @intFromPtr(memptr), alignment, size });
 
-    const result = alloc_allocator.alloc(u8, alignment + size) catch @panic("OOM");
+    const result = dll_alloc_allocator.alloc(u8, alignment + size) catch @panic("OOM");
 
     const aligned_result = @as([*]u8, @ptrFromInt(std.mem.alignForward(usize, @intFromPtr(result.ptr), alignment)));
 
-    extra_allocations.put(allocator, @intFromPtr(aligned_result), .{
+    extra_allocations.put(dll_allocator, @intFromPtr(aligned_result), .{
         .addr = @intFromPtr(result.ptr),
         .size = alignment + size,
         .r_size = size,
@@ -4165,7 +4171,7 @@ fn freeSubstitute(p: ?*anyopaque) callconv(.c) void {
             const arr = @as([*]u8, @ptrFromInt(alloc.addr));
             const slice = arr[0..alloc.size];
 
-            alloc_allocator.free(slice);
+            dll_alloc_allocator.free(slice);
 
             if (@intFromPtr(p) != alloc_zero_val) {
                 _ = extra_allocations.swapRemove(@intFromPtr(p));
@@ -4176,7 +4182,7 @@ fn freeSubstitute(p: ?*anyopaque) callconv(.c) void {
         }
     }
 
-    Logger.info("intercepted call: success: free(0x{x}) [{d} allocs remaining, mem used: {B:.2}]", .{ @intFromPtr(p), extra_allocations.count(), alloc_arena.queryCapacity() });
+    Logger.info("intercepted call: success: free(0x{x}) [{d} allocs remaining, mem used: {B:.2}]", .{ @intFromPtr(p), extra_allocations.count(), dll_alloc_arena.queryCapacity() });
 
     alloc_mutex.unlock();
 }
@@ -4186,12 +4192,12 @@ fn callocSubstitute(n: usize, size: usize) callconv(.c) *anyopaque {
 
     Logger.debug("intercepted call: calloc({d}, {d})", .{ n, size });
 
-    const result = alloc_allocator.alloc(u8, 16 + n * size) catch @panic("OOM");
+    const result = dll_alloc_allocator.alloc(u8, 16 + n * size) catch @panic("OOM");
     @memset(result, 0x0);
 
     const aligned_result = @as([*]u8, @ptrFromInt(std.mem.alignForward(usize, @intFromPtr(result.ptr), 16)));
 
-    extra_allocations.put(allocator, @intFromPtr(aligned_result), .{
+    extra_allocations.put(dll_allocator, @intFromPtr(aligned_result), .{
         .addr = @intFromPtr(result.ptr),
         .size = 16 + n * size,
         .r_size = n * size,
@@ -4227,7 +4233,7 @@ fn reallocSubstitute(p: ?*anyopaque, size: usize) callconv(.c) *anyopaque {
                 @memmove(prev_slice.ptr, @as([*]u8, @ptrCast(p))[0..prev_alloc.r_size]);
             }
 
-            result = alloc_allocator.realloc(prev_slice, size + 16) catch @panic("OOM");
+            result = dll_alloc_allocator.realloc(prev_slice, size + 16) catch @panic("OOM");
 
             aligned_result = @as([*]u8, @ptrFromInt(std.mem.alignForward(usize, @intFromPtr(result.ptr), 16)));
 
@@ -4245,12 +4251,12 @@ fn reallocSubstitute(p: ?*anyopaque, size: usize) callconv(.c) *anyopaque {
             @panic("realloc failed: externally allocated memory");
         }
     } else {
-        result = alloc_allocator.alloc(u8, size + 16) catch @panic("OOM");
+        result = dll_alloc_allocator.alloc(u8, size + 16) catch @panic("OOM");
 
         aligned_result = @as([*]u8, @ptrFromInt(std.mem.alignForward(usize, @intFromPtr(result.ptr), 16)));
     }
 
-    extra_allocations.put(allocator, @intFromPtr(aligned_result), .{
+    extra_allocations.put(dll_allocator, @intFromPtr(aligned_result), .{
         .addr = @intFromPtr(result.ptr),
         .r_size = size,
         .size = size + 16,
@@ -4286,7 +4292,7 @@ fn reallocarraySubstitute(p: ?*anyopaque, n: usize, size: usize) callconv(.c) *a
                 @memmove(prev_slice.ptr, @as([*]u8, @ptrCast(p))[0..prev_alloc.r_size]);
             }
 
-            result = alloc_allocator.realloc(prev_slice, n * size + 16) catch @panic("OOM");
+            result = dll_alloc_allocator.realloc(prev_slice, n * size + 16) catch @panic("OOM");
 
             aligned_result = @as([*]u8, @ptrFromInt(std.mem.alignForward(usize, @intFromPtr(result.ptr), 16)));
 
@@ -4304,12 +4310,12 @@ fn reallocarraySubstitute(p: ?*anyopaque, n: usize, size: usize) callconv(.c) *a
             @panic("reallocarray failed: externally allocated memory");
         }
     } else {
-        result = alloc_allocator.alloc(u8, n * size + 16) catch @panic("OOM");
+        result = dll_alloc_allocator.alloc(u8, n * size + 16) catch @panic("OOM");
 
         aligned_result = @as([*]u8, @ptrFromInt(std.mem.alignForward(usize, @intFromPtr(result.ptr), 16)));
     }
 
-    extra_allocations.put(allocator, @intFromPtr(aligned_result), .{
+    extra_allocations.put(dll_allocator, @intFromPtr(aligned_result), .{
         .addr = @intFromPtr(result.ptr),
         .size = n * size + 16,
         .r_size = n * size,
@@ -4329,14 +4335,14 @@ fn dlopenSubstitute(path: ?[*:0]const u8, flags: c_int) callconv(.c) ?*anyopaque
         return @ptrFromInt(std.math.maxInt(usize) - 1);
     }
 
-    const owned_path = allocator.dupe(u8, std.mem.span(path.?)) catch @panic("OOM");
-    extra_strs.append(allocator, owned_path) catch @panic("OOM");
+    const owned_path = dll_allocator.dupe(u8, std.mem.span(path.?)) catch @panic("OOM");
+    extra_strs.append(dll_allocator, owned_path) catch @panic("OOM");
 
     const lib = load(owned_path) catch |err| {
         if (last_dl_error != null) {
-            allocator.free(last_dl_error.?);
+            dll_allocator.free(last_dl_error.?);
         }
-        last_dl_error = std.fmt.allocPrintSentinel(allocator, "unable to load library {s}: {}", .{ owned_path, err }, 0) catch @panic("OOM");
+        last_dl_error = std.fmt.allocPrintSentinel(dll_allocator, "unable to load library {s}: {}", .{ owned_path, err }, 0) catch @panic("OOM");
 
         Logger.err("dlopen(\"{s}\", 0x{x}) failed: {}", .{ owned_path, flags, err });
 
@@ -4362,9 +4368,9 @@ fn dlsymSubstitute(lib_handle: ?*anyopaque, sym_name: [*:0]const u8) callconv(.c
 
     const sym = getResolvedSymbolByName(dyn_object, std.mem.span(sym_name)) catch |err| {
         if (last_dl_error != null) {
-            allocator.free(last_dl_error.?);
+            dll_allocator.free(last_dl_error.?);
         }
-        last_dl_error = std.fmt.allocPrintSentinel(allocator, "unable to get symbol {s} for library {s}: {}", .{ sym_name, if (dyn_object) |do| do.name else "NULL", err }, 0) catch @panic("OOM");
+        last_dl_error = std.fmt.allocPrintSentinel(dll_allocator, "unable to get symbol {s} for library {s}: {}", .{ sym_name, if (dyn_object) |do| do.name else "NULL", err }, 0) catch @panic("OOM");
 
         Logger.warn("dlsym({d} [{s}], \"{s}\") failed: {}", .{ @intFromPtr(lib_handle), if (dyn_object) |do| do.name else "NULL", sym_name, err });
 
@@ -4383,9 +4389,9 @@ fn dlvsymSubstitute(lib_handle: ?*anyopaque, sym_name: [*:0]const u8, version: [
 
     const sym = getResolvedSymbolByNameAndVersion(dyn_object, std.mem.span(sym_name), std.mem.span(version)) catch |err| {
         if (last_dl_error != null) {
-            allocator.free(last_dl_error.?);
+            dll_allocator.free(last_dl_error.?);
         }
-        last_dl_error = std.fmt.allocPrintSentinel(allocator, "unable to get symbol {s}@{s} for library {s}: {}", .{ sym_name, version, if (dyn_object) |do| do.name else "NULL", err }, 0) catch @panic("OOM");
+        last_dl_error = std.fmt.allocPrintSentinel(dll_allocator, "unable to get symbol {s}@{s} for library {s}: {}", .{ sym_name, version, if (dyn_object) |do| do.name else "NULL", err }, 0) catch @panic("OOM");
 
         Logger.warn("dlvsym({d} [{s}], \"{s}\", \"{s}\") failed: {}", .{ @intFromPtr(lib_handle), if (dyn_object) |do| do.name else "NULL", sym_name, version, err });
 
@@ -4434,17 +4440,17 @@ fn dladdrSubstitute(addr: *anyopaque, dl_info: *DlInfo) callconv(.c) c_int {
 
     const infos = findDynObjectSegmentForLoadedAddr(@intFromPtr(addr)) catch |err| {
         if (last_dl_error != null) {
-            allocator.free(last_dl_error.?);
+            dll_allocator.free(last_dl_error.?);
         }
-        last_dl_error = std.fmt.allocPrintSentinel(allocator, "unable to get infos for address 0x{x}: {}", .{ @intFromPtr(addr), err }, 0) catch @panic("OOM");
+        last_dl_error = std.fmt.allocPrintSentinel(dll_allocator, "unable to get infos for address 0x{x}: {}", .{ @intFromPtr(addr), err }, 0) catch @panic("OOM");
 
         Logger.warn("dladdr(0x{x}, {}) failed: {}", .{ @intFromPtr(addr), dl_info.*, err });
 
         return 0;
     };
 
-    const owned_name = allocator.dupeZ(u8, infos.dyn_object.name) catch @panic("OOM");
-    extra_strs_z.append(allocator, owned_name) catch @panic("OOM");
+    const owned_name = dll_allocator.dupeZ(u8, infos.dyn_object.name) catch @panic("OOM");
+    extra_strs_z.append(dll_allocator, owned_name) catch @panic("OOM");
 
     dl_info.dli_fname = owned_name.ptr;
     dl_info.dli_fbase = @ptrFromInt(infos.dyn_object.loaded_at.?);
@@ -4453,8 +4459,8 @@ fn dladdrSubstitute(addr: *anyopaque, dl_info: *DlInfo) callconv(.c) c_int {
         const sym = infos.dyn_object.syms_array.items[sidx];
         const sym_addr = vAddressToLoadedAddress(infos.dyn_object, sym.value, false) catch unreachable;
 
-        const owned_sym_name = allocator.dupeZ(u8, sym.name) catch @panic("OOM");
-        extra_strs_z.append(allocator, owned_sym_name) catch @panic("OOM");
+        const owned_sym_name = dll_allocator.dupeZ(u8, sym.name) catch @panic("OOM");
+        extra_strs_z.append(dll_allocator, owned_sym_name) catch @panic("OOM");
 
         dl_info.dli_fsname = owned_sym_name.ptr;
         dl_info.dli_fsaddr = @ptrFromInt(sym_addr);
@@ -4491,9 +4497,9 @@ fn dladdr1Substitute(addr: *anyopaque, dl_info: *DlInfo, extra_infos: *anyopaque
 
     const infos = findDynObjectSegmentForLoadedAddr(@intFromPtr(addr)) catch |err| {
         if (last_dl_error != null) {
-            allocator.free(last_dl_error.?);
+            dll_allocator.free(last_dl_error.?);
         }
-        last_dl_error = std.fmt.allocPrintSentinel(allocator, "unable to get infos for address 0x{x}: {}", .{ @intFromPtr(addr), err }, 0) catch @panic("OOM");
+        last_dl_error = std.fmt.allocPrintSentinel(dll_allocator, "unable to get infos for address 0x{x}: {}", .{ @intFromPtr(addr), err }, 0) catch @panic("OOM");
 
         Logger.warn("dladdr1(0x{x}, dl_info: *DlInfo [0x{x}], extra_infos: 0x{x}, flags: 0x{x}) failed: {}", .{
             @intFromPtr(addr),
@@ -4506,8 +4512,8 @@ fn dladdr1Substitute(addr: *anyopaque, dl_info: *DlInfo, extra_infos: *anyopaque
         return 0;
     };
 
-    const owned_name = allocator.dupeZ(u8, infos.dyn_object.name) catch @panic("OOM");
-    extra_strs_z.append(allocator, owned_name) catch @panic("OOM");
+    const owned_name = dll_allocator.dupeZ(u8, infos.dyn_object.name) catch @panic("OOM");
+    extra_strs_z.append(dll_allocator, owned_name) catch @panic("OOM");
 
     dl_info.dli_fname = owned_name.ptr;
     dl_info.dli_fbase = @ptrFromInt(infos.dyn_object.loaded_at.?);
@@ -4516,8 +4522,8 @@ fn dladdr1Substitute(addr: *anyopaque, dl_info: *DlInfo, extra_infos: *anyopaque
         const sym = infos.dyn_object.syms_array.items[sidx];
         const sym_addr = vAddressToLoadedAddress(infos.dyn_object, sym.value, false) catch unreachable;
 
-        const owned_sym_name = allocator.dupeZ(u8, sym.name) catch @panic("OOM");
-        extra_strs_z.append(allocator, owned_sym_name) catch @panic("OOM");
+        const owned_sym_name = dll_allocator.dupeZ(u8, sym.name) catch @panic("OOM");
+        extra_strs_z.append(dll_allocator, owned_sym_name) catch @panic("OOM");
 
         dl_info.dli_fsname = owned_sym_name.ptr;
         dl_info.dli_fsaddr = @ptrFromInt(sym_addr);
@@ -4536,8 +4542,8 @@ fn dladdr1Substitute(addr: *anyopaque, dl_info: *DlInfo, extra_infos: *anyopaque
             }
 
             // TODO we should cache and reuse produced link maps (store them in a hasmap, keyed by dyn object name)
-            const link_map = allocator.create(DlLinkMap) catch @panic("OOM");
-            extra_link_maps.append(allocator, link_map) catch @panic("OOM");
+            const link_map = dll_allocator.create(DlLinkMap) catch @panic("OOM");
+            extra_link_maps.append(dll_allocator, link_map) catch @panic("OOM");
 
             link_map.l_addr = dyn_obj.loaded_at.?;
             link_map.l_name = owned_name;
@@ -4616,14 +4622,14 @@ fn dlFindDsoForObjectSubstitute(addr: *anyopaque) callconv(.c) ?*DlLinkMap {
         return null;
     };
 
-    const owned_name = allocator.dupeZ(u8, infos.dyn_object.name) catch @panic("OOM");
-    extra_strs_z.append(allocator, owned_name) catch @panic("OOM");
+    const owned_name = dll_allocator.dupeZ(u8, infos.dyn_object.name) catch @panic("OOM");
+    extra_strs_z.append(dll_allocator, owned_name) catch @panic("OOM");
 
     Logger.warn("_dl_find_dso_for_object: partial implementation: link maps should be reused as they can be compared by address", .{});
 
     // TODO we should cache and reuse produced link maps (store them in a hasmap, keyed by dyn object name)
-    const link_map = allocator.create(DlLinkMap) catch @panic("OOM");
-    extra_link_maps.append(allocator, link_map) catch @panic("OOM");
+    const link_map = dll_allocator.create(DlLinkMap) catch @panic("OOM");
+    extra_link_maps.append(dll_allocator, link_map) catch @panic("OOM");
 
     link_map.l_addr = infos.dyn_object.loaded_at.?;
     link_map.l_name = owned_name;
@@ -4645,8 +4651,8 @@ fn dlIteratePhdrSubstitute(callback: *const fn (*anyopaque, c_uint, *anyopaque) 
             continue;
         }
 
-        const dl_phdr_info = allocator.create(std.posix.dl_phdr_info) catch @panic("OOM");
-        extra_phdrs.append(allocator, dl_phdr_info) catch @panic("OOM");
+        const dl_phdr_info = dll_allocator.create(std.posix.dl_phdr_info) catch @panic("OOM");
+        extra_phdrs.append(dll_allocator, dl_phdr_info) catch @panic("OOM");
 
         dl_phdr_info.* = .{
             .addr = dyn_obj.loaded_at.?,
@@ -4704,13 +4710,13 @@ fn threadRoutine(ctx: ThreadRoutineContext) void {
     }
 
     thread_mutex.lock();
-    thread_infos.putNoClobber(allocator, ctx.idx, .{ .idx = ctx.idx, .handle = new_tp, .t = ctx.thread, .ret = undefined }) catch @panic("OOM");
+    thread_infos.putNoClobber(dll_allocator, ctx.idx, .{ .idx = ctx.idx, .handle = new_tp, .t = ctx.thread, .ret = undefined }) catch @panic("OOM");
     thread_mutex.unlock();
 
     const ret = ctx.f(ctx.arg);
 
     thread_mutex.lock();
-    var r = thread_infos.getOrPut(allocator, ctx.idx) catch @panic("OOM");
+    var r = thread_infos.getOrPut(dll_allocator, ctx.idx) catch @panic("OOM");
     r.value_ptr.ret = ret;
     thread_mutex.unlock();
 
@@ -4730,9 +4736,9 @@ fn pthreadCreateSubstitute(newthread: *c_ulong, attr: ?*const anyopaque, start_r
     bytes = std.mem.alignForward(usize, bytes, std.os.linux.tls.area_desc.alignment);
     tls_offset = bytes + std.os.linux.tls.area_desc.abi_tcb.offset;
 
-    const thread = allocator.create(std.Thread) catch @panic("OOM");
+    const thread = dll_allocator.create(std.Thread) catch @panic("OOM");
     thread_mutex.lock();
-    extra_threads.append(allocator, thread) catch @panic("OOM");
+    extra_threads.append(dll_allocator, thread) catch @panic("OOM");
     thread_mutex.unlock();
 
     const idx = @atomicRmw(usize, &currentIdx, .Add, 1, .seq_cst);

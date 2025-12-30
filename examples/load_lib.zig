@@ -19,7 +19,11 @@ pub fn main() !void {
     const allocator = gpa.allocator();
     defer if (gpa.deinit() != .ok) @panic("memory check failed");
 
-    try dll.init(.{ .allocator = allocator, .log_level = .debug });
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    try dll.init(.{ .allocator = allocator, .io = io, .log_level = .debug });
     defer dll.deinit();
 
     const args = try std.process.argsAlloc(allocator);

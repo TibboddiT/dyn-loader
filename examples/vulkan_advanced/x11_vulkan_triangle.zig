@@ -62,7 +62,11 @@ pub fn main() !void {
 
     const allocator = std.heap.smp_allocator;
 
-    try dll.init(.{ .allocator = allocator });
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    try dll.init(.{ .allocator = allocator, .io = io });
     defer dll.deinit();
 
     std.log.info("loading 'libX11.so.6'...", .{});
@@ -80,6 +84,7 @@ pub fn main() !void {
     const xFlush: *Xlib.XFlush = @ptrFromInt((try lib_x11.getSymbol("XFlush")).addr);
     const xCloseDisplay: *Xlib.XCloseDisplay = @ptrFromInt((try lib_x11.getSymbol("XCloseDisplay")).addr);
     const xGetWindowAttributes: *Xlib.XGetWindowAttributes = @ptrFromInt((try lib_x11.getSymbol("XGetWindowAttributes")).addr);
+    const xChangeWindowAttributes: *Xlib.XChangeWindowAttributes = @ptrFromInt((try lib_x11.getSymbol("XChangeWindowAttributes")).addr);
     const xPending: *Xlib.XPending = @ptrFromInt((try lib_x11.getSymbol("XPending")).addr);
     const xNextEvent: *Xlib.XNextEvent = @ptrFromInt((try lib_x11.getSymbol("XNextEvent")).addr);
     const xSelectInput: *Xlib.XSelectInput = @ptrFromInt((try lib_x11.getSymbol("XSelectInput")).addr);
@@ -165,6 +170,10 @@ pub fn main() !void {
         framebuffers,
     );
     defer destroyCommandBuffers(&gc, pool, allocator, cmdbufs);
+
+    var attrs: Xlib.XSetWindowAttributes = .{};
+    attrs.background_pixmap = Xlib.None;
+    _ = xChangeWindowAttributes(x11_display, x11_window, Xlib.CWBackPixmap, &attrs);
 
     var state: Swapchain.PresentState = .optimal;
     main_loop: while (true) {

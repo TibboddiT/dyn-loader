@@ -37,11 +37,11 @@ pub fn main() !void {
     const allocator = gpa.allocator();
     defer if (gpa.deinit() != .ok) @panic("memory check failed");
 
-    var threaded: std.Io.Threaded = .init(allocator);
+    var threaded: std.Io.Threaded = .init(allocator, .{});
     defer threaded.deinit();
     const io = threaded.io();
 
-    try dll.init(.{ .allocator = allocator });
+    try dll.init(.{ .allocator = allocator, .io = io });
     defer dll.deinit();
 
     std.log.info("loading 'libX11.so.6'...", .{});
