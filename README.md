@@ -4,7 +4,7 @@
 
 *Warning: prototype quality: lots of bugs, lots of TODOs remaining.*
 
-Tested on `x86_64-linux-gnu`, with libraries compiled agasint glibc 2.41 and musl 1.2.5.
+Tested on `x86_64-linux`, with libraries compiled agasint glibc 2.41 and musl 1.2.5.
 
 See [this thread](https://ziggit.dev/t/dynamic-linking-without-libc-adventures) for further information.
 
@@ -41,7 +41,7 @@ pub fn main() !void {
 
 - Loading libraries should be done before having started any thread.
 - Some (rare) relocation types are still missing.
-- Dirty tricks are used to accomodate with patched libc.
+- Dirty tricks are used to accomodate with patched libc coming from various distros.
 
 ### Notes
 
@@ -49,8 +49,8 @@ A musl's `libc.so` is included, compiled from sources without any modification.
 You should load it first before loading libraries compiled against musl on a non musl based system (see [the musl printf example](src/examples/printf_musl.zig)).
 The library is stripped (`strip --strip-unneeded lib/libc.so`) as it is often the case when it is packaged for linux distros.
 
-An original copy of `libvulkan.so.1.4.326` from the `vulkan-loader` package of [Chimera Linux](https://repo.chimera-linux.org/current/main/x86_64/)
-is also included (renamed `libvulkan.so.1`), to make the `vulkan_version_musl` example work.
+To demonstrate this, an original copy of `libvulkan.so.1.4.326` from the `vulkan-loader` package of [Chimera Linux](https://repo.chimera-linux.org/current/main/x86_64/)
+is also included (renamed `libvulkan.so.1`) to make the `vulkan_version_musl` example work.
 
 ---
 
