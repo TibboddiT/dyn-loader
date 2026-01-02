@@ -23,8 +23,12 @@ pub fn main() !void {
     const allocator = gpa.allocator();
     defer if (gpa.deinit() != .ok) @panic("memory check failed");
 
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
     // `dll` is a singleton, it should be initialized early and only once, on the main thread
-    try dll.init(.{ .allocator = allocator, .log_level = .warn });
+    try dll.init(.{ .allocator = allocator, .io = io, .log_level = .err });
     defer dll.deinit();
 
     const lib_c = try dll.loadSystemLibC();
