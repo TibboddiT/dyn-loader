@@ -50,7 +50,7 @@ pub fn main() !void {
 ### Notes
 
 A musl's `libc.so` is included, compiled from sources without any modification.
-You should load it first before loading libraries compiled against musl on a non musl based system (see [the musl printf example](src/examples/printf_musl.zig)).
+You should load it first before loading libraries compiled against musl on a non musl based system (see [the musl printf example](examples/printf_musl.zig)).
 The library is stripped (`strip --strip-unneeded lib/libc.so`) as it is often the case when it is packaged for linux distros.
 
 To demonstrate this, an original copy of `libvulkan.so.1.4.326` from the `vulkan-loader` package of [Chimera Linux](https://repo.chimera-linux.org/current/main/x86_64/)
