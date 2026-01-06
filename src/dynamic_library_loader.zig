@@ -4793,11 +4793,23 @@ fn pthreadJoinSubstitute(thread_handle: c_ulong, retval: ?**anyopaque) callconv(
         thread_mutex.unlock();
 
         // TODO bad things can happen here...
+        // `entry` might have become an invalid pointer
 
         entry.t.join();
 
         if (retval != null) {
-            retval.?.* = entry.ret;
+            thread_mutex.lock();
+
+            for (thread_infos.values()) |*n_entry| {
+                if (n_entry.handle != thread_handle) {
+                    continue;
+                }
+
+                retval.?.* = n_entry.ret;
+                break;
+            }
+
+            thread_mutex.unlock();
         }
 
         Logger.info("intercepted call: success: pthread_join(0x{x}, 0x{x})", .{ thread_handle, @intFromPtr(retval) });
