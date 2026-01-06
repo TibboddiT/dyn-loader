@@ -18,17 +18,14 @@ pub const debug = struct {
     pub const SelfInfo = dll.CustomSelfInfo;
 };
 
-pub fn main() !void {
-    var gpa: std.heap.DebugAllocator(.{}) = .init;
-    const allocator = gpa.allocator();
-    defer if (gpa.deinit() != .ok) @panic("memory check failed");
-
-    var threaded: std.Io.Threaded = .init(allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
+    const io = init.io;
+    const args = init.minimal.args;
+    const environ = init.minimal.environ;
 
     // `dll` is a singleton, it should be initialized early and only once, on the main thread
-    try dll.init(.{ .allocator = allocator, .io = io, .log_level = .err });
+    try dll.init(.{ .allocator = allocator, .io = io, .args = args, .environ = environ, .log_level = .err });
     defer dll.deinit();
 
     const lib_c = try dll.loadSystemLibC();

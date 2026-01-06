@@ -764,6 +764,8 @@ export fn _dl_debug_state() callconv(.c) void {
 var dll_initialized: bool = false;
 var dll_allocator: std.mem.Allocator = undefined;
 var dll_io: std.Io = undefined;
+var dll_args: std.process.Args = undefined;
+var dll_environ: std.process.Environ = undefined;
 
 const LibcSpecifics = struct {
     const WriteOps = struct {
@@ -804,6 +806,8 @@ var libc_specifics: ?LibcSpecifics = null;
 const InitOptions = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
+    args: std.process.Args,
+    environ: std.process.Environ,
     log_level: Logger.Level = .err,
 };
 
@@ -820,6 +824,9 @@ pub fn init(options: InitOptions) !void {
     dll_alloc_arena = .init(dll_allocator);
     // alloc_allocator = alloc_arena.allocator();
     dll_alloc_allocator = dll_allocator;
+
+    dll_args = options.args;
+    dll_environ = options.environ;
 
     // TODO
     // - pre restructure TLS early
@@ -2369,12 +2376,12 @@ fn detectLibC(dyn_object: *DynObject) !void {
                 const progname_sym = try resolveSymbolByName("program_invocation_name");
                 const progname_loc = progname_sym.address;
                 Logger.debug("libc detection: program_name: addr: 0x{x} (0x{x})", .{ progname_loc, progname_sym.value });
-                const argv: [*c]const [*c]const u8 = @ptrCast(std.os.argv);
+                const argv: [*c]const [*c]const u8 = @ptrCast(dll_args.vector);
 
                 const environ_sym = try resolveSymbolByName("environ");
                 const environ_loc = environ_sym.address;
                 Logger.debug("libc detection: environ: addr: 0x{x} (0x{x})", .{ environ_loc, environ_sym.value });
-                const environ: [*c]const [*c]const u8 = @ptrCast(std.os.environ);
+                const environ: [*c]const [*c]const u8 = @ptrCast(dll_environ.block);
 
                 // TODO validate these offsets
                 //
@@ -3897,9 +3904,9 @@ fn callInitFunctions(dyn_obj: *DynObject) !void {
         } else {
             Logger.debug("libc: calling init function for {s} at 0x{x} (initial address: 0x{x})", .{ dyn_obj.name, actual_addr, initial_addr });
 
-            const argc: c_int = @intCast(std.os.argv.len);
-            const argv: [*c]const [*c]const u8 = @ptrCast(std.os.argv);
-            const env: [*c]const [*c]const u8 = @ptrCast(std.os.environ);
+            const argc: c_int = @intCast(dll_args.vector.len);
+            const argv: [*c]const [*c]const u8 = @ptrCast(dll_args.vector);
+            const env: [*c]const [*c]const u8 = @ptrCast(dll_environ.block);
 
             const func = @as(*const fn (
                 c_int,
@@ -3932,9 +3939,9 @@ fn callInitFunctions(dyn_obj: *DynObject) !void {
             } else {
                 Logger.debug("libc: calling init_array[{d}] for {s} at 0x{x} (initial address: 0x{x})", .{ i, dyn_obj.name, actual_addr, initial_addr });
 
-                const argc: c_int = @intCast(std.os.argv.len);
-                const argv: [*c]const [*c]const u8 = @ptrCast(std.os.argv);
-                const env: [*c]const [*c]const u8 = @ptrCast(std.os.environ);
+                const argc: c_int = @intCast(dll_args.vector.len);
+                const argv: [*c]const [*c]const u8 = @ptrCast(dll_args.vector);
+                const env: [*c]const [*c]const u8 = @ptrCast(dll_environ.block);
 
                 const func = @as(*const fn (
                     c_int,

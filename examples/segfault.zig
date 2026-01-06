@@ -15,16 +15,13 @@ pub const debug = struct {
     pub const SelfInfo = dll.CustomSelfInfo;
 };
 
-pub fn main() !void {
-    var gpa: std.heap.DebugAllocator(.{}) = .init;
-    const allocator = gpa.allocator();
-    defer if (gpa.deinit() != .ok) @panic("memory check failed");
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
+    const io = init.io;
+    const args = init.minimal.args;
+    const environ = init.minimal.environ;
 
-    var threaded: std.Io.Threaded = .init(allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
-
-    try dll.init(.{ .allocator = allocator, .io = io });
+    try dll.init(.{ .allocator = allocator, .io = io, .args = args, .environ = environ });
     defer dll.deinit();
 
     std.log.info("loading system libc...", .{});

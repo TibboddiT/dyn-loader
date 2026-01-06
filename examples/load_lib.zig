@@ -14,27 +14,24 @@ pub const debug = struct {
     pub const SelfInfo = dll.CustomSelfInfo;
 };
 
-pub fn main() !void {
-    var gpa: std.heap.DebugAllocator(.{}) = .init;
-    const allocator = gpa.allocator();
-    defer if (gpa.deinit() != .ok) @panic("memory check failed");
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
+    const io = init.io;
+    const args = init.minimal.args;
+    const environ = init.minimal.environ;
 
-    var threaded: std.Io.Threaded = .init(allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
-
-    try dll.init(.{ .allocator = allocator, .io = io, .log_level = .debug });
+    try dll.init(.{ .allocator = allocator, .io = io, .args = args, .environ = environ, .log_level = .debug });
     defer dll.deinit();
 
-    const args = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, args);
+    const args_slice = try init.minimal.args.toSlice(allocator);
+    defer allocator.free(args_slice);
 
-    if (args.len <= 1) {
+    if (args_slice.len <= 1) {
         std.log.err("missing mandatory lib name", .{});
         return error.MissingLibName;
     }
 
-    for (args[1..]) |arg| {
+    for (args_slice[1..]) |arg| {
         const lib_name = arg;
 
         std.log.info("loading '{s}'...", .{lib_name});
