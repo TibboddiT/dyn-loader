@@ -1228,7 +1228,7 @@ fn loadDso(o_path: []const u8) !usize {
     const file_bytes = try std.posix.mmap(
         null,
         std.mem.alignForward(usize, size, std.heap.pageSize()),
-        std.posix.PROT.READ,
+        .{ .READ = true },
         .{ .TYPE = .PRIVATE },
         f.handle,
         0,
@@ -2064,7 +2064,7 @@ fn mapSegments(dyn_object: *DynObject, file_bytes: []const u8) !void {
     const mapped_space = std.posix.mmap(
         null,
         total_mem_size + max_align,
-        std.posix.PROT.NONE,
+        .{},
         .{ .TYPE = .PRIVATE, .ANONYMOUS = true },
         -1,
         0,
@@ -2111,10 +2111,10 @@ fn mapSegments(dyn_object: *DynObject, file_bytes: []const u8) !void {
     for (dyn_object.segments.values(), 0..) |*segment, s| {
         Logger.debug("  segment {d}: foff: 0x{x}, moff: 0x{x}, fsize: 0x{x}, msize: 0x{x}", .{ s, segment.file_offset, segment.mem_offset, segment.file_size, segment.mem_size });
 
-        var prot: u32 = std.posix.PROT.NONE;
-        if (segment.flags_first.read) prot |= std.posix.PROT.READ;
-        if (segment.flags_first.write) prot |= std.posix.PROT.WRITE;
-        if (segment.flags_first.exec) prot |= std.posix.PROT.EXEC;
+        var prot: std.posix.PROT = .{};
+        if (segment.flags_first.read) prot.READ = true;
+        if (segment.flags_first.write) prot.WRITE = true;
+        if (segment.flags_first.exec) prot.EXEC = true;
 
         const aligned_ptr: [*]align(std.heap.pageSize()) u8 = @ptrFromInt(std.mem.alignBackward(usize, base_addr + segment.mem_offset, segment.mem_align));
         const aligned_end: usize = std.mem.alignForward(usize, base_addr + segment.mem_offset + segment.mem_size, segment.mem_align);
@@ -2790,7 +2790,7 @@ fn mapTlsBlock(dyn_object: *DynObject) !void {
 
     if (current_tls_area_desc.gdt_entry_number == @as(usize, @bitCast(@as(isize, -1)))) {
         Logger.debug("tls: mapping new area (first time): size: 0x{x} (surplus) + 0x{x} (new_area_size) + 0x{x} (size of pthread struct)", .{ current_surplus_size, new_area_size, sizeof_pthread });
-        const space = std.posix.mmap(null, current_surplus_size + new_area_size + sizeof_pthread, std.posix.PROT.READ | std.posix.PROT.WRITE, .{ .TYPE = .PRIVATE, .ANONYMOUS = true }, -1, 0) catch |err| {
+        const space = std.posix.mmap(null, current_surplus_size + new_area_size + sizeof_pthread, .{ .READ = true, .WRITE = true }, .{ .TYPE = .PRIVATE, .ANONYMOUS = true }, -1, 0) catch |err| {
             Logger.err("failed to allocate tls space: {s}", .{@errorName(err)});
             return err;
         };
@@ -3701,20 +3701,24 @@ fn updateSegmentsPermissions(dyn_object: *DynObject) !void {
     Logger.debug("updating segment permissions for {s}", .{dyn_object.name});
 
     for (dyn_object.segments.values(), 0..) |*segment, s| {
-        var prot: u32 = std.posix.PROT.NONE;
-        if (segment.flags_last.read) prot |= std.posix.PROT.READ;
-        if (segment.flags_last.write) prot |= std.posix.PROT.WRITE;
-        if (segment.flags_last.exec) prot |= std.posix.PROT.EXEC;
+        var prot: std.posix.PROT = .{};
+        if (segment.flags_last.read) prot.READ = true;
+        if (segment.flags_last.write) prot.WRITE = true;
+        if (segment.flags_last.exec) prot.EXEC = true;
 
         const aligned_start = std.mem.alignBackward(usize, segment.loaded_at + (segment.flags_last.mem_offset - segment.mem_offset), std.heap.pageSize());
         const aligned_end = std.mem.alignForward(usize, segment.loaded_at + (segment.flags_last.mem_offset - segment.mem_offset) + segment.flags_last.mem_size, std.heap.pageSize());
-        Logger.debug("  updating segment {d}: from 0x{x} to 0x{x}, prot: 0x{x}", .{ s, aligned_start, aligned_end, prot });
+        Logger.debug("  updating segment {d}: from 0x{x} to 0x{x}, prot: 0x{x}", .{ s, aligned_start, aligned_end, @as(u32, @bitCast(prot)) });
 
         const segment_slice = @as([*]align(std.heap.pageSize()) u8, @ptrFromInt(aligned_start))[0 .. aligned_end - aligned_start];
-        std.posix.mprotect(segment_slice, prot) catch |err| {
-            Logger.err("failed to update segment permissions: {s}", .{@errorName(err)});
-            return err;
-        };
+        const r = std.os.linux.mprotect(segment_slice.ptr, segment_slice.len, prot);
+        switch (std.os.linux.errno(r)) {
+            .SUCCESS => {},
+            else => |err| {
+                Logger.err("failed to update segment permissions: {t}", .{err});
+                return error.ProtectSegmentFailed;
+            },
+        }
     }
 
     Logger.debug("successfully updated {d} segments for {s}", .{ dyn_object.segments.count(), dyn_object.name });
@@ -3725,15 +3729,19 @@ fn unprotectSegment(dyn_object: *DynObject, segment_index: usize) !void {
 
     const aligned_start = std.mem.alignBackward(usize, segment.loaded_at, std.heap.pageSize());
     const aligned_end = std.mem.alignForward(usize, segment.loaded_at + segment.mem_size, std.heap.pageSize());
-    const prot: u32 = std.posix.PROT.READ | std.posix.PROT.WRITE;
+    const prot: std.posix.PROT = .{ .READ = true, .WRITE = true };
 
-    Logger.debug("{s}: unprotecting segment {d}: from 0x{x} to 0x{x}, prot: 0x{x}", .{ dyn_object.name, segment_index, aligned_start, aligned_end, prot });
+    Logger.debug("{s}: unprotecting segment {d}: from 0x{x} to 0x{x}, prot: 0x{x}", .{ dyn_object.name, segment_index, aligned_start, aligned_end, @as(u32, @bitCast(prot)) });
 
     const segment_slice = @as([*]align(std.heap.pageSize()) u8, @ptrFromInt(aligned_start))[0 .. aligned_end - aligned_start];
-    std.posix.mprotect(segment_slice, prot) catch |err| {
-        Logger.err("failed to update segment permissions: {s}", .{@errorName(err)});
-        return err;
-    };
+    const r = std.os.linux.mprotect(segment_slice.ptr, segment_slice.len, prot);
+    switch (std.os.linux.errno(r)) {
+        .SUCCESS => {},
+        else => |err| {
+            Logger.err("failed to update segment permissions: {t}", .{err});
+            return error.UnprotectSegmentFailed;
+        },
+    }
 
     Logger.debug("successfully unprotected segment {d} for {s}", .{ segment_index, dyn_object.name });
 }
@@ -3744,35 +3752,43 @@ fn reprotectSegment(dyn_object: *DynObject, segment_index: usize) !void {
     var aligned_start = std.mem.alignBackward(usize, segment.loaded_at, std.heap.pageSize());
     var aligned_end = std.mem.alignForward(usize, segment.loaded_at + segment.mem_size, std.heap.pageSize());
 
-    var prot: u32 = std.posix.PROT.NONE;
-    if (segment.flags_first.read) prot |= std.posix.PROT.READ;
-    if (segment.flags_first.write) prot |= std.posix.PROT.WRITE;
-    if (segment.flags_first.exec) prot |= std.posix.PROT.EXEC;
+    var prot: std.posix.PROT = .{};
+    if (segment.flags_first.read) prot.READ = true;
+    if (segment.flags_first.write) prot.WRITE = true;
+    if (segment.flags_first.exec) prot.EXEC = true;
 
-    Logger.debug("{s}: reprotecting segment {d}: from 0x{x} to 0x{x}, prot: 0x{x}", .{ dyn_object.name, segment_index, aligned_start, aligned_end, prot });
+    Logger.debug("{s}: reprotecting segment {d}: from 0x{x} to 0x{x}, prot: 0x{x}", .{ dyn_object.name, segment_index, aligned_start, aligned_end, @as(u32, @bitCast(prot)) });
 
     var segment_slice = @as([*]align(std.heap.pageSize()) u8, @ptrFromInt(aligned_start))[0 .. aligned_end - aligned_start];
-    std.posix.mprotect(segment_slice, prot) catch |err| {
-        Logger.err("failed to update segment permissions: {s}", .{@errorName(err)});
-        return err;
-    };
+    const r1 = std.os.linux.mprotect(segment_slice.ptr, segment_slice.len, prot);
+    switch (std.os.linux.errno(r1)) {
+        .SUCCESS => {},
+        else => |err| {
+            Logger.err("failed to update segment permissions: {t}", .{err});
+            return error.ProtectSegmentFailed;
+        },
+    }
 
     if (dyn_object.loaded) {
-        prot = std.posix.PROT.NONE;
-        if (segment.flags_last.read) prot |= std.posix.PROT.READ;
-        if (segment.flags_last.write) prot |= std.posix.PROT.WRITE;
-        if (segment.flags_last.exec) prot |= std.posix.PROT.EXEC;
+        prot = .{};
+        if (segment.flags_last.read) prot.READ = true;
+        if (segment.flags_last.write) prot.WRITE = true;
+        if (segment.flags_last.exec) prot.EXEC = true;
 
         aligned_start = std.mem.alignBackward(usize, segment.loaded_at + (segment.flags_last.mem_offset - segment.mem_offset), std.heap.pageSize());
         aligned_end = std.mem.alignForward(usize, segment.loaded_at + (segment.flags_last.mem_offset - segment.mem_offset) + segment.flags_last.mem_size, std.heap.pageSize());
 
-        Logger.debug("{s}: reapplying segment {d} permissions: from 0x{x} to 0x{x}, prot: 0x{x}", .{ dyn_object.name, segment_index, aligned_start, aligned_end, prot });
+        Logger.debug("{s}: reapplying segment {d} permissions: from 0x{x} to 0x{x}, prot: 0x{x}", .{ dyn_object.name, segment_index, aligned_start, aligned_end, @as(u32, @bitCast(prot)) });
 
         segment_slice = @as([*]align(std.heap.pageSize()) u8, @ptrFromInt(aligned_start))[0 .. aligned_end - aligned_start];
-        std.posix.mprotect(segment_slice, prot) catch |err| {
-            Logger.err("failed to update segment permissions: {s}", .{@errorName(err)});
-            return err;
-        };
+        const r2 = std.os.linux.mprotect(segment_slice.ptr, segment_slice.len, prot);
+        switch (std.os.linux.errno(r2)) {
+            .SUCCESS => {},
+            else => |err| {
+                Logger.err("failed to update segment permissions: {t}", .{err});
+                return error.ProtectSegmentFailed;
+            },
+        }
     }
 
     Logger.debug("successfully reprotected segment {d} for {s}", .{ segment_index, dyn_object.name });
