@@ -23,25 +23,23 @@ pub fn build(b: *std.Build) void {
         .install_subdir = "resources",
     });
 
-    b.getInstallStep().dependOn(&resources_dir.step);
-
     const check_step = b.step("check", "Check");
 
-    addExecutable(b, check_step, dll_mod, target, optimize, false, "load_lib", "examples/load_lib.zig");
-    addExecutable(b, check_step, dll_mod, target, optimize, false, "printf", "examples/printf.zig");
-    addExecutable(b, check_step, dll_mod, target, optimize, false, "printf_musl", "examples/printf_musl.zig");
-    addExecutable(b, check_step, dll_mod, target, optimize, true, "segfault", "examples/segfault.zig");
-    addExecutable(b, check_step, dll_mod, target, optimize, false, "vulkan_version", "examples/vulkan_version.zig");
-    addExecutable(b, check_step, dll_mod, target, optimize, false, "vulkan_version_musl", "examples/vulkan_version_musl.zig");
-    addExecutable(b, check_step, dll_mod, target, optimize, false, "x11_window", "examples/x11_window.zig");
-    addExecutable(b, check_step, dll_mod, target, optimize, false, "raylib", "examples/raylib.zig");
-    addExecutable(b, check_step, dll_mod, target, optimize, false, "x11_egl", "examples/x11_egl.zig");
+    addExecutable(b, &resources_dir.step, check_step, dll_mod, target, optimize, false, "load_lib", "examples/load_lib.zig");
+    addExecutable(b, &resources_dir.step, check_step, dll_mod, target, optimize, false, "printf", "examples/printf.zig");
+    addExecutable(b, &resources_dir.step, check_step, dll_mod, target, optimize, false, "printf_musl", "examples/printf_musl.zig");
+    addExecutable(b, &resources_dir.step, check_step, dll_mod, target, optimize, true, "segfault", "examples/segfault.zig");
+    addExecutable(b, &resources_dir.step, check_step, dll_mod, target, optimize, false, "vulkan_version", "examples/vulkan_version.zig");
+    addExecutable(b, &resources_dir.step, check_step, dll_mod, target, optimize, false, "vulkan_version_musl", "examples/vulkan_version_musl.zig");
+    addExecutable(b, &resources_dir.step, check_step, dll_mod, target, optimize, false, "x11_window", "examples/x11_window.zig");
+    addExecutable(b, &resources_dir.step, check_step, dll_mod, target, optimize, false, "raylib", "examples/raylib.zig");
+    addExecutable(b, &resources_dir.step, check_step, dll_mod, target, optimize, false, "x11_egl", "examples/x11_egl.zig");
 
-    addExecutable(b, check_step, dll_mod, target, optimize, false, "vulkan_instance", "examples/vulkan_advanced/vulkan_instance.zig");
-    addExecutable(b, check_step, dll_mod, target, optimize, false, "x11_vulkan_triangle", "examples/vulkan_advanced/x11_vulkan_triangle.zig");
+    addExecutable(b, &resources_dir.step, check_step, dll_mod, target, optimize, false, "vulkan_instance", "examples/vulkan_advanced/vulkan_instance.zig");
+    addExecutable(b, &resources_dir.step, check_step, dll_mod, target, optimize, false, "x11_vulkan_triangle", "examples/vulkan_advanced/x11_vulkan_triangle.zig");
 }
 
-fn addExecutable(b: *std.Build, check_step: *std.Build.Step, mod: *std.Build.Module, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, force_unstripped: bool, name: []const u8, root_source_file: []const u8) void {
+fn addExecutable(b: *std.Build, resources_step: *std.Build.Step, check_step: *std.Build.Step, mod: *std.Build.Module, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, force_unstripped: bool, name: []const u8, root_source_file: []const u8) void {
     const exe = b.addExecutable(.{
         .name = name,
         .root_module = b.createModule(.{
@@ -54,10 +52,14 @@ fn addExecutable(b: *std.Build, check_step: *std.Build.Step, mod: *std.Build.Mod
             .strip = if (force_unstripped) false else null,
         }),
     });
-    b.installArtifact(exe);
+    const install = b.addInstallArtifact(exe, .{});
+
+    install.step.dependOn(resources_step);
+
+    b.getInstallStep().dependOn(&install.step);
 
     const run_cmd = b.addRunArtifact(exe);
-    run_cmd.step.dependOn(b.getInstallStep());
+    run_cmd.step.dependOn(&install.step);
     if (b.args) |args| {
         run_cmd.addArgs(args);
     }

@@ -1300,25 +1300,27 @@ fn loadDso(o_path: []const u8) !usize {
         Logger.debug("    size: 0x{x}", .{sh.size});
 
         if (sh.type == .STRTAB) {
-            Logger.debug("    content:", .{});
+            if (Logger.level == .debug) {
+                Logger.debug("    content:", .{});
 
-            const strtab_addr: usize = file_addr + sh.offset;
-            const strs: [*]u8 = @ptrFromInt(strtab_addr);
+                const strtab_addr: usize = file_addr + sh.offset;
+                const strs: [*]u8 = @ptrFromInt(strtab_addr);
 
-            var j: usize = 0;
-            while (j < sh.size) : (j += 1) {
-                var k: usize = 0;
-                while (j < sh.size) : ({
-                    k += 1;
-                    j += 1;
-                }) {
-                    scratch_buf[k] = strs[j];
-                    if (strs[j] == 0) {
-                        break;
+                var j: usize = 0;
+                while (j < sh.size) : (j += 1) {
+                    var k: usize = 0;
+                    while (j < sh.size) : ({
+                        k += 1;
+                        j += 1;
+                    }) {
+                        scratch_buf[k] = strs[j];
+                        if (strs[j] == 0) {
+                            break;
+                        }
                     }
-                }
-                if (k > 0) {
-                    Logger.debug("      - {s}", .{scratch_buf[0..k]});
+                    if (k > 0) {
+                        Logger.debug("      - {s}", .{scratch_buf[0..k]});
+                    }
                 }
             }
 
@@ -1623,13 +1625,15 @@ fn loadDso(o_path: []const u8) !usize {
     }) {
         const ph: *std.elf.Elf64.Phdr = @ptrFromInt(ph_addr);
 
-        Logger.debug("  - {d}", .{i});
-        Logger.debug("    type: 0x{x}", .{ph.type});
-        Logger.debug("    flags: {b}", .{@as(std.elf.Word, @bitCast(ph.flags))});
-        Logger.debug("    offset: 0x{x}", .{ph.offset});
-        Logger.debug("    v_addr: 0x{x}", .{ph.vaddr});
-        Logger.debug("    fsize: 0x{x}", .{ph.filesz});
-        Logger.debug("    msize: 0x{x}", .{ph.memsz});
+        if (Logger.level == .debug) {
+            Logger.debug("  - {d}", .{i});
+            Logger.debug("    type: 0x{x}", .{ph.type});
+            Logger.debug("    flags: {b}", .{@as(std.elf.Word, @bitCast(ph.flags))});
+            Logger.debug("    offset: 0x{x}", .{ph.offset});
+            Logger.debug("    v_addr: 0x{x}", .{ph.vaddr});
+            Logger.debug("    fsize: 0x{x}", .{ph.filesz});
+            Logger.debug("    msize: 0x{x}", .{ph.memsz});
+        }
 
         if (ph.type == .LOAD) {
             const segment: LoadSegment = .{
