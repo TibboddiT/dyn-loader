@@ -44,6 +44,22 @@ pub fn main(init: std.process.Init) !void {
 - Some (rare) relocation types are still missing.
 - Dirty tricks are used to accomodate with patched libc coming from various distros.
 
+### How it works
+
+Here is an simplified overview of what is done when loading a dynamic library:
+
+- dependencies are resolved, and for each library to load:
+  - segments are mmapped
+  - if the current library is a libc, information is collected to apply specific binary patching
+  - "normal" relocations are processed
+    - dl, malloc, and thread functions are "redirected" to zig code
+  - TLS is set up
+  - IRELATIVE relocations are processed
+  - segment permissions are applied
+  - information about the extra ELF files is added to the provided custom SelfInfo to get nice stack traces
+  - init functions are called
+    - with specific handling in the case of libc
+
 ### Notes
 
 A musl's `libc.so` is included, compiled from sources without any modification.
