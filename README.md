@@ -1,4 +1,4 @@
-## Loading dynamic libraries from non libc static executable
+## Loading dynamic libraries from non libc static executables
 
 ### Proof of concept
 
