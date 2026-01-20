@@ -121,7 +121,7 @@ pub const Swapchain = struct {
         self.gc.dev.destroySwapchainKHR(self.handle, null);
     }
 
-    pub fn recreate(self: *Swapchain, new_extent: vk.Extent2D) !void {
+    pub fn recreate(self: *Swapchain, new_extent: vk.Extent2D, recycle: bool) !void {
         const gc = self.gc;
         const allocator = self.allocator;
         const old_handle = self.handle;
@@ -129,7 +129,12 @@ pub const Swapchain = struct {
         try self.gc.dev.queueWaitIdle(self.gc.graphics_queue.handle);
         try self.gc.dev.queueWaitIdle(self.gc.present_queue.handle);
         try self.gc.dev.deviceWaitIdle();
-        try self.waitForAllFences();
+
+        if (!recycle) {
+            self.deinit();
+            self.* = try init(gc, allocator, new_extent);
+            return;
+        }
 
         self.deinitExceptSwapchain();
         // set current handle to NULL_HANDLE to signal that the current swapchain does no longer need to be

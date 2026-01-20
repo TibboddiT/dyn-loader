@@ -204,7 +204,20 @@ pub fn main(init: std.process.Init) !void {
         if (state == .suboptimal or extent.width != @as(u32, @intCast(w)) or extent.height != @as(u32, @intCast(h))) {
             extent.width = @intCast(w);
             extent.height = @intCast(h);
-            try swapchain.recreate(extent);
+            var do_recycle: bool = true;
+            while (true) {
+                swapchain.recreate(extent, do_recycle) catch |err| switch (err) {
+                    error.OutOfDateKHR => {
+                        _ = xGetWindowAttributes(x11_display, x11_window, &attr);
+                        extent.width = @intCast(attr.width);
+                        extent.height = @intCast(attr.height);
+                        do_recycle = false;
+                        continue;
+                    },
+                    else => |e| return e,
+                };
+                break;
+            }
 
             destroyFramebuffers(&gc, allocator, framebuffers);
             framebuffers = try createFramebuffers(&gc, allocator, render_pass, swapchain);
