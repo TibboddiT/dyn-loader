@@ -30,6 +30,9 @@ pub fn main(init: std.process.Init) !void {
 
     const lib_c = try dll.loadSystemLibC();
 
+    // or load any other dynamic library:
+    // const lib_x11 = try dll.load("libX11.so.6");
+
     const printf_sym = try lib_c.getSymbol("printf");
     const printf_addr = printf_sym.addr;
     const printf: *const fn ([*:0]const u8, ...) callconv(.c) c_int = @ptrFromInt(printf_addr);
