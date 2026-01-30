@@ -5,7 +5,8 @@ const VulkanProcResolver = @import("vulkan_proc_resolver.zig").VulkanProcResolve
 
 const Allocator = std.mem.Allocator;
 
-const required_layer_names = [_][*:0]const u8{"VK_LAYER_KHRONOS_validation"};
+// const required_layer_names = [_][*:0]const u8{"VK_LAYER_KHRONOS_validation"};
+const required_layer_names = [_][*:0]const u8{};
 
 const required_device_extensions = [_][*:0]const u8{vk.extensions.khr_swapchain.name};
 

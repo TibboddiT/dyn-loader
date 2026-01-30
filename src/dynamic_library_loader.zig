@@ -1222,6 +1222,8 @@ fn loadDso(o_path: []const u8) !usize {
     }
 
     const f = try std.Io.Dir.openFileAbsolute(dll_io, path, .{ .mode = .read_only });
+    errdefer f.close(dll_io);
+
     const stat = try f.stat(dll_io);
     const size = std.math.cast(usize, stat.size) orelse return error.FileTooBig;
 
@@ -1241,6 +1243,9 @@ fn loadDso(o_path: []const u8) !usize {
         const key = try std.fmt.allocPrint(dll_allocator, "{s}", .{dyn_object_name});
         try dyn_objects.putNoClobber(dll_allocator, key, .init(key));
     } else if (dyn_objects.get(dyn_object_name).?.loaded) {
+        f.close(dll_io);
+        std.posix.munmap(file_bytes);
+
         defer dll_allocator.free(dyn_object_name);
         return dyn_objects.getIndex(dyn_object_name).?;
     }

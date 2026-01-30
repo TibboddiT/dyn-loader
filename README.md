@@ -2,9 +2,11 @@
 
 ### Proof of concept
 
+All executable artifacts produced by the included examples are static executables that load dynamic libraries without using libc's `dlopen`.
+
 *Warning: prototype quality: lots of bugs, lots of TODOs remaining.*
 
-Tested on `x86_64-linux`, with libraries compiled agasint glibc 2.41 and musl 1.2.5.
+Tested on `x86_64-linux`, with libraries compiled agasint glibc from 2.23 to 2.42 and musl from 1.2.1 to 1.2.5.
 
 See [this thread](https://ziggit.dev/t/dynamic-linking-without-libc-adventures) for further information.
 
@@ -43,9 +45,12 @@ pub fn main(init: std.process.Init) !void {
 
 ### Current limitations
 
-- Loading libraries should be done before having started any thread.
+- Loading libraries should be done before starting any thread.
 - Some (rare) relocation types are still missing.
-- Dirty tricks are used to accomodate with patched libc coming from various distros.
+- Dirty tricks are used to accommodate patched libc versions from various distros.
+- Some libc functions that need to be implemented in zig are not yet implemented.
+- `dlclose` is a noop.
+- `fini` and `fini_array` functions are not called.
 
 ### How it works
 
@@ -90,14 +95,19 @@ zig build run-printf
 zig build run-printf_musl
 zig build run-vulkan_version
 zig build run-vulkan_version_musl
+zig build run-vulkan_instance
 zig build run-x11_window
 zig build run-x11_egl
 zig build run-x11_vulkan_triangle
 ```
 
-The vulkan examples might need validation layer. The EGL one will need `libEGL.so`.
+The following example will intentionally trigger a segfault to demonstrate stack traces across loaded libraries:
 
-The following examples will only work on glibc based systems (because this lib is compiled against glibc):
+```
+zig build run-segfault
+```
+
+The following examples will only work on glibc-based systems (because they use libraries compiled against glibc):
 
 ```
 zig build run-raylib

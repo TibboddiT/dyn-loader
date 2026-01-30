@@ -49,7 +49,8 @@ pub fn main(init: std.process.Init) !void {
 
     const app_name = "Test";
 
-    const required_layer_names = [_][*:0]const u8{"VK_LAYER_KHRONOS_validation"};
+    // const required_layer_names = [_][*:0]const u8{"VK_LAYER_KHRONOS_validation"};
+    const required_layer_names = [_][*:0]const u8{};
 
     var extension_names: std.ArrayList([*:0]const u8) = .empty;
     defer extension_names.deinit(allocator);
