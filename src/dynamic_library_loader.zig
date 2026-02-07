@@ -1868,7 +1868,7 @@ fn detectLibC(dyn_object: *DynObject) !void {
                 const environ_sym = try resolveSymbolByName("environ");
                 const environ_loc = environ_sym.address;
                 Logger.debug("libc detection: environ: addr: 0x{x} (0x{x})", .{ environ_loc, environ_sym.value });
-                const environ: [*c]const [*c]const u8 = @ptrCast(dll_environ.block);
+                const environ: [*c]const [*c]const u8 = @ptrCast(dll_environ.block.slice);
 
                 // TODO validate these offsets
                 //
@@ -3409,7 +3409,7 @@ fn callInitFunctions(dyn_obj: *DynObject) !void {
 
             const argc: c_int = @intCast(dll_args.vector.len);
             const argv: [*c]const [*c]const u8 = @ptrCast(dll_args.vector);
-            const env: [*c]const [*c]const u8 = @ptrCast(dll_environ.block);
+            const env: [*c]const [*c]const u8 = @ptrCast(dll_environ.block.slice);
 
             const func = @as(*const fn (
                 c_int,
@@ -3444,7 +3444,7 @@ fn callInitFunctions(dyn_obj: *DynObject) !void {
 
                 const argc: c_int = @intCast(dll_args.vector.len);
                 const argv: [*c]const [*c]const u8 = @ptrCast(dll_args.vector);
-                const env: [*c]const [*c]const u8 = @ptrCast(dll_environ.block);
+                const env: [*c]const [*c]const u8 = @ptrCast(dll_environ.block.slice);
 
                 const func = @as(*const fn (
                     c_int,
