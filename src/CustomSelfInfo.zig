@@ -1,3 +1,20 @@
+// TODO move this to dll global state
+var extra_phdr_infos: std.ArrayList(*std.posix.dl_phdr_info) = .empty;
+
+pub fn addExtraElf(gpa: std.mem.Allocator, dl_phdr_info: *std.posix.dl_phdr_info) !void {
+    // TODO thread safety
+    try extra_phdr_infos.append(gpa, dl_phdr_info);
+}
+
+pub fn clearExtraElfs(gpa: std.mem.Allocator) void {
+    // TODO thread safety
+    for (extra_phdr_infos.items) |e| {
+        gpa.destroy(e);
+    }
+
+    extra_phdr_infos.clearAndFree(gpa);
+}
+
 rwlock: Io.RwLock,
 
 modules: std.ArrayList(Module),
@@ -5,16 +22,15 @@ ranges: std.ArrayList(Module.Range),
 
 unwind_cache: if (can_unwind) ?[]Dwarf.SelfUnwinder.CacheEntry else ?noreturn,
 
-// TODO move this to dll global state
-var extra_phdr_infos: std.ArrayList(*std.posix.dl_phdr_info) = .empty;
-
 pub const init: SelfInfo = .{
     .rwlock = .init,
     .modules = .empty,
     .ranges = .empty,
     .unwind_cache = null,
 };
-pub fn deinit(si: *SelfInfo, gpa: Allocator) void {
+pub fn deinit(si: *SelfInfo, io: Io) void {
+    _ = io;
+    const gpa = std.debug.getDebugInfoAllocator();
     for (si.modules.items) |*mod| {
         unwind: {
             const u = &(mod.unwind orelse break :unwind catch break :unwind);
@@ -31,21 +47,8 @@ pub fn deinit(si: *SelfInfo, gpa: Allocator) void {
     if (si.unwind_cache) |cache| gpa.free(cache);
 }
 
-pub fn addExtraElf(gpa: std.mem.Allocator, dl_phdr_info: *std.posix.dl_phdr_info) !void {
-    // TODO thread safety
-    try extra_phdr_infos.append(gpa, dl_phdr_info);
-}
-
-pub fn clearExtraElfs(gpa: std.mem.Allocator) void {
-    // TODO thread safety
-    for (extra_phdr_infos.items) |e| {
-        gpa.destroy(e);
-    }
-
-    extra_phdr_infos.clearAndFree(gpa);
-}
-
-pub fn getSymbol(si: *SelfInfo, gpa: Allocator, io: Io, address: usize) Error!std.debug.Symbol {
+pub fn getSymbol(si: *SelfInfo, io: Io, address: usize) Error!std.debug.Symbol {
+    const gpa = std.debug.getDebugInfoAllocator();
     const module = try si.findModule(gpa, io, address, .exclusive);
     defer si.rwlock.unlock(io);
 
@@ -90,13 +93,15 @@ pub fn getSymbol(si: *SelfInfo, gpa: Allocator, io: Io, address: usize) Error!st
         error.OutOfMemory => |e| return e,
     };
 }
-pub fn getModuleName(si: *SelfInfo, gpa: Allocator, io: Io, address: usize) Error![]const u8 {
+pub fn getModuleName(si: *SelfInfo, io: Io, address: usize) Error![]const u8 {
+    const gpa = std.debug.getDebugInfoAllocator();
     const module = try si.findModule(gpa, io, address, .shared);
     defer si.rwlock.unlockShared(io);
     if (module.name.len == 0) return error.MissingDebugInfo;
     return module.name;
 }
-pub fn getModuleSlide(si: *SelfInfo, gpa: Allocator, io: Io, address: usize) Error!usize {
+pub fn getModuleSlide(si: *SelfInfo, io: Io, address: usize) Error!usize {
+    const gpa = std.debug.getDebugInfoAllocator();
     const module = try si.findModule(gpa, io, address, .shared);
     defer si.rwlock.unlockShared(io);
     return module.load_offset;
@@ -196,8 +201,9 @@ comptime {
     }
 }
 pub const UnwindContext = Dwarf.SelfUnwinder;
-pub fn unwindFrame(si: *SelfInfo, gpa: Allocator, io: Io, context: *UnwindContext) Error!usize {
+pub fn unwindFrame(si: *SelfInfo, io: Io, context: *UnwindContext) Error!usize {
     comptime assert(can_unwind);
+    const gpa = std.debug.getDebugInfoAllocator();
 
     {
         si.rwlock.lockSharedUncancelable(io);
