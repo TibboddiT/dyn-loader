@@ -175,7 +175,7 @@ pub const DeviceAddress = u64;
 pub const OHNativeWindow = if (@hasDecl(root, "OHNativeWindow")) root.OHNativeWindow else opaque {};
 pub const OHBufferHandle = if (@hasDecl(root, "OHBufferHandle")) root.OHBufferHandle else opaque {};
 pub const OH_NativeBuffer = if (@hasDecl(root, "OH_NativeBuffer")) root.OH_NativeBuffer else opaque {};
-pub const PipelineDynamicStateCreateFlags = packed struct {
+pub const PipelineDynamicStateCreateFlags = packed struct(Flags) {
     _reserved_bits: Flags = 0,
     pub const toInt = FlagsMixin(PipelineDynamicStateCreateFlags).toInt;
     pub const fromInt = FlagsMixin(PipelineDynamicStateCreateFlags).fromInt;
@@ -186,7 +186,7 @@ pub const PipelineDynamicStateCreateFlags = packed struct {
     pub const contains = FlagsMixin(PipelineDynamicStateCreateFlags).contains;
     pub const format = FlagFormatMixin(PipelineDynamicStateCreateFlags).format;
 };
-pub const PipelineMultisampleStateCreateFlags = packed struct {
+pub const PipelineMultisampleStateCreateFlags = packed struct(Flags) {
     _reserved_bits: Flags = 0,
     pub const toInt = FlagsMixin(PipelineMultisampleStateCreateFlags).toInt;
     pub const fromInt = FlagsMixin(PipelineMultisampleStateCreateFlags).fromInt;
@@ -197,7 +197,7 @@ pub const PipelineMultisampleStateCreateFlags = packed struct {
     pub const contains = FlagsMixin(PipelineMultisampleStateCreateFlags).contains;
     pub const format = FlagFormatMixin(PipelineMultisampleStateCreateFlags).format;
 };
-pub const PipelineRasterizationStateCreateFlags = packed struct {
+pub const PipelineRasterizationStateCreateFlags = packed struct(Flags) {
     _reserved_bits: Flags = 0,
     pub const toInt = FlagsMixin(PipelineRasterizationStateCreateFlags).toInt;
     pub const fromInt = FlagsMixin(PipelineRasterizationStateCreateFlags).fromInt;
@@ -208,7 +208,7 @@ pub const PipelineRasterizationStateCreateFlags = packed struct {
     pub const contains = FlagsMixin(PipelineRasterizationStateCreateFlags).contains;
     pub const format = FlagFormatMixin(PipelineRasterizationStateCreateFlags).format;
 };
-pub const PipelineViewportStateCreateFlags = packed struct {
+pub const PipelineViewportStateCreateFlags = packed struct(Flags) {
     _reserved_bits: Flags = 0,
     pub const toInt = FlagsMixin(PipelineViewportStateCreateFlags).toInt;
     pub const fromInt = FlagsMixin(PipelineViewportStateCreateFlags).fromInt;
@@ -219,7 +219,7 @@ pub const PipelineViewportStateCreateFlags = packed struct {
     pub const contains = FlagsMixin(PipelineViewportStateCreateFlags).contains;
     pub const format = FlagFormatMixin(PipelineViewportStateCreateFlags).format;
 };
-pub const PipelineTessellationStateCreateFlags = packed struct {
+pub const PipelineTessellationStateCreateFlags = packed struct(Flags) {
     _reserved_bits: Flags = 0,
     pub const toInt = FlagsMixin(PipelineTessellationStateCreateFlags).toInt;
     pub const fromInt = FlagsMixin(PipelineTessellationStateCreateFlags).fromInt;
@@ -230,7 +230,7 @@ pub const PipelineTessellationStateCreateFlags = packed struct {
     pub const contains = FlagsMixin(PipelineTessellationStateCreateFlags).contains;
     pub const format = FlagFormatMixin(PipelineTessellationStateCreateFlags).format;
 };
-pub const PipelineInputAssemblyStateCreateFlags = packed struct {
+pub const PipelineInputAssemblyStateCreateFlags = packed struct(Flags) {
     _reserved_bits: Flags = 0,
     pub const toInt = FlagsMixin(PipelineInputAssemblyStateCreateFlags).toInt;
     pub const fromInt = FlagsMixin(PipelineInputAssemblyStateCreateFlags).fromInt;
@@ -241,7 +241,7 @@ pub const PipelineInputAssemblyStateCreateFlags = packed struct {
     pub const contains = FlagsMixin(PipelineInputAssemblyStateCreateFlags).contains;
     pub const format = FlagFormatMixin(PipelineInputAssemblyStateCreateFlags).format;
 };
-pub const PipelineVertexInputStateCreateFlags = packed struct {
+pub const PipelineVertexInputStateCreateFlags = packed struct(Flags) {
     _reserved_bits: Flags = 0,
     pub const toInt = FlagsMixin(PipelineVertexInputStateCreateFlags).toInt;
     pub const fromInt = FlagsMixin(PipelineVertexInputStateCreateFlags).fromInt;
@@ -252,7 +252,7 @@ pub const PipelineVertexInputStateCreateFlags = packed struct {
     pub const contains = FlagsMixin(PipelineVertexInputStateCreateFlags).contains;
     pub const format = FlagFormatMixin(PipelineVertexInputStateCreateFlags).format;
 };
-pub const BufferViewCreateFlags = packed struct {
+pub const BufferViewCreateFlags = packed struct(Flags) {
     _reserved_bits: Flags = 0,
     pub const toInt = FlagsMixin(BufferViewCreateFlags).toInt;
     pub const fromInt = FlagsMixin(BufferViewCreateFlags).fromInt;
@@ -263,7 +263,7 @@ pub const BufferViewCreateFlags = packed struct {
     pub const contains = FlagsMixin(BufferViewCreateFlags).contains;
     pub const format = FlagFormatMixin(BufferViewCreateFlags).format;
 };
-pub const DeviceCreateFlags = packed struct {
+pub const DeviceCreateFlags = packed struct(Flags) {
     _reserved_bits: Flags = 0,
     pub const toInt = FlagsMixin(DeviceCreateFlags).toInt;
     pub const fromInt = FlagsMixin(DeviceCreateFlags).fromInt;
@@ -274,7 +274,7 @@ pub const DeviceCreateFlags = packed struct {
     pub const contains = FlagsMixin(DeviceCreateFlags).contains;
     pub const format = FlagFormatMixin(DeviceCreateFlags).format;
 };
-pub const SemaphoreCreateFlags = packed struct {
+pub const SemaphoreCreateFlags = packed struct(Flags) {
     _reserved_bits: Flags = 0,
     pub const toInt = FlagsMixin(SemaphoreCreateFlags).toInt;
     pub const fromInt = FlagsMixin(SemaphoreCreateFlags).fromInt;
@@ -285,7 +285,7 @@ pub const SemaphoreCreateFlags = packed struct {
     pub const contains = FlagsMixin(SemaphoreCreateFlags).contains;
     pub const format = FlagFormatMixin(SemaphoreCreateFlags).format;
 };
-pub const ShaderModuleCreateFlags = packed struct {
+pub const ShaderModuleCreateFlags = packed struct(Flags) {
     _reserved_bits: Flags = 0,
     pub const toInt = FlagsMixin(ShaderModuleCreateFlags).toInt;
     pub const fromInt = FlagsMixin(ShaderModuleCreateFlags).fromInt;
@@ -297,7 +297,7 @@ pub const ShaderModuleCreateFlags = packed struct {
     pub const format = FlagFormatMixin(ShaderModuleCreateFlags).format;
 };
 pub const MemoryUnmapFlagsKHR = MemoryUnmapFlags;
-pub const DescriptorPoolResetFlags = packed struct {
+pub const DescriptorPoolResetFlags = packed struct(Flags) {
     _reserved_bits: Flags = 0,
     pub const toInt = FlagsMixin(DescriptorPoolResetFlags).toInt;
     pub const fromInt = FlagsMixin(DescriptorPoolResetFlags).fromInt;
@@ -311,7 +311,7 @@ pub const DescriptorPoolResetFlags = packed struct {
 pub const GeometryFlagsNV = GeometryFlagsKHR;
 pub const GeometryInstanceFlagsNV = GeometryInstanceFlagsKHR;
 pub const BuildAccelerationStructureFlagsNV = BuildAccelerationStructureFlagsKHR;
-pub const PrivateDataSlotCreateFlags = packed struct {
+pub const PrivateDataSlotCreateFlags = packed struct(Flags) {
     _reserved_bits: Flags = 0,
     pub const toInt = FlagsMixin(PrivateDataSlotCreateFlags).toInt;
     pub const fromInt = FlagsMixin(PrivateDataSlotCreateFlags).fromInt;
@@ -323,7 +323,7 @@ pub const PrivateDataSlotCreateFlags = packed struct {
     pub const format = FlagFormatMixin(PrivateDataSlotCreateFlags).format;
 };
 pub const PrivateDataSlotCreateFlagsEXT = PrivateDataSlotCreateFlags;
-pub const DescriptorUpdateTemplateCreateFlags = packed struct {
+pub const DescriptorUpdateTemplateCreateFlags = packed struct(Flags) {
     _reserved_bits: Flags = 0,
     pub const toInt = FlagsMixin(DescriptorUpdateTemplateCreateFlags).toInt;
     pub const fromInt = FlagsMixin(DescriptorUpdateTemplateCreateFlags).fromInt;
@@ -339,7 +339,7 @@ pub const PipelineCreationFeedbackFlagsEXT = PipelineCreationFeedbackFlags;
 pub const SemaphoreWaitFlagsKHR = SemaphoreWaitFlags;
 pub const AccessFlags2KHR = AccessFlags2;
 pub const PipelineStageFlags2KHR = PipelineStageFlags2;
-pub const AccelerationStructureMotionInfoFlagsNV = packed struct {
+pub const AccelerationStructureMotionInfoFlagsNV = packed struct(Flags) {
     _reserved_bits: Flags = 0,
     pub const toInt = FlagsMixin(AccelerationStructureMotionInfoFlagsNV).toInt;
     pub const fromInt = FlagsMixin(AccelerationStructureMotionInfoFlagsNV).fromInt;
@@ -350,7 +350,7 @@ pub const AccelerationStructureMotionInfoFlagsNV = packed struct {
     pub const contains = FlagsMixin(AccelerationStructureMotionInfoFlagsNV).contains;
     pub const format = FlagFormatMixin(AccelerationStructureMotionInfoFlagsNV).format;
 };
-pub const AccelerationStructureMotionInstanceFlagsNV = packed struct {
+pub const AccelerationStructureMotionInstanceFlagsNV = packed struct(Flags) {
     _reserved_bits: Flags = 0,
     pub const toInt = FlagsMixin(AccelerationStructureMotionInstanceFlagsNV).toInt;
     pub const fromInt = FlagsMixin(AccelerationStructureMotionInstanceFlagsNV).fromInt;
@@ -364,7 +364,7 @@ pub const AccelerationStructureMotionInstanceFlagsNV = packed struct {
 pub const FormatFeatureFlags2KHR = FormatFeatureFlags2;
 pub const MemoryDecompressionMethodFlagsNV = MemoryDecompressionMethodFlagsEXT;
 pub const RenderingFlagsKHR = RenderingFlags;
-pub const DirectDriverLoadingFlagsLUNARG = packed struct {
+pub const DirectDriverLoadingFlagsLUNARG = packed struct(Flags) {
     _reserved_bits: Flags = 0,
     pub const toInt = FlagsMixin(DirectDriverLoadingFlagsLUNARG).toInt;
     pub const fromInt = FlagsMixin(DirectDriverLoadingFlagsLUNARG).fromInt;
@@ -377,7 +377,7 @@ pub const DirectDriverLoadingFlagsLUNARG = packed struct {
 };
 pub const PipelineCreateFlags2KHR = PipelineCreateFlags2;
 pub const BufferUsageFlags2KHR = BufferUsageFlags2;
-pub const DisplayModeCreateFlagsKHR = packed struct {
+pub const DisplayModeCreateFlagsKHR = packed struct(Flags) {
     _reserved_bits: Flags = 0,
     pub const toInt = FlagsMixin(DisplayModeCreateFlagsKHR).toInt;
     pub const fromInt = FlagsMixin(DisplayModeCreateFlagsKHR).fromInt;
@@ -388,7 +388,7 @@ pub const DisplayModeCreateFlagsKHR = packed struct {
     pub const contains = FlagsMixin(DisplayModeCreateFlagsKHR).contains;
     pub const format = FlagFormatMixin(DisplayModeCreateFlagsKHR).format;
 };
-pub const DisplaySurfaceCreateFlagsKHR = packed struct {
+pub const DisplaySurfaceCreateFlagsKHR = packed struct(Flags) {
     _reserved_bits: Flags = 0,
     pub const toInt = FlagsMixin(DisplaySurfaceCreateFlagsKHR).toInt;
     pub const fromInt = FlagsMixin(DisplaySurfaceCreateFlagsKHR).fromInt;
@@ -399,7 +399,7 @@ pub const DisplaySurfaceCreateFlagsKHR = packed struct {
     pub const contains = FlagsMixin(DisplaySurfaceCreateFlagsKHR).contains;
     pub const format = FlagFormatMixin(DisplaySurfaceCreateFlagsKHR).format;
 };
-pub const AndroidSurfaceCreateFlagsKHR = packed struct {
+pub const AndroidSurfaceCreateFlagsKHR = packed struct(Flags) {
     _reserved_bits: Flags = 0,
     pub const toInt = FlagsMixin(AndroidSurfaceCreateFlagsKHR).toInt;
     pub const fromInt = FlagsMixin(AndroidSurfaceCreateFlagsKHR).fromInt;
@@ -410,7 +410,7 @@ pub const AndroidSurfaceCreateFlagsKHR = packed struct {
     pub const contains = FlagsMixin(AndroidSurfaceCreateFlagsKHR).contains;
     pub const format = FlagFormatMixin(AndroidSurfaceCreateFlagsKHR).format;
 };
-pub const ViSurfaceCreateFlagsNN = packed struct {
+pub const ViSurfaceCreateFlagsNN = packed struct(Flags) {
     _reserved_bits: Flags = 0,
     pub const toInt = FlagsMixin(ViSurfaceCreateFlagsNN).toInt;
     pub const fromInt = FlagsMixin(ViSurfaceCreateFlagsNN).fromInt;
@@ -421,7 +421,7 @@ pub const ViSurfaceCreateFlagsNN = packed struct {
     pub const contains = FlagsMixin(ViSurfaceCreateFlagsNN).contains;
     pub const format = FlagFormatMixin(ViSurfaceCreateFlagsNN).format;
 };
-pub const WaylandSurfaceCreateFlagsKHR = packed struct {
+pub const WaylandSurfaceCreateFlagsKHR = packed struct(Flags) {
     _reserved_bits: Flags = 0,
     pub const toInt = FlagsMixin(WaylandSurfaceCreateFlagsKHR).toInt;
     pub const fromInt = FlagsMixin(WaylandSurfaceCreateFlagsKHR).fromInt;
@@ -432,7 +432,7 @@ pub const WaylandSurfaceCreateFlagsKHR = packed struct {
     pub const contains = FlagsMixin(WaylandSurfaceCreateFlagsKHR).contains;
     pub const format = FlagFormatMixin(WaylandSurfaceCreateFlagsKHR).format;
 };
-pub const Win32SurfaceCreateFlagsKHR = packed struct {
+pub const Win32SurfaceCreateFlagsKHR = packed struct(Flags) {
     _reserved_bits: Flags = 0,
     pub const toInt = FlagsMixin(Win32SurfaceCreateFlagsKHR).toInt;
     pub const fromInt = FlagsMixin(Win32SurfaceCreateFlagsKHR).fromInt;
@@ -443,7 +443,7 @@ pub const Win32SurfaceCreateFlagsKHR = packed struct {
     pub const contains = FlagsMixin(Win32SurfaceCreateFlagsKHR).contains;
     pub const format = FlagFormatMixin(Win32SurfaceCreateFlagsKHR).format;
 };
-pub const XlibSurfaceCreateFlagsKHR = packed struct {
+pub const XlibSurfaceCreateFlagsKHR = packed struct(Flags) {
     _reserved_bits: Flags = 0,
     pub const toInt = FlagsMixin(XlibSurfaceCreateFlagsKHR).toInt;
     pub const fromInt = FlagsMixin(XlibSurfaceCreateFlagsKHR).fromInt;
@@ -454,7 +454,7 @@ pub const XlibSurfaceCreateFlagsKHR = packed struct {
     pub const contains = FlagsMixin(XlibSurfaceCreateFlagsKHR).contains;
     pub const format = FlagFormatMixin(XlibSurfaceCreateFlagsKHR).format;
 };
-pub const XcbSurfaceCreateFlagsKHR = packed struct {
+pub const XcbSurfaceCreateFlagsKHR = packed struct(Flags) {
     _reserved_bits: Flags = 0,
     pub const toInt = FlagsMixin(XcbSurfaceCreateFlagsKHR).toInt;
     pub const fromInt = FlagsMixin(XcbSurfaceCreateFlagsKHR).fromInt;
@@ -465,7 +465,7 @@ pub const XcbSurfaceCreateFlagsKHR = packed struct {
     pub const contains = FlagsMixin(XcbSurfaceCreateFlagsKHR).contains;
     pub const format = FlagFormatMixin(XcbSurfaceCreateFlagsKHR).format;
 };
-pub const DirectFBSurfaceCreateFlagsEXT = packed struct {
+pub const DirectFBSurfaceCreateFlagsEXT = packed struct(Flags) {
     _reserved_bits: Flags = 0,
     pub const toInt = FlagsMixin(DirectFBSurfaceCreateFlagsEXT).toInt;
     pub const fromInt = FlagsMixin(DirectFBSurfaceCreateFlagsEXT).fromInt;
@@ -476,7 +476,7 @@ pub const DirectFBSurfaceCreateFlagsEXT = packed struct {
     pub const contains = FlagsMixin(DirectFBSurfaceCreateFlagsEXT).contains;
     pub const format = FlagFormatMixin(DirectFBSurfaceCreateFlagsEXT).format;
 };
-pub const IOSSurfaceCreateFlagsMVK = packed struct {
+pub const IOSSurfaceCreateFlagsMVK = packed struct(Flags) {
     _reserved_bits: Flags = 0,
     pub const toInt = FlagsMixin(IOSSurfaceCreateFlagsMVK).toInt;
     pub const fromInt = FlagsMixin(IOSSurfaceCreateFlagsMVK).fromInt;
@@ -487,7 +487,7 @@ pub const IOSSurfaceCreateFlagsMVK = packed struct {
     pub const contains = FlagsMixin(IOSSurfaceCreateFlagsMVK).contains;
     pub const format = FlagFormatMixin(IOSSurfaceCreateFlagsMVK).format;
 };
-pub const MacOSSurfaceCreateFlagsMVK = packed struct {
+pub const MacOSSurfaceCreateFlagsMVK = packed struct(Flags) {
     _reserved_bits: Flags = 0,
     pub const toInt = FlagsMixin(MacOSSurfaceCreateFlagsMVK).toInt;
     pub const fromInt = FlagsMixin(MacOSSurfaceCreateFlagsMVK).fromInt;
@@ -498,7 +498,7 @@ pub const MacOSSurfaceCreateFlagsMVK = packed struct {
     pub const contains = FlagsMixin(MacOSSurfaceCreateFlagsMVK).contains;
     pub const format = FlagFormatMixin(MacOSSurfaceCreateFlagsMVK).format;
 };
-pub const MetalSurfaceCreateFlagsEXT = packed struct {
+pub const MetalSurfaceCreateFlagsEXT = packed struct(Flags) {
     _reserved_bits: Flags = 0,
     pub const toInt = FlagsMixin(MetalSurfaceCreateFlagsEXT).toInt;
     pub const fromInt = FlagsMixin(MetalSurfaceCreateFlagsEXT).fromInt;
@@ -509,7 +509,7 @@ pub const MetalSurfaceCreateFlagsEXT = packed struct {
     pub const contains = FlagsMixin(MetalSurfaceCreateFlagsEXT).contains;
     pub const format = FlagFormatMixin(MetalSurfaceCreateFlagsEXT).format;
 };
-pub const ImagePipeSurfaceCreateFlagsFUCHSIA = packed struct {
+pub const ImagePipeSurfaceCreateFlagsFUCHSIA = packed struct(Flags) {
     _reserved_bits: Flags = 0,
     pub const toInt = FlagsMixin(ImagePipeSurfaceCreateFlagsFUCHSIA).toInt;
     pub const fromInt = FlagsMixin(ImagePipeSurfaceCreateFlagsFUCHSIA).fromInt;
@@ -520,7 +520,7 @@ pub const ImagePipeSurfaceCreateFlagsFUCHSIA = packed struct {
     pub const contains = FlagsMixin(ImagePipeSurfaceCreateFlagsFUCHSIA).contains;
     pub const format = FlagFormatMixin(ImagePipeSurfaceCreateFlagsFUCHSIA).format;
 };
-pub const StreamDescriptorSurfaceCreateFlagsGGP = packed struct {
+pub const StreamDescriptorSurfaceCreateFlagsGGP = packed struct(Flags) {
     _reserved_bits: Flags = 0,
     pub const toInt = FlagsMixin(StreamDescriptorSurfaceCreateFlagsGGP).toInt;
     pub const fromInt = FlagsMixin(StreamDescriptorSurfaceCreateFlagsGGP).fromInt;
@@ -531,7 +531,7 @@ pub const StreamDescriptorSurfaceCreateFlagsGGP = packed struct {
     pub const contains = FlagsMixin(StreamDescriptorSurfaceCreateFlagsGGP).contains;
     pub const format = FlagFormatMixin(StreamDescriptorSurfaceCreateFlagsGGP).format;
 };
-pub const HeadlessSurfaceCreateFlagsEXT = packed struct {
+pub const HeadlessSurfaceCreateFlagsEXT = packed struct(Flags) {
     _reserved_bits: Flags = 0,
     pub const toInt = FlagsMixin(HeadlessSurfaceCreateFlagsEXT).toInt;
     pub const fromInt = FlagsMixin(HeadlessSurfaceCreateFlagsEXT).fromInt;
@@ -542,7 +542,7 @@ pub const HeadlessSurfaceCreateFlagsEXT = packed struct {
     pub const contains = FlagsMixin(HeadlessSurfaceCreateFlagsEXT).contains;
     pub const format = FlagFormatMixin(HeadlessSurfaceCreateFlagsEXT).format;
 };
-pub const ScreenSurfaceCreateFlagsQNX = packed struct {
+pub const ScreenSurfaceCreateFlagsQNX = packed struct(Flags) {
     _reserved_bits: Flags = 0,
     pub const toInt = FlagsMixin(ScreenSurfaceCreateFlagsQNX).toInt;
     pub const fromInt = FlagsMixin(ScreenSurfaceCreateFlagsQNX).fromInt;
@@ -555,7 +555,7 @@ pub const ScreenSurfaceCreateFlagsQNX = packed struct {
 };
 pub const PeerMemoryFeatureFlagsKHR = PeerMemoryFeatureFlags;
 pub const MemoryAllocateFlagsKHR = MemoryAllocateFlags;
-pub const CommandPoolTrimFlags = packed struct {
+pub const CommandPoolTrimFlags = packed struct(Flags) {
     _reserved_bits: Flags = 0,
     pub const toInt = FlagsMixin(CommandPoolTrimFlags).toInt;
     pub const fromInt = FlagsMixin(CommandPoolTrimFlags).fromInt;
@@ -575,7 +575,7 @@ pub const SemaphoreImportFlagsKHR = SemaphoreImportFlags;
 pub const ExternalFenceHandleTypeFlagsKHR = ExternalFenceHandleTypeFlags;
 pub const ExternalFenceFeatureFlagsKHR = ExternalFenceFeatureFlags;
 pub const FenceImportFlagsKHR = FenceImportFlags;
-pub const PipelineViewportSwizzleStateCreateFlagsNV = packed struct {
+pub const PipelineViewportSwizzleStateCreateFlagsNV = packed struct(Flags) {
     _reserved_bits: Flags = 0,
     pub const toInt = FlagsMixin(PipelineViewportSwizzleStateCreateFlagsNV).toInt;
     pub const fromInt = FlagsMixin(PipelineViewportSwizzleStateCreateFlagsNV).fromInt;
@@ -586,7 +586,7 @@ pub const PipelineViewportSwizzleStateCreateFlagsNV = packed struct {
     pub const contains = FlagsMixin(PipelineViewportSwizzleStateCreateFlagsNV).contains;
     pub const format = FlagFormatMixin(PipelineViewportSwizzleStateCreateFlagsNV).format;
 };
-pub const PipelineDiscardRectangleStateCreateFlagsEXT = packed struct {
+pub const PipelineDiscardRectangleStateCreateFlagsEXT = packed struct(Flags) {
     _reserved_bits: Flags = 0,
     pub const toInt = FlagsMixin(PipelineDiscardRectangleStateCreateFlagsEXT).toInt;
     pub const fromInt = FlagsMixin(PipelineDiscardRectangleStateCreateFlagsEXT).fromInt;
@@ -597,7 +597,7 @@ pub const PipelineDiscardRectangleStateCreateFlagsEXT = packed struct {
     pub const contains = FlagsMixin(PipelineDiscardRectangleStateCreateFlagsEXT).contains;
     pub const format = FlagFormatMixin(PipelineDiscardRectangleStateCreateFlagsEXT).format;
 };
-pub const PipelineCoverageToColorStateCreateFlagsNV = packed struct {
+pub const PipelineCoverageToColorStateCreateFlagsNV = packed struct(Flags) {
     _reserved_bits: Flags = 0,
     pub const toInt = FlagsMixin(PipelineCoverageToColorStateCreateFlagsNV).toInt;
     pub const fromInt = FlagsMixin(PipelineCoverageToColorStateCreateFlagsNV).fromInt;
@@ -608,7 +608,7 @@ pub const PipelineCoverageToColorStateCreateFlagsNV = packed struct {
     pub const contains = FlagsMixin(PipelineCoverageToColorStateCreateFlagsNV).contains;
     pub const format = FlagFormatMixin(PipelineCoverageToColorStateCreateFlagsNV).format;
 };
-pub const PipelineCoverageModulationStateCreateFlagsNV = packed struct {
+pub const PipelineCoverageModulationStateCreateFlagsNV = packed struct(Flags) {
     _reserved_bits: Flags = 0,
     pub const toInt = FlagsMixin(PipelineCoverageModulationStateCreateFlagsNV).toInt;
     pub const fromInt = FlagsMixin(PipelineCoverageModulationStateCreateFlagsNV).fromInt;
@@ -619,7 +619,7 @@ pub const PipelineCoverageModulationStateCreateFlagsNV = packed struct {
     pub const contains = FlagsMixin(PipelineCoverageModulationStateCreateFlagsNV).contains;
     pub const format = FlagFormatMixin(PipelineCoverageModulationStateCreateFlagsNV).format;
 };
-pub const PipelineCoverageReductionStateCreateFlagsNV = packed struct {
+pub const PipelineCoverageReductionStateCreateFlagsNV = packed struct(Flags) {
     _reserved_bits: Flags = 0,
     pub const toInt = FlagsMixin(PipelineCoverageReductionStateCreateFlagsNV).toInt;
     pub const fromInt = FlagsMixin(PipelineCoverageReductionStateCreateFlagsNV).fromInt;
@@ -630,7 +630,7 @@ pub const PipelineCoverageReductionStateCreateFlagsNV = packed struct {
     pub const contains = FlagsMixin(PipelineCoverageReductionStateCreateFlagsNV).contains;
     pub const format = FlagFormatMixin(PipelineCoverageReductionStateCreateFlagsNV).format;
 };
-pub const ValidationCacheCreateFlagsEXT = packed struct {
+pub const ValidationCacheCreateFlagsEXT = packed struct(Flags) {
     _reserved_bits: Flags = 0,
     pub const toInt = FlagsMixin(ValidationCacheCreateFlagsEXT).toInt;
     pub const fromInt = FlagsMixin(ValidationCacheCreateFlagsEXT).fromInt;
@@ -641,7 +641,7 @@ pub const ValidationCacheCreateFlagsEXT = packed struct {
     pub const contains = FlagsMixin(ValidationCacheCreateFlagsEXT).contains;
     pub const format = FlagFormatMixin(ValidationCacheCreateFlagsEXT).format;
 };
-pub const DebugUtilsMessengerCreateFlagsEXT = packed struct {
+pub const DebugUtilsMessengerCreateFlagsEXT = packed struct(Flags) {
     _reserved_bits: Flags = 0,
     pub const toInt = FlagsMixin(DebugUtilsMessengerCreateFlagsEXT).toInt;
     pub const fromInt = FlagsMixin(DebugUtilsMessengerCreateFlagsEXT).fromInt;
@@ -652,7 +652,7 @@ pub const DebugUtilsMessengerCreateFlagsEXT = packed struct {
     pub const contains = FlagsMixin(DebugUtilsMessengerCreateFlagsEXT).contains;
     pub const format = FlagFormatMixin(DebugUtilsMessengerCreateFlagsEXT).format;
 };
-pub const DebugUtilsMessengerCallbackDataFlagsEXT = packed struct {
+pub const DebugUtilsMessengerCallbackDataFlagsEXT = packed struct(Flags) {
     _reserved_bits: Flags = 0,
     pub const toInt = FlagsMixin(DebugUtilsMessengerCallbackDataFlagsEXT).toInt;
     pub const fromInt = FlagsMixin(DebugUtilsMessengerCallbackDataFlagsEXT).fromInt;
@@ -663,7 +663,7 @@ pub const DebugUtilsMessengerCallbackDataFlagsEXT = packed struct {
     pub const contains = FlagsMixin(DebugUtilsMessengerCallbackDataFlagsEXT).contains;
     pub const format = FlagFormatMixin(DebugUtilsMessengerCallbackDataFlagsEXT).format;
 };
-pub const DeviceMemoryReportFlagsEXT = packed struct {
+pub const DeviceMemoryReportFlagsEXT = packed struct(Flags) {
     _reserved_bits: Flags = 0,
     pub const toInt = FlagsMixin(DeviceMemoryReportFlagsEXT).toInt;
     pub const fromInt = FlagsMixin(DeviceMemoryReportFlagsEXT).fromInt;
@@ -674,7 +674,7 @@ pub const DeviceMemoryReportFlagsEXT = packed struct {
     pub const contains = FlagsMixin(DeviceMemoryReportFlagsEXT).contains;
     pub const format = FlagFormatMixin(DeviceMemoryReportFlagsEXT).format;
 };
-pub const PipelineRasterizationConservativeStateCreateFlagsEXT = packed struct {
+pub const PipelineRasterizationConservativeStateCreateFlagsEXT = packed struct(Flags) {
     _reserved_bits: Flags = 0,
     pub const toInt = FlagsMixin(PipelineRasterizationConservativeStateCreateFlagsEXT).toInt;
     pub const fromInt = FlagsMixin(PipelineRasterizationConservativeStateCreateFlagsEXT).fromInt;
@@ -687,7 +687,7 @@ pub const PipelineRasterizationConservativeStateCreateFlagsEXT = packed struct {
 };
 pub const DescriptorBindingFlagsEXT = DescriptorBindingFlags;
 pub const ResolveModeFlagsKHR = ResolveModeFlags;
-pub const PipelineRasterizationStateStreamCreateFlagsEXT = packed struct {
+pub const PipelineRasterizationStateStreamCreateFlagsEXT = packed struct(Flags) {
     _reserved_bits: Flags = 0,
     pub const toInt = FlagsMixin(PipelineRasterizationStateStreamCreateFlagsEXT).toInt;
     pub const fromInt = FlagsMixin(PipelineRasterizationStateStreamCreateFlagsEXT).fromInt;
@@ -698,7 +698,7 @@ pub const PipelineRasterizationStateStreamCreateFlagsEXT = packed struct {
     pub const contains = FlagsMixin(PipelineRasterizationStateStreamCreateFlagsEXT).contains;
     pub const format = FlagFormatMixin(PipelineRasterizationStateStreamCreateFlagsEXT).format;
 };
-pub const PipelineRasterizationDepthClipStateCreateFlagsEXT = packed struct {
+pub const PipelineRasterizationDepthClipStateCreateFlagsEXT = packed struct(Flags) {
     _reserved_bits: Flags = 0,
     pub const toInt = FlagsMixin(PipelineRasterizationDepthClipStateCreateFlagsEXT).toInt;
     pub const fromInt = FlagsMixin(PipelineRasterizationDepthClipStateCreateFlagsEXT).fromInt;
@@ -711,7 +711,7 @@ pub const PipelineRasterizationDepthClipStateCreateFlagsEXT = packed struct {
 };
 pub const ToolPurposeFlagsEXT = ToolPurposeFlags;
 pub const SubmitFlagsKHR = SubmitFlags;
-pub const ImageFormatConstraintsFlagsFUCHSIA = packed struct {
+pub const ImageFormatConstraintsFlagsFUCHSIA = packed struct(Flags) {
     _reserved_bits: Flags = 0,
     pub const toInt = FlagsMixin(ImageFormatConstraintsFlagsFUCHSIA).toInt;
     pub const fromInt = FlagsMixin(ImageFormatConstraintsFlagsFUCHSIA).fromInt;
@@ -725,7 +725,7 @@ pub const ImageFormatConstraintsFlagsFUCHSIA = packed struct {
 pub const HostImageCopyFlagsEXT = HostImageCopyFlags;
 pub const PresentScalingFlagsEXT = PresentScalingFlagsKHR;
 pub const PresentGravityFlagsEXT = PresentGravityFlagsKHR;
-pub const SurfaceCreateFlagsOHOS = packed struct {
+pub const SurfaceCreateFlagsOHOS = packed struct(Flags) {
     _reserved_bits: Flags = 0,
     pub const toInt = FlagsMixin(SurfaceCreateFlagsOHOS).toInt;
     pub const fromInt = FlagsMixin(SurfaceCreateFlagsOHOS).fromInt;
@@ -736,7 +736,7 @@ pub const SurfaceCreateFlagsOHOS = packed struct {
     pub const contains = FlagsMixin(SurfaceCreateFlagsOHOS).contains;
     pub const format = FlagFormatMixin(SurfaceCreateFlagsOHOS).format;
 };
-pub const PerformanceCounterDescriptionFlagsARM = packed struct {
+pub const PerformanceCounterDescriptionFlagsARM = packed struct(Flags) {
     _reserved_bits: Flags = 0,
     pub const toInt = FlagsMixin(PerformanceCounterDescriptionFlagsARM).toInt;
     pub const fromInt = FlagsMixin(PerformanceCounterDescriptionFlagsARM).fromInt;
@@ -747,7 +747,7 @@ pub const PerformanceCounterDescriptionFlagsARM = packed struct {
     pub const contains = FlagsMixin(PerformanceCounterDescriptionFlagsARM).contains;
     pub const format = FlagFormatMixin(PerformanceCounterDescriptionFlagsARM).format;
 };
-pub const VideoBeginCodingFlagsKHR = packed struct {
+pub const VideoBeginCodingFlagsKHR = packed struct(Flags) {
     _reserved_bits: Flags = 0,
     pub const toInt = FlagsMixin(VideoBeginCodingFlagsKHR).toInt;
     pub const fromInt = FlagsMixin(VideoBeginCodingFlagsKHR).fromInt;
@@ -758,7 +758,7 @@ pub const VideoBeginCodingFlagsKHR = packed struct {
     pub const contains = FlagsMixin(VideoBeginCodingFlagsKHR).contains;
     pub const format = FlagFormatMixin(VideoBeginCodingFlagsKHR).format;
 };
-pub const VideoEndCodingFlagsKHR = packed struct {
+pub const VideoEndCodingFlagsKHR = packed struct(Flags) {
     _reserved_bits: Flags = 0,
     pub const toInt = FlagsMixin(VideoEndCodingFlagsKHR).toInt;
     pub const fromInt = FlagsMixin(VideoEndCodingFlagsKHR).fromInt;
@@ -769,7 +769,7 @@ pub const VideoEndCodingFlagsKHR = packed struct {
     pub const contains = FlagsMixin(VideoEndCodingFlagsKHR).contains;
     pub const format = FlagFormatMixin(VideoEndCodingFlagsKHR).format;
 };
-pub const VideoDecodeFlagsKHR = packed struct {
+pub const VideoDecodeFlagsKHR = packed struct(Flags) {
     _reserved_bits: Flags = 0,
     pub const toInt = FlagsMixin(VideoDecodeFlagsKHR).toInt;
     pub const fromInt = FlagsMixin(VideoDecodeFlagsKHR).fromInt;
@@ -780,7 +780,7 @@ pub const VideoDecodeFlagsKHR = packed struct {
     pub const contains = FlagsMixin(VideoDecodeFlagsKHR).contains;
     pub const format = FlagFormatMixin(VideoDecodeFlagsKHR).format;
 };
-pub const VideoEncodeRateControlFlagsKHR = packed struct {
+pub const VideoEncodeRateControlFlagsKHR = packed struct(Flags) {
     _reserved_bits: Flags = 0,
     pub const toInt = FlagsMixin(VideoEncodeRateControlFlagsKHR).toInt;
     pub const fromInt = FlagsMixin(VideoEncodeRateControlFlagsKHR).fromInt;
