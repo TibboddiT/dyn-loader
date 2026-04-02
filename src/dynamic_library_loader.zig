@@ -479,6 +479,14 @@ fn logSummary() void {
 }
 
 // TODO thread safety
+pub fn resolve(name: []const u8) !?[]const u8 {
+    return resolvePath(name, true) catch |err| switch (err) {
+        error.LibraryNotFound => null,
+        else => |e| return e,
+    };
+}
+
+// TODO thread safety
 // TODO handle errors gracefully
 pub fn loadSystemLibC() !DynamicLibrary {
     const candidates = [_][]const u8{
