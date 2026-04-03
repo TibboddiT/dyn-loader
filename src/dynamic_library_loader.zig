@@ -2998,19 +2998,20 @@ fn resolveSymbolByName(sym_name: []const u8) !ResolvedSymbol {
 // TODO the next 3 functions are very ugly and need factorization
 
 // TODO thread safety (called from Symbol)
-fn getResolvedSymbolByName(maybe_dyn_object: ?*DynObject, sym_name: []const u8, skip_first: bool) !ResolvedSymbol {
-    var first_skipped = false;
-
+fn getResolvedSymbolByName(maybe_dyn_object: ?*DynObject, sym_name: []const u8, find_next: bool) !ResolvedSymbol {
     if (maybe_dyn_object) |dyn_object| {
-        for (dyn_object.deps_breadth_first.items) |dep_idx| {
+        for (dyn_object.deps_breadth_first.items, 0..) |dep_idx, dep_order| {
             const dep_object = &dyn_objects.values()[dep_idx];
 
-            if (dep_object.syms.get(sym_name)) |dep_sym_list| {
-                if (skip_first and !first_skipped) {
-                    first_skipped = true;
-                    continue;
-                }
+            if (find_next and dep_order == 0) {
+                continue;
+            }
 
+            if (dep_object.ref_count == 0) {
+                continue;
+            }
+
+            if (dep_object.syms.get(sym_name)) |dep_sym_list| {
                 for (dep_sym_list.items) |dep_sym_idx| {
                     const dep_sym = dep_object.syms_array.items[dep_sym_idx];
                     if (dep_sym.shidx != std.elf.SHN_UNDEF and !dep_sym.hidden) {
@@ -3062,15 +3063,14 @@ fn getResolvedSymbolByName(maybe_dyn_object: ?*DynObject, sym_name: []const u8, 
             }
         }
     } else {
-        for (0..dyn_objects.count()) |dep_idx| {
+        for (dyn_objects_sorted_indices.items) |dep_idx| {
             const dep_object = &dyn_objects.values()[dep_idx];
 
-            if (dep_object.syms.get(sym_name)) |dep_sym_list| {
-                if (skip_first and !first_skipped) {
-                    first_skipped = true;
-                    continue;
-                }
+            if (dep_object.ref_count == 0) {
+                continue;
+            }
 
+            if (dep_object.syms.get(sym_name)) |dep_sym_list| {
                 for (dep_sym_list.items) |dep_sym_idx| {
                     const dep_sym = dep_object.syms_array.items[dep_sym_idx];
                     if (dep_sym.shidx != std.elf.SHN_UNDEF and !dep_sym.hidden) {
@@ -3132,19 +3132,20 @@ fn getResolvedSymbolByName(maybe_dyn_object: ?*DynObject, sym_name: []const u8, 
 }
 
 // TODO thread safety (called from Symbol)
-fn getResolvedSymbolByNameAndVersion(maybe_dyn_object: ?*DynObject, sym_name: []const u8, version: []const u8, skip_first: bool) !ResolvedSymbol {
-    var first_skipped = false;
-
+fn getResolvedSymbolByNameAndVersion(maybe_dyn_object: ?*DynObject, sym_name: []const u8, version: []const u8, find_next: bool) !ResolvedSymbol {
     if (maybe_dyn_object) |dyn_object| {
-        for (dyn_object.deps_breadth_first.items) |dep_idx| {
+        for (dyn_object.deps_breadth_first.items, 0..) |dep_idx, dep_order| {
             const dep_object = &dyn_objects.values()[dep_idx];
 
-            if (dep_object.syms.get(sym_name)) |dep_sym_list| {
-                if (skip_first and !first_skipped) {
-                    first_skipped = true;
-                    continue;
-                }
+            if (find_next and dep_order == 0) {
+                continue;
+            }
 
+            if (dep_object.ref_count == 0) {
+                continue;
+            }
+
+            if (dep_object.syms.get(sym_name)) |dep_sym_list| {
                 for (dep_sym_list.items) |dep_sym_idx| {
                     const dep_sym = dep_object.syms_array.items[dep_sym_idx];
                     if (std.mem.eql(u8, dep_sym.version, version) and dep_sym.shidx != std.elf.SHN_UNDEF and !dep_sym.hidden) {
@@ -3196,15 +3197,14 @@ fn getResolvedSymbolByNameAndVersion(maybe_dyn_object: ?*DynObject, sym_name: []
             }
         }
     } else {
-        for (0..dyn_objects.count()) |dep_idx| {
+        for (dyn_objects_sorted_indices.items) |dep_idx| {
             const dep_object = &dyn_objects.values()[dep_idx];
 
-            if (dep_object.syms.get(sym_name)) |dep_sym_list| {
-                if (skip_first and !first_skipped) {
-                    first_skipped = true;
-                    continue;
-                }
+            if (dep_object.ref_count == 0) {
+                continue;
+            }
 
+            if (dep_object.syms.get(sym_name)) |dep_sym_list| {
                 for (dep_sym_list.items) |dep_sym_idx| {
                     const dep_sym = dep_object.syms_array.items[dep_sym_idx];
                     if (std.mem.eql(u8, dep_sym.version, version) and dep_sym.shidx != std.elf.SHN_UNDEF and !dep_sym.hidden) {
@@ -4203,11 +4203,27 @@ fn dlsymSubstitute(lib_handle: ?*anyopaque, sym_name: [*:0]const u8) callconv(.c
         return null;
     }
 
-    if (lib_handle != null and @intFromPtr(lib_handle.?) == std.math.maxInt(usize)) {
-        Logger.warn("dlsym(RTLD_NEXT, \"{s}\"): incomplete implementation invoked for handle = RTLD_NEXT", .{sym_name}); // TODO
-    }
+    const find_next = lib_handle != null and @intFromPtr(lib_handle.?) == std.math.maxInt(usize);
 
-    const dyn_object = if (lib_handle != null and @intFromPtr(lib_handle.?) != std.math.maxInt(usize) - 1 and @intFromPtr(lib_handle.?) != std.math.maxInt(usize)) &dyn_objects.values()[@intFromPtr(lib_handle.?) - 1] else null;
+    var dyn_object: ?*DynObject = null;
+
+    if (find_next) {
+        const caller_addr = @returnAddress();
+        const infos = findDynObjectSegmentForLoadedAddr(caller_addr) catch |err| {
+            if (last_dl_error != null) {
+                dll_allocator.free(last_dl_error.?);
+            }
+            last_dl_error = std.fmt.allocPrintSentinel(dll_allocator, "unable to resolve RTLD_NEXT caller for symbol {s} at 0x{x}: {}", .{ sym_name, caller_addr, err }, 0) catch @panic("OOM");
+
+            Logger.warn("dlsym(RTLD_NEXT, \"{s}\") failed: unable to resolve caller at 0x{x}: {}", .{ sym_name, caller_addr, err });
+
+            return null;
+        };
+
+        dyn_object = infos.dyn_object;
+    } else if (lib_handle != null and @intFromPtr(lib_handle.?) != std.math.maxInt(usize) - 1) {
+        dyn_object = &dyn_objects.values()[@intFromPtr(lib_handle.?) - 1];
+    }
 
     if (dyn_object != null and dyn_object.?.ref_count == 0) {
         if (last_dl_error != null) {
@@ -4220,7 +4236,7 @@ fn dlsymSubstitute(lib_handle: ?*anyopaque, sym_name: [*:0]const u8) callconv(.c
         return null;
     }
 
-    const sym = getResolvedSymbolByName(dyn_object, std.mem.span(sym_name), lib_handle != null and @intFromPtr(lib_handle.?) == std.math.maxInt(usize)) catch |err| {
+    const sym = getResolvedSymbolByName(dyn_object, std.mem.span(sym_name), find_next) catch |err| {
         if (last_dl_error != null) {
             dll_allocator.free(last_dl_error.?);
         }
@@ -4250,11 +4266,27 @@ fn dlvsymSubstitute(lib_handle: ?*anyopaque, sym_name: [*:0]const u8, version: [
         return null;
     }
 
-    if (lib_handle != null and @intFromPtr(lib_handle.?) == std.math.maxInt(usize)) {
-        Logger.warn("dlsym(RTLD_NEXT, \"{s}\", \"{s}\"): incomplete implementation invoked for handle = RTLD_NEXT", .{ sym_name, version }); // TODO
-    }
+    const find_next = lib_handle != null and @intFromPtr(lib_handle.?) == std.math.maxInt(usize);
 
-    const dyn_object = if (lib_handle != null and @intFromPtr(lib_handle.?) != std.math.maxInt(usize) - 1 and @intFromPtr(lib_handle.?) != std.math.maxInt(usize)) &dyn_objects.values()[@intFromPtr(lib_handle.?) - 1] else null;
+    var dyn_object: ?*DynObject = null;
+
+    if (find_next) {
+        const caller_addr = @returnAddress();
+        const infos = findDynObjectSegmentForLoadedAddr(caller_addr) catch |err| {
+            if (last_dl_error != null) {
+                dll_allocator.free(last_dl_error.?);
+            }
+            last_dl_error = std.fmt.allocPrintSentinel(dll_allocator, "unable to resolve RTLD_NEXT caller for symbol {s}@{s} at 0x{x}: {}", .{ sym_name, version, caller_addr, err }, 0) catch @panic("OOM");
+
+            Logger.warn("dlvsym(RTLD_NEXT, \"{s}\", \"{s}\") failed: unable to resolve caller at 0x{x}: {}", .{ sym_name, version, caller_addr, err });
+
+            return null;
+        };
+
+        dyn_object = infos.dyn_object;
+    } else if (lib_handle != null and @intFromPtr(lib_handle.?) != std.math.maxInt(usize) - 1) {
+        dyn_object = &dyn_objects.values()[@intFromPtr(lib_handle.?) - 1];
+    }
 
     if (dyn_object != null and dyn_object.?.ref_count == 0) {
         if (last_dl_error != null) {
@@ -4267,7 +4299,7 @@ fn dlvsymSubstitute(lib_handle: ?*anyopaque, sym_name: [*:0]const u8, version: [
         return null;
     }
 
-    const sym = getResolvedSymbolByNameAndVersion(dyn_object, std.mem.span(sym_name), std.mem.span(version), lib_handle != null and @intFromPtr(lib_handle.?) == std.math.maxInt(usize)) catch |err| {
+    const sym = getResolvedSymbolByNameAndVersion(dyn_object, std.mem.span(sym_name), std.mem.span(version), find_next) catch |err| {
         if (last_dl_error != null) {
             dll_allocator.free(last_dl_error.?);
         }
