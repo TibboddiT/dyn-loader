@@ -180,6 +180,18 @@ pub const DynamicLibrary = struct {
     index: usize,
 
     pub fn getSymbol(lib: DynamicLibrary, sym_name: []const u8) !Symbol {
+        for (preload_root_indices.items) |preload_idx| {
+            const preload_dyn_obj = &dyn_objects.values()[preload_idx];
+            const preload_sym = getResolvedSymbolByName(preload_dyn_obj, sym_name, false) catch |err| switch (err) {
+                error.UnresolvedSymbol => continue,
+                else => |e| return e,
+            };
+
+            return .{
+                .addr = preload_sym.address,
+            };
+        }
+
         const dyn_obj = &dyn_objects.values()[lib.index];
         const sym = try getResolvedSymbolByName(dyn_obj, sym_name, false);
         return .{
@@ -196,6 +208,7 @@ pub const DynamicLibrary = struct {
 // TODO global state
 var dyn_objects: DynObjectList = .empty;
 var dyn_objects_sorted_indices: std.ArrayList(usize) = .empty;
+var preload_root_indices: std.ArrayList(usize) = .empty;
 
 const Logger = struct {
     const Level = enum {
@@ -370,6 +383,7 @@ pub fn deinit() void {
 
     dyn_objects.clearAndFree(dll_allocator);
     dyn_objects_sorted_indices.deinit(dll_allocator);
+    preload_root_indices.deinit(dll_allocator);
 
     ifunc_resolved_addrs.clearAndFree(dll_allocator);
     irel_resolved_targets.clearAndFree(dll_allocator);
@@ -641,10 +655,14 @@ fn loadPreloads() void {
         var last_err: ?anyerror = null;
         var loaded = false;
         for (candidates.items) |candidate| {
-            _ = load(candidate) catch |err| {
+            const preload_lib = load(candidate) catch |err| {
                 last_err = err;
                 continue;
             };
+
+            if (std.mem.findScalar(usize, preload_root_indices.items, preload_lib.index) == null) {
+                preload_root_indices.append(dll_allocator, preload_lib.index) catch @panic("OOM");
+            }
 
             Logger.info("preload: loaded {s} for {s}", .{ candidate, entry });
 
