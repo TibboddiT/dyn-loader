@@ -346,11 +346,13 @@ pub fn deinit() void {
             continue;
         }
 
+        dyn_object.init_called = false;
+
         callFiniFunctions(dyn_object) catch |err| {
+            dyn_object.init_called = true;
             Logger.warn("deinit: unable to close library {s}: {}", .{ dyn_object.name, err });
         };
 
-        dyn_object.init_called = false;
         dyn_object.ref_count = 0;
     }
 
@@ -749,8 +751,11 @@ pub fn load(f_path: []const u8) !DynamicLibrary {
             continue;
         }
 
-        try callInitFunctions(dyn_obj);
         dyn_obj.init_called = true;
+        callInitFunctions(dyn_obj) catch |err| {
+            dyn_obj.init_called = false;
+            return err;
+        };
     }
 
     return lib;
@@ -4188,7 +4193,11 @@ fn dlcloseSubstitute(lib: *anyopaque) callconv(.c) c_int {
             continue;
         }
 
+        dep_dyn_object.init_called = false;
+
         callFiniFunctions(dep_dyn_object) catch |err| {
+            dep_dyn_object.init_called = true;
+
             if (last_dl_error != null) {
                 dll_allocator.free(last_dl_error.?);
             }
@@ -4198,8 +4207,6 @@ fn dlcloseSubstitute(lib: *anyopaque) callconv(.c) c_int {
 
             return 1;
         };
-
-        dep_dyn_object.init_called = false;
     }
 
     Logger.info("intercepted call: success: dlclose(0x{x} [{s}]) = 0", .{ handle, dyn_object.name });
