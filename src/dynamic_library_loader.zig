@@ -4300,6 +4300,11 @@ fn dlcloseSubstitute(lib: *anyopaque) callconv(.c) c_int {
     Logger.debug("intercepted call: dlclose(0x{x})", .{@intFromPtr(lib)});
 
     const handle = @intFromPtr(lib);
+    if (handle == std.math.maxInt(usize) - 1) {
+        Logger.info("intercepted call: success: dlclose(0x{x} [RTLD_MAIN]) = 0", .{handle});
+        return 0;
+    }
+
     if (handle == 0 or handle - 1 >= dyn_objects.count()) {
         if (last_dl_error != null) {
             dll_allocator.free(last_dl_error.?);
