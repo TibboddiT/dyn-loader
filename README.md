@@ -50,8 +50,6 @@ pub fn main(init: std.process.Init) !void {
 - Dirty tricks are used to accommodate patched libc versions from various distros.
 - Some libc functions that need to be implemented in zig are not yet implemented.
 - When called from a loaded library, `dlopen` flags are not honored (basically always `RTLD_NOW | RTLD_LOCAL`, but not exactly).
-- When called from a loaded library, `dlclose` is a noop.
-- `fini` and `fini_array` functions are not called.
 
 ### How it works
 
