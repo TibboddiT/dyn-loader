@@ -524,6 +524,117 @@ pub fn loadSystemLibC() !DynamicLibrary {
     return error.SystemLibcNotFound;
 }
 
+// TODO global state
+var preloads_processed: bool = false;
+
+fn appendLdExpansions(list: *std.ArrayList([]const u8), value: []const u8) !void {
+    // TODO max len?
+    var expanded_buf: [2048]u8 = @splat(0);
+    var expanded = try std.fmt.bufPrint(&expanded_buf, "{s}", .{value});
+
+    var expanded_tmp_buf: [2048]u8 = @splat(0);
+
+    // TODO what if `value` contains the same token multiple times?
+
+    if (std.mem.find(u8, expanded, "$ORIGIN")) |idx| {
+        const origin = try std.process.executableDirPathAlloc(dll_io, dll_allocator);
+        defer dll_allocator.free(origin);
+        @memcpy(expanded_tmp_buf[0..expanded.len], expanded);
+        expanded = try std.fmt.bufPrint(&expanded_buf, "{s}{s}{s}", .{ expanded_tmp_buf[0..idx], origin, expanded_tmp_buf[idx + "$ORIGIN".len ..] });
+    }
+
+    if (std.mem.find(u8, expanded, "${ORIGIN}")) |idx| {
+        const origin = try std.process.executableDirPathAlloc(dll_io, dll_allocator);
+        defer dll_allocator.free(origin);
+        @memcpy(expanded_tmp_buf[0..expanded.len], expanded);
+        expanded = try std.fmt.bufPrint(&expanded_buf, "{s}{s}{s}", .{ expanded_tmp_buf[0..idx], origin, expanded_tmp_buf[idx + "${ORIGIN}".len ..] });
+    }
+
+    if (std.mem.find(u8, expanded, "$PLATFORM")) |idx| {
+        const platform_ptr = std.os.linux.getauxval(std.elf.AT_PLATFORM);
+        const platform = if (platform_ptr == 0) try dll_allocator.dupe(u8, "x86_64") else try dll_allocator.dupe(u8, std.mem.span(@as([*:0]const u8, @ptrFromInt(platform_ptr))));
+        defer dll_allocator.free(platform);
+        @memcpy(expanded_tmp_buf[0..expanded.len], expanded);
+        expanded = try std.fmt.bufPrint(&expanded_buf, "{s}{s}{s}", .{ expanded_tmp_buf[0..idx], platform, expanded_tmp_buf[idx + "$PLATFORM".len ..] });
+    }
+
+    if (std.mem.find(u8, expanded, "${PLATFORM}")) |idx| {
+        const platform_ptr = std.os.linux.getauxval(std.elf.AT_PLATFORM);
+        const platform = if (platform_ptr == 0) try dll_allocator.dupe(u8, "x86_64") else try dll_allocator.dupe(u8, std.mem.span(@as([*:0]const u8, @ptrFromInt(platform_ptr))));
+        defer dll_allocator.free(platform);
+        @memcpy(expanded_tmp_buf[0..expanded.len], expanded);
+        expanded = try std.fmt.bufPrint(&expanded_buf, "{s}{s}{s}", .{ expanded_tmp_buf[0..idx], platform, expanded_tmp_buf[idx + "${PLATFORM}".len ..] });
+    }
+
+    if (std.mem.find(u8, expanded, "$LIB") == null and std.mem.find(u8, expanded, "${LIB}") == null) {
+        try list.append(dll_allocator, try dll_allocator.dupe(u8, expanded));
+        return;
+    }
+
+    const lib_values = [_][]const u8{ "lib/x86_64-linux-gnu", "lib64", "lib" };
+
+    var expanded_candidate_buf: [2048]u8 = @splat(0);
+
+    if (std.mem.find(u8, expanded, "$LIB")) |idx| {
+        for (lib_values) |lv| {
+            const expanded_candidate = try std.fmt.bufPrint(&expanded_candidate_buf, "{s}{s}{s}", .{ expanded[0..idx], lv, expanded[idx + "$LIB".len ..] });
+            try list.append(dll_allocator, try dll_allocator.dupe(u8, expanded_candidate));
+        }
+    }
+
+    if (std.mem.find(u8, expanded, "${LIB}")) |idx| {
+        for (lib_values) |lv| {
+            const expanded_candidate = try std.fmt.bufPrint(&expanded_candidate_buf, "{s}{s}{s}", .{ expanded[0..idx], lv, expanded[idx + "$LIB".len ..] });
+            try list.append(dll_allocator, try dll_allocator.dupe(u8, expanded_candidate));
+        }
+    }
+}
+
+fn loadPreloads() void {
+    if (preloads_processed) {
+        return;
+    }
+    preloads_processed = true;
+
+    const preload_list = dll_environ.getPosix("LD_PRELOAD") orelse return;
+
+    var candidates: std.ArrayList([]const u8) = .empty;
+    defer candidates.deinit(dll_allocator);
+
+    var it = std.mem.tokenizeAny(u8, preload_list, ": \t\n\r");
+    while (it.next()) |entry| {
+        defer {
+            for (candidates.items) |candidate| {
+                dll_allocator.free(candidate);
+            }
+            candidates.clearRetainingCapacity();
+        }
+
+        appendLdExpansions(&candidates, entry) catch |err| {
+            Logger.err("preload: cannot expand {s}: {}", .{ entry, err });
+            continue;
+        };
+
+        var last_err: ?anyerror = null;
+        var loaded = false;
+        for (candidates.items) |candidate| {
+            _ = load(candidate) catch |err| {
+                last_err = err;
+                continue;
+            };
+
+            Logger.info("preload: loaded {s} for {s}", .{ candidate, entry });
+
+            loaded = true;
+            break;
+        }
+
+        if (!loaded) {
+            Logger.warn("preload: unable to load {s}: {}", .{ entry, last_err orelse error.LibraryNotFound });
+        }
+    }
+}
+
 // TODO thread safety
 // TODO handle errors gracefully
 pub fn load(f_path: []const u8) !DynamicLibrary {
@@ -535,6 +646,8 @@ pub fn load(f_path: []const u8) !DynamicLibrary {
     // - open flags
     // - rpath
     // - LD_* env vars
+
+    loadPreloads();
 
     const lib = try loadDepTree(f_path);
 
@@ -660,13 +773,29 @@ fn resolvePath(r_path: []const u8, check_mode: bool) ![]const u8 {
     // TODO max path len
     var buf: [2048]u8 = @splat(0);
 
-    var path: ?[]const u8 = null;
+    if (dll_environ.getPosix("LD_LIBRARY_PATH")) |dir_list| {
+        var dirs_it = std.mem.splitScalar(u8, dir_list, ':');
+        while (dirs_it.next()) |dir| {
+            if (dir.len == 0) {
+                continue;
+            }
 
+            const a_path = std.fmt.bufPrint(&buf, "{s}/{s}", .{ dir, r_path }) catch |err| switch (err) {
+                error.NoSpaceLeft => continue,
+                else => |e| return e,
+            };
+
+            std.Io.Dir.accessAbsolute(dll_io, a_path, .{ .read = true }) catch continue;
+
+            const path = try std.fmt.allocPrint(dll_allocator, "{s}", .{a_path});
+            Logger.debug("found {s} via LD_LIBRARY_PATH: {s}", .{ r_path, path });
+            return path;
+        }
+    }
+
+    var path: ?[]const u8 = null;
     for (lib_dirs) |dir| {
-        const a_path = try std.fmt.bufPrint(&buf, "{s}/{s}", .{
-            dir,
-            r_path,
-        });
+        const a_path = try std.fmt.bufPrint(&buf, "{s}/{s}", .{ dir, r_path });
 
         std.Io.Dir.accessAbsolute(dll_io, a_path, .{ .read = true }) catch continue;
 
