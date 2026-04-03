@@ -182,7 +182,7 @@ pub const DynamicLibrary = struct {
     pub fn getSymbol(lib: DynamicLibrary, sym_name: []const u8) !Symbol {
         for (preload_root_indices.items) |preload_idx| {
             const preload_dyn_obj = &dyn_objects.values()[preload_idx];
-            const preload_sym = getResolvedSymbolByName(preload_dyn_obj, sym_name, false) catch |err| switch (err) {
+            const preload_sym = getResolvedSymbolByName(preload_dyn_obj, sym_name, false, false, true) catch |err| switch (err) {
                 error.UnresolvedSymbol => continue,
                 else => |e| return e,
             };
@@ -193,7 +193,7 @@ pub const DynamicLibrary = struct {
         }
 
         const dyn_obj = &dyn_objects.values()[lib.index];
-        const sym = try getResolvedSymbolByName(dyn_obj, sym_name, false);
+        const sym = try getResolvedSymbolByName(dyn_obj, sym_name, false, false, true);
         return .{
             .addr = sym.address,
         };
@@ -762,7 +762,7 @@ pub fn load(f_path: []const u8) !DynamicLibrary {
 }
 
 pub fn getSymbol(sym_name: []const u8) !Symbol {
-    const sym = try getResolvedSymbolByName(null, sym_name, false);
+    const sym = try getResolvedSymbolByName(null, sym_name, false, false, true);
     return .{
         .addr = sym.address,
     };
@@ -881,6 +881,13 @@ fn resolvePath(r_path: []const u8, check_mode: bool) ![]const u8 {
 
 fn loadDso(o_path: []const u8) !usize {
     var scratch_buf: [1024]u8 = undefined;
+
+    if (std.mem.findScalar(u8, o_path, '/') == null and dyn_objects.contains(o_path)) {
+        const existing_idx = dyn_objects.getIndex(o_path).?;
+        if (dyn_objects.values()[existing_idx].mapped_at != 0) {
+            return existing_idx;
+        }
+    }
 
     const path: []const u8 = if (std.mem.findScalar(u8, o_path, '/') != null) try dll_allocator.dupe(u8, o_path) else try resolvePath(o_path, false);
     defer dll_allocator.free(path);
@@ -1976,12 +1983,12 @@ fn detectLibC(dyn_object: *DynObject) !void {
 
     Logger.debug("libc detection: {s} is detected as libc", .{dyn_object.path});
 
-    const maybe_issetugid_sym = getResolvedSymbolByName(dyn_object, "issetugid", false) catch |err| switch (err) {
+    const maybe_issetugid_sym = getResolvedSymbolByName(dyn_object, "issetugid", false, false, true) catch |err| switch (err) {
         error.UnresolvedSymbol => null,
         else => |e| return e,
     };
 
-    const maybe_rtld_global_ro_sym = getResolvedSymbolByName(dyn_object, "_rtld_global_ro", false) catch |err| switch (err) {
+    const maybe_rtld_global_ro_sym = getResolvedSymbolByName(dyn_object, "_rtld_global_ro", false, false, true) catch |err| switch (err) {
         error.UnresolvedSymbol => null,
         else => |e| return e,
     };
@@ -2157,7 +2164,7 @@ fn detectLibC(dyn_object: *DynObject) !void {
         // TODO factorize, and use libc_specifics.write_ops
         {
             // patch direct calls to __libc_malloc
-            const pthread_atfork_rsym = getResolvedSymbolByName(dyn_object, "pthread_atfork", false) catch |err| switch (err) {
+            const pthread_atfork_rsym = getResolvedSymbolByName(dyn_object, "pthread_atfork", false, false, true) catch |err| switch (err) {
                 error.UnresolvedSymbol => return error.RequiredPatchedSymbolNotFound,
                 else => |e| return e,
             };
@@ -2242,7 +2249,7 @@ fn detectLibC(dyn_object: *DynObject) !void {
 
         {
             // patch direct calls to __libc_calloc
-            const cxa_atexit_rsym = getResolvedSymbolByName(dyn_object, "__cxa_atexit", false) catch |err| switch (err) {
+            const cxa_atexit_rsym = getResolvedSymbolByName(dyn_object, "__cxa_atexit", false, false, true) catch |err| switch (err) {
                 error.UnresolvedSymbol => return error.RequiredPatchedSymbolNotFound,
                 else => |e| return e,
             };
@@ -2364,7 +2371,7 @@ fn detectLibC(dyn_object: *DynObject) !void {
             },
         });
 
-        const maybe_ei_rsym = getResolvedSymbolByName(dyn_object, "__libc_early_init", false) catch |err| switch (err) {
+        const maybe_ei_rsym = getResolvedSymbolByName(dyn_object, "__libc_early_init", false, false, true) catch |err| switch (err) {
             error.UnresolvedSymbol => null,
             else => |e| return e,
         };
@@ -2767,7 +2774,7 @@ fn processRelocations(dyn_object: *DynObject) !void {
                 const sym = try resolveSymbol(dyn_object, reloc.sym_idx);
                 const value = r64_blk: {
                     if (reloc.addend != 0) break :r64_blk sym.address + @as(usize, @intCast(reloc.addend));
-                    break :r64_blk if (getSubstituteAddress(sym, dyn_object)) |a| a else sym.address;
+                    break :r64_blk if (getSubstituteAddress(sym, dyn_object, true)) |a| a else sym.address;
                 };
                 Logger.debug("  64: 0x{x} (0x{x}): 0x{x} -> 0x{x} (0x{x}, {s}@{s} + 0x{x})", .{ reloc_addr, reloc.offset, ptr.*, value, sym.value, sym.name, sym.version, reloc.addend });
                 ptr.* = value;
@@ -2776,7 +2783,7 @@ fn processRelocations(dyn_object: *DynObject) !void {
                 reloc_count += 1;
                 // R_X86_64_GLOB_DAT: S
                 const sym = try resolveSymbol(dyn_object, reloc.sym_idx);
-                const value = if (getSubstituteAddress(sym, dyn_object)) |a| a else sym.address;
+                const value = if (getSubstituteAddress(sym, dyn_object, true)) |a| a else sym.address;
                 Logger.debug("  GLOB_DAT: 0x{x} (0x{x}): 0x{x} -> 0x{x} (0x{x}, {s}@{s} + 0x{x})", .{ reloc_addr, reloc.offset, ptr.*, value, sym.value, sym.name, sym.version, reloc.addend });
                 ptr.* = value;
             },
@@ -2784,7 +2791,7 @@ fn processRelocations(dyn_object: *DynObject) !void {
                 reloc_count += 1;
                 // R_X86_64_JUMP_SLOT: S
                 const sym = try resolveSymbol(dyn_object, reloc.sym_idx);
-                const value = if (getSubstituteAddress(sym, dyn_object)) |a| a else sym.address;
+                const value = if (getSubstituteAddress(sym, dyn_object, true)) |a| a else sym.address;
                 Logger.debug("  JUMP_SLOT: 0x{x} (0x{x}): 0x{x} -> 0x{x} (0x{x}, {s}@{s} + 0x{x})", .{ reloc_addr, reloc.offset, ptr.*, value, sym.value, sym.name, sym.version, reloc.addend });
                 ptr.* = value;
             },
@@ -2902,7 +2909,7 @@ fn processRelocations(dyn_object: *DynObject) !void {
                     const sym = dyn_object.syms_array.items[r.sym_idx];
                     const r_sym = try resolveSymbol(dyn_object, r.sym_idx);
 
-                    const substitute_addr = getSubstituteAddress(r_sym, dyn_object);
+                    const substitute_addr = getSubstituteAddress(r_sym, dyn_object, true);
                     if (substitute_addr == null) {
                         break;
                     }
@@ -3021,7 +3028,68 @@ fn resolveSymbolByName(sym_name: []const u8) !ResolvedSymbol {
 // TODO the next 3 functions are very ugly and need factorization
 
 // TODO thread safety (called from Symbol)
-fn getResolvedSymbolByName(maybe_dyn_object: ?*DynObject, sym_name: []const u8, find_next: bool) !ResolvedSymbol {
+fn getResolvedSymbolByName(maybe_dyn_object: ?*DynObject, sym_name: []const u8, find_next: bool, only_preload: bool, allow_preload_override: bool) !ResolvedSymbol {
+    std.debug.assert(!(find_next and only_preload));
+    std.debug.assert(!(find_next and allow_preload_override));
+    std.debug.assert(!(only_preload and allow_preload_override));
+
+    if (only_preload and !find_next) {
+        for (preload_root_indices.items) |preload_idx| {
+            const dep_object = &dyn_objects.values()[preload_idx];
+
+            if (dep_object.ref_count == 0) {
+                continue;
+            }
+
+            if (dep_object.syms.get(sym_name)) |dep_sym_list| {
+                for (dep_sym_list.items) |dep_sym_idx| {
+                    const dep_sym = dep_object.syms_array.items[dep_sym_idx];
+                    if (dep_sym.shidx != std.elf.SHN_UNDEF and !dep_sym.hidden) {
+                        if (dep_sym.shidx == std.elf.SHN_ABS) {
+                            Logger.debug("WARNING: ABSOLUTE SYMBOL from dep: {s}", .{dep_sym.name});
+                        }
+
+                        const dep_sym_address = dep_sym.value;
+
+                        var dep_addr = try vAddressToLoadedAddress(dep_object, dep_sym_address, false);
+
+                        if (ifunc_resolved_addrs.get(dep_addr)) |res_addr| {
+                            Logger.debug("ifunc address substitution: {s}: 0x{x} => 0x{x}", .{ dep_sym.name, dep_addr, res_addr });
+                            dep_addr = res_addr;
+                        } else if (dep_sym.type == std.elf.STT.GNU_IFUNC) {
+                            const resolver_addr = dep_addr;
+                            const resolver: *const fn () callconv(.c) usize = @ptrFromInt(resolver_addr);
+                            Logger.debug("  IFUNC: calling resolver for {s} at 0x{x} (0x{x})", .{ dep_sym.name, resolver_addr, dep_sym_address });
+                            const value = resolver();
+                            Logger.debug("  IFUNC: {s}: 0x{x} (0x{x}): 0x{x}", .{ dep_sym.name, resolver_addr, dep_sym_address, value });
+                            if (ifunc_resolved_addrs.get(resolver_addr)) |res_val| {
+                                std.debug.assert(res_val == value);
+                            }
+                            try ifunc_resolved_addrs.put(dll_allocator, resolver_addr, value);
+                            try irel_resolved_targets.putNoClobber(dll_allocator, resolver_addr, value);
+                            dep_addr = value;
+                        }
+
+                        return .{
+                            .value = dep_sym.value,
+                            .address = dep_addr,
+                            .name = dep_sym.name,
+                            .version = dep_sym.version,
+                            .dyn_object_idx = dyn_objects.getIndex(dep_object.name).?,
+                            .sym_idx = dep_sym_idx,
+                        };
+                    }
+
+                    if (dep_sym.shidx != std.elf.SHN_UNDEF and dep_sym.hidden) {
+                        Logger.debug("WARNING: HIDDEN SYMBOL from dep: {s}", .{dep_sym.name});
+                    }
+                }
+            }
+        }
+
+        return error.UnresolvedSymbol;
+    }
+
     if (maybe_dyn_object) |dyn_object| {
         for (dyn_object.deps_breadth_first.items, 0..) |dep_idx, dep_order| {
             const dep_object = &dyn_objects.values()[dep_idx];
@@ -3072,8 +3140,10 @@ fn getResolvedSymbolByName(maybe_dyn_object: ?*DynObject, sym_name: []const u8, 
                             .sym_idx = dep_sym_idx,
                         };
 
-                        if (getSubstituteAddress(res_sym, dep_object)) |a| {
-                            res_sym.address = a;
+                        if (!only_preload) {
+                            if (getSubstituteAddress(res_sym, dep_object, allow_preload_override)) |a| {
+                                res_sym.address = a;
+                            }
                         }
 
                         return res_sym;
@@ -3131,8 +3201,10 @@ fn getResolvedSymbolByName(maybe_dyn_object: ?*DynObject, sym_name: []const u8, 
                             .sym_idx = dep_sym_idx,
                         };
 
-                        if (getSubstituteAddress(res_sym, dep_object)) |a| {
-                            res_sym.address = a;
+                        if (!only_preload) {
+                            if (getSubstituteAddress(res_sym, dep_object, allow_preload_override)) |a| {
+                                res_sym.address = a;
+                            }
                         }
 
                         return res_sym;
@@ -3155,7 +3227,68 @@ fn getResolvedSymbolByName(maybe_dyn_object: ?*DynObject, sym_name: []const u8, 
 }
 
 // TODO thread safety (called from Symbol)
-fn getResolvedSymbolByNameAndVersion(maybe_dyn_object: ?*DynObject, sym_name: []const u8, version: []const u8, find_next: bool) !ResolvedSymbol {
+fn getResolvedSymbolByNameAndVersion(maybe_dyn_object: ?*DynObject, sym_name: []const u8, version: []const u8, find_next: bool, only_preload: bool, allow_preload_override: bool) !ResolvedSymbol {
+    std.debug.assert(!(find_next and only_preload));
+    std.debug.assert(!(find_next and allow_preload_override));
+    std.debug.assert(!(only_preload and allow_preload_override));
+
+    if (only_preload and !find_next) {
+        for (preload_root_indices.items) |preload_idx| {
+            const dep_object = &dyn_objects.values()[preload_idx];
+
+            if (dep_object.ref_count == 0) {
+                continue;
+            }
+
+            if (dep_object.syms.get(sym_name)) |dep_sym_list| {
+                for (dep_sym_list.items) |dep_sym_idx| {
+                    const dep_sym = dep_object.syms_array.items[dep_sym_idx];
+                    if (std.mem.eql(u8, dep_sym.version, version) and dep_sym.shidx != std.elf.SHN_UNDEF and !dep_sym.hidden) {
+                        if (dep_sym.shidx == std.elf.SHN_ABS) {
+                            Logger.debug("WARNING: ABSOLUTE SYMBOL from dep: {s}", .{dep_sym.name});
+                        }
+
+                        const dep_sym_address = dep_sym.value;
+
+                        var dep_addr = try vAddressToLoadedAddress(dep_object, dep_sym_address, false);
+
+                        if (ifunc_resolved_addrs.get(dep_addr)) |res_addr| {
+                            Logger.debug("ifunc address substitution: {s}: 0x{x} => 0x{x}", .{ dep_sym.name, dep_addr, res_addr });
+                            dep_addr = res_addr;
+                        } else if (dep_sym.type == std.elf.STT.GNU_IFUNC) {
+                            const resolver_addr = dep_addr;
+                            const resolver: *const fn () callconv(.c) usize = @ptrFromInt(resolver_addr);
+                            Logger.debug("  IFUNC: calling resolver for {s} at 0x{x} (0x{x})", .{ dep_sym.name, resolver_addr, dep_sym_address });
+                            const value = resolver();
+                            Logger.debug("  IFUNC: {s}: 0x{x} (0x{x}): 0x{x}", .{ dep_sym.name, resolver_addr, dep_sym_address, value });
+                            if (ifunc_resolved_addrs.get(resolver_addr)) |res_val| {
+                                std.debug.assert(res_val == value);
+                            }
+                            try ifunc_resolved_addrs.put(dll_allocator, resolver_addr, value);
+                            try irel_resolved_targets.putNoClobber(dll_allocator, resolver_addr, value);
+                            dep_addr = value;
+                        }
+
+                        return .{
+                            .value = dep_sym.value,
+                            .address = dep_addr,
+                            .name = dep_sym.name,
+                            .version = dep_sym.version,
+                            .dyn_object_idx = dyn_objects.getIndex(dep_object.name).?,
+                            .sym_idx = dep_sym_idx,
+                        };
+                    }
+
+                    if (dep_sym.shidx != std.elf.SHN_UNDEF and dep_sym.hidden) {
+                        Logger.debug("WARNING: HIDDEN SYMBOL from dep: {s}", .{dep_sym.name});
+                    }
+                }
+            }
+        }
+
+        return error.UnresolvedSymbol;
+    }
+
     if (maybe_dyn_object) |dyn_object| {
         for (dyn_object.deps_breadth_first.items, 0..) |dep_idx, dep_order| {
             const dep_object = &dyn_objects.values()[dep_idx];
@@ -3206,8 +3339,10 @@ fn getResolvedSymbolByNameAndVersion(maybe_dyn_object: ?*DynObject, sym_name: []
                             .sym_idx = dep_sym_idx,
                         };
 
-                        if (getSubstituteAddress(res_sym, dep_object)) |a| {
-                            res_sym.address = a;
+                        if (!only_preload) {
+                            if (getSubstituteAddress(res_sym, dep_object, allow_preload_override)) |a| {
+                                res_sym.address = a;
+                            }
                         }
 
                         return res_sym;
@@ -3265,8 +3400,10 @@ fn getResolvedSymbolByNameAndVersion(maybe_dyn_object: ?*DynObject, sym_name: []
                             .sym_idx = dep_sym_idx,
                         };
 
-                        if (getSubstituteAddress(res_sym, dep_object)) |a| {
-                            res_sym.address = a;
+                        if (!only_preload) {
+                            if (getSubstituteAddress(res_sym, dep_object, allow_preload_override)) |a| {
+                                res_sym.address = a;
+                            }
                         }
 
                         return res_sym;
@@ -3739,7 +3876,7 @@ fn callFiniFunctions(dyn_obj: *DynObject) !void {
     }
 }
 
-fn getSubstituteAddress(sym: ResolvedSymbol, for_obj: *DynObject) ?usize {
+fn getSubstituteAddress(sym: ResolvedSymbol, for_obj: *DynObject, allow_preload_override: bool) ?usize {
     var addr: ?usize = null;
 
     if (sym.dyn_object_idx == std.math.maxInt(usize)) {
@@ -3747,6 +3884,19 @@ fn getSubstituteAddress(sym: ResolvedSymbol, for_obj: *DynObject) ?usize {
     }
 
     const dyn_object = &dyn_objects.values()[sym.dyn_object_idx];
+
+    var for_obj_is_preload_root = false;
+    if (dyn_objects.getIndex(for_obj.name)) |for_obj_idx| {
+        for_obj_is_preload_root = std.mem.findScalar(usize, preload_root_indices.items, for_obj_idx) != null;
+    }
+
+    if (allow_preload_override and !for_obj_is_preload_root) {
+        const preload_sym = getResolvedSymbolByName(null, sym.name, false, true, false) catch null;
+        if (preload_sym) |psym| {
+            Logger.info("substitutes: preload override for {s}: 0x{x} => 0x{x}", .{ sym.name, sym.address, psym.address });
+            return psym.address;
+        }
+    }
 
     // alloc functions
     // TODO errno handling
@@ -4217,6 +4367,15 @@ fn dlcloseSubstitute(lib: *anyopaque) callconv(.c) c_int {
 fn dlsymSubstitute(lib_handle: ?*anyopaque, sym_name: [*:0]const u8) callconv(.c) ?*anyopaque {
     Logger.debug("intercepted call: dlsym({d}, \"{s}\")", .{ @intFromPtr(lib_handle), sym_name });
 
+    const caller_addr = @returnAddress();
+    const maybe_caller_infos = findDynObjectSegmentForLoadedAddr(caller_addr) catch null;
+    var caller_is_preload_root = false;
+    if (maybe_caller_infos) |caller_infos| {
+        if (dyn_objects.getIndex(caller_infos.dyn_object.name)) |caller_idx| {
+            caller_is_preload_root = std.mem.findScalar(usize, preload_root_indices.items, caller_idx) != null;
+        }
+    }
+
     if (lib_handle != null and @intFromPtr(lib_handle.?) != std.math.maxInt(usize) - 1 and @intFromPtr(lib_handle.?) != std.math.maxInt(usize) and @intFromPtr(lib_handle.?) - 1 >= dyn_objects.count()) {
         if (last_dl_error != null) {
             dll_allocator.free(last_dl_error.?);
@@ -4233,14 +4392,13 @@ fn dlsymSubstitute(lib_handle: ?*anyopaque, sym_name: [*:0]const u8) callconv(.c
     var dyn_object: ?*DynObject = null;
 
     if (find_next) {
-        const caller_addr = @returnAddress();
-        const infos = findDynObjectSegmentForLoadedAddr(caller_addr) catch |err| {
+        const infos = maybe_caller_infos orelse {
             if (last_dl_error != null) {
                 dll_allocator.free(last_dl_error.?);
             }
-            last_dl_error = std.fmt.allocPrintSentinel(dll_allocator, "unable to resolve RTLD_NEXT caller for symbol {s} at 0x{x}: {}", .{ sym_name, caller_addr, err }, 0) catch @panic("OOM");
+            last_dl_error = std.fmt.allocPrintSentinel(dll_allocator, "unable to resolve RTLD_NEXT caller for symbol {s} at 0x{x}", .{ sym_name, caller_addr }, 0) catch @panic("OOM");
 
-            Logger.warn("dlsym(RTLD_NEXT, \"{s}\") failed: unable to resolve caller at 0x{x}: {}", .{ sym_name, caller_addr, err });
+            Logger.warn("dlsym(RTLD_NEXT, \"{s}\") failed: unable to resolve caller at 0x{x}", .{ sym_name, caller_addr });
 
             return null;
         };
@@ -4261,7 +4419,9 @@ fn dlsymSubstitute(lib_handle: ?*anyopaque, sym_name: [*:0]const u8) callconv(.c
         return null;
     }
 
-    const sym = getResolvedSymbolByName(dyn_object, std.mem.span(sym_name), find_next) catch |err| {
+    const allow_preload_override = !find_next and !caller_is_preload_root;
+
+    const sym = getResolvedSymbolByName(dyn_object, std.mem.span(sym_name), find_next, false, allow_preload_override) catch |err| {
         if (last_dl_error != null) {
             dll_allocator.free(last_dl_error.?);
         }
@@ -4280,6 +4440,15 @@ fn dlsymSubstitute(lib_handle: ?*anyopaque, sym_name: [*:0]const u8) callconv(.c
 fn dlvsymSubstitute(lib_handle: ?*anyopaque, sym_name: [*:0]const u8, version: [*:0]const u8) callconv(.c) ?*anyopaque {
     Logger.debug("intercepted call: dlvsym({d}, \"{s}\", \"{s}\")", .{ @intFromPtr(lib_handle), sym_name, version });
 
+    const caller_addr = @returnAddress();
+    const maybe_caller_infos = findDynObjectSegmentForLoadedAddr(caller_addr) catch null;
+    var caller_is_preload_root = false;
+    if (maybe_caller_infos) |caller_infos| {
+        if (dyn_objects.getIndex(caller_infos.dyn_object.name)) |caller_idx| {
+            caller_is_preload_root = std.mem.findScalar(usize, preload_root_indices.items, caller_idx) != null;
+        }
+    }
+
     if (lib_handle != null and @intFromPtr(lib_handle.?) != std.math.maxInt(usize) - 1 and @intFromPtr(lib_handle.?) != std.math.maxInt(usize) and @intFromPtr(lib_handle.?) - 1 >= dyn_objects.count()) {
         if (last_dl_error != null) {
             dll_allocator.free(last_dl_error.?);
@@ -4296,14 +4465,13 @@ fn dlvsymSubstitute(lib_handle: ?*anyopaque, sym_name: [*:0]const u8, version: [
     var dyn_object: ?*DynObject = null;
 
     if (find_next) {
-        const caller_addr = @returnAddress();
-        const infos = findDynObjectSegmentForLoadedAddr(caller_addr) catch |err| {
+        const infos = maybe_caller_infos orelse {
             if (last_dl_error != null) {
                 dll_allocator.free(last_dl_error.?);
             }
-            last_dl_error = std.fmt.allocPrintSentinel(dll_allocator, "unable to resolve RTLD_NEXT caller for symbol {s}@{s} at 0x{x}: {}", .{ sym_name, version, caller_addr, err }, 0) catch @panic("OOM");
+            last_dl_error = std.fmt.allocPrintSentinel(dll_allocator, "unable to resolve RTLD_NEXT caller for symbol {s}@{s} at 0x{x}", .{ sym_name, version, caller_addr }, 0) catch @panic("OOM");
 
-            Logger.warn("dlvsym(RTLD_NEXT, \"{s}\", \"{s}\") failed: unable to resolve caller at 0x{x}: {}", .{ sym_name, version, caller_addr, err });
+            Logger.warn("dlvsym(RTLD_NEXT, \"{s}\", \"{s}\") failed: unable to resolve caller at 0x{x}", .{ sym_name, version, caller_addr });
 
             return null;
         };
@@ -4324,7 +4492,9 @@ fn dlvsymSubstitute(lib_handle: ?*anyopaque, sym_name: [*:0]const u8, version: [
         return null;
     }
 
-    const sym = getResolvedSymbolByNameAndVersion(dyn_object, std.mem.span(sym_name), std.mem.span(version), find_next) catch |err| {
+    const allow_preload_override = !find_next and !caller_is_preload_root;
+
+    const sym = getResolvedSymbolByNameAndVersion(dyn_object, std.mem.span(sym_name), std.mem.span(version), find_next, false, allow_preload_override) catch |err| {
         if (last_dl_error != null) {
             dll_allocator.free(last_dl_error.?);
         }
@@ -4639,7 +4809,7 @@ fn threadRoutine(ctx: ThreadRoutineContext) void {
     applyLibcWriteOps(new_tp, true) catch @panic("error setting tp fields");
 
     // TODO should be lib_specifics.call_ops
-    const maybe_sym = getResolvedSymbolByName(null, "__ctype_init", false) catch null;
+    const maybe_sym = getResolvedSymbolByName(null, "__ctype_init", false, false, true) catch null;
     if (maybe_sym) |sym| {
         const ctypeInit: *const fn () callconv(.c) void = @ptrFromInt(sym.address);
         Logger.debug("thread {d}: call __ctype_init", .{ctx.idx});
