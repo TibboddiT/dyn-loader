@@ -177,7 +177,7 @@ pub const DynamicLibrary = struct {
 
     pub fn getSymbol(lib: DynamicLibrary, sym_name: []const u8) !Symbol {
         const dyn_obj = &dyn_objects.values()[lib.index];
-        const sym = try getResolvedSymbolByName(dyn_obj, sym_name);
+        const sym = try getResolvedSymbolByName(dyn_obj, sym_name, false);
         return .{
             .addr = sym.address,
         };
@@ -704,6 +704,13 @@ pub fn load(f_path: []const u8) !DynamicLibrary {
     }
 
     return lib;
+}
+
+pub fn getSymbol(sym_name: []const u8) !Symbol {
+    const sym = try getResolvedSymbolByName(null, sym_name, false);
+    return .{
+        .addr = sym.address,
+    };
 }
 
 // TODO inefficient strategy
@@ -1912,12 +1919,12 @@ fn detectLibC(dyn_object: *DynObject) !void {
 
     Logger.debug("libc detection: {s} is detected as libc", .{dyn_object.path});
 
-    const maybe_issetugid_sym = getResolvedSymbolByName(dyn_object, "issetugid") catch |err| switch (err) {
+    const maybe_issetugid_sym = getResolvedSymbolByName(dyn_object, "issetugid", false) catch |err| switch (err) {
         error.UnresolvedSymbol => null,
         else => |e| return e,
     };
 
-    const maybe_rtld_global_ro_sym = getResolvedSymbolByName(dyn_object, "_rtld_global_ro") catch |err| switch (err) {
+    const maybe_rtld_global_ro_sym = getResolvedSymbolByName(dyn_object, "_rtld_global_ro", false) catch |err| switch (err) {
         error.UnresolvedSymbol => null,
         else => |e| return e,
     };
@@ -2093,7 +2100,7 @@ fn detectLibC(dyn_object: *DynObject) !void {
         // TODO factorize, and use libc_specifics.write_ops
         {
             // patch direct calls to __libc_malloc
-            const pthread_atfork_rsym = getResolvedSymbolByName(dyn_object, "pthread_atfork") catch |err| switch (err) {
+            const pthread_atfork_rsym = getResolvedSymbolByName(dyn_object, "pthread_atfork", false) catch |err| switch (err) {
                 error.UnresolvedSymbol => return error.RequiredPatchedSymbolNotFound,
                 else => |e| return e,
             };
@@ -2178,7 +2185,7 @@ fn detectLibC(dyn_object: *DynObject) !void {
 
         {
             // patch direct calls to __libc_calloc
-            const cxa_atexit_rsym = getResolvedSymbolByName(dyn_object, "__cxa_atexit") catch |err| switch (err) {
+            const cxa_atexit_rsym = getResolvedSymbolByName(dyn_object, "__cxa_atexit", false) catch |err| switch (err) {
                 error.UnresolvedSymbol => return error.RequiredPatchedSymbolNotFound,
                 else => |e| return e,
             };
@@ -2300,7 +2307,7 @@ fn detectLibC(dyn_object: *DynObject) !void {
             },
         });
 
-        const maybe_ei_rsym = getResolvedSymbolByName(dyn_object, "__libc_early_init") catch |err| switch (err) {
+        const maybe_ei_rsym = getResolvedSymbolByName(dyn_object, "__libc_early_init", false) catch |err| switch (err) {
             error.UnresolvedSymbol => null,
             else => |e| return e,
         };
@@ -2957,12 +2964,19 @@ fn resolveSymbolByName(sym_name: []const u8) !ResolvedSymbol {
 // TODO the next 3 functions are very ugly and need factorization
 
 // TODO thread safety (called from Symbol)
-fn getResolvedSymbolByName(maybe_dyn_object: ?*DynObject, sym_name: []const u8) !ResolvedSymbol {
+fn getResolvedSymbolByName(maybe_dyn_object: ?*DynObject, sym_name: []const u8, skip_first: bool) !ResolvedSymbol {
+    var first_skipped = false;
+
     if (maybe_dyn_object) |dyn_object| {
         for (dyn_object.deps_breadth_first.items) |dep_idx| {
             const dep_object = &dyn_objects.values()[dep_idx];
 
             if (dep_object.syms.get(sym_name)) |dep_sym_list| {
+                if (skip_first and !first_skipped) {
+                    first_skipped = true;
+                    continue;
+                }
+
                 for (dep_sym_list.items) |dep_sym_idx| {
                     const dep_sym = dep_object.syms_array.items[dep_sym_idx];
                     if (dep_sym.shidx != std.elf.SHN_UNDEF and !dep_sym.hidden) {
@@ -3018,6 +3032,11 @@ fn getResolvedSymbolByName(maybe_dyn_object: ?*DynObject, sym_name: []const u8) 
             const dep_object = &dyn_objects.values()[dep_idx];
 
             if (dep_object.syms.get(sym_name)) |dep_sym_list| {
+                if (skip_first and !first_skipped) {
+                    first_skipped = true;
+                    continue;
+                }
+
                 for (dep_sym_list.items) |dep_sym_idx| {
                     const dep_sym = dep_object.syms_array.items[dep_sym_idx];
                     if (dep_sym.shidx != std.elf.SHN_UNDEF and !dep_sym.hidden) {
@@ -3069,17 +3088,29 @@ fn getResolvedSymbolByName(maybe_dyn_object: ?*DynObject, sym_name: []const u8) 
             }
         }
     }
+
+    // if (skip_first) {
+    //     Logger.warn("retrying non skipped first getResolvedSymbolByName for {s}", .{sym_name});
+    //     return getResolvedSymbolByName(maybe_dyn_object, sym_name, false);
+    // }
 
     return error.UnresolvedSymbol;
 }
 
 // TODO thread safety (called from Symbol)
-fn getResolvedSymbolByNameAndVersion(maybe_dyn_object: ?*DynObject, sym_name: []const u8, version: []const u8) !ResolvedSymbol {
+fn getResolvedSymbolByNameAndVersion(maybe_dyn_object: ?*DynObject, sym_name: []const u8, version: []const u8, skip_first: bool) !ResolvedSymbol {
+    var first_skipped = false;
+
     if (maybe_dyn_object) |dyn_object| {
         for (dyn_object.deps_breadth_first.items) |dep_idx| {
             const dep_object = &dyn_objects.values()[dep_idx];
 
             if (dep_object.syms.get(sym_name)) |dep_sym_list| {
+                if (skip_first and !first_skipped) {
+                    first_skipped = true;
+                    continue;
+                }
+
                 for (dep_sym_list.items) |dep_sym_idx| {
                     const dep_sym = dep_object.syms_array.items[dep_sym_idx];
                     if (std.mem.eql(u8, dep_sym.version, version) and dep_sym.shidx != std.elf.SHN_UNDEF and !dep_sym.hidden) {
@@ -3135,6 +3166,11 @@ fn getResolvedSymbolByNameAndVersion(maybe_dyn_object: ?*DynObject, sym_name: []
             const dep_object = &dyn_objects.values()[dep_idx];
 
             if (dep_object.syms.get(sym_name)) |dep_sym_list| {
+                if (skip_first and !first_skipped) {
+                    first_skipped = true;
+                    continue;
+                }
+
                 for (dep_sym_list.items) |dep_sym_idx| {
                     const dep_sym = dep_object.syms_array.items[dep_sym_idx];
                     if (std.mem.eql(u8, dep_sym.version, version) and dep_sym.shidx != std.elf.SHN_UNDEF and !dep_sym.hidden) {
@@ -3186,6 +3222,11 @@ fn getResolvedSymbolByNameAndVersion(maybe_dyn_object: ?*DynObject, sym_name: []
             }
         }
     }
+
+    // if (skip_first) {
+    //     Logger.warn("retrying non skipped first getResolvedSymbolByNameAndVersion for {s}", .{sym_name});
+    //     return getResolvedSymbolByNameAndVersion(maybe_dyn_object, sym_name, version, false);
+    // }
 
     return error.UnresolvedSymbol;
 }
@@ -4011,9 +4052,13 @@ fn dlcloseSubstitute(lib: *anyopaque) callconv(.c) c_int {
 fn dlsymSubstitute(lib_handle: ?*anyopaque, sym_name: [*:0]const u8) callconv(.c) ?*anyopaque {
     Logger.debug("intercepted call: dlsym({d}, \"{s}\")", .{ @intFromPtr(lib_handle), sym_name });
 
-    const dyn_object = if (lib_handle != null and @intFromPtr(lib_handle.?) != std.math.maxInt(usize) - 1) &dyn_objects.values()[@intFromPtr(lib_handle.?) - 1] else null;
+    if (lib_handle != null and @intFromPtr(lib_handle.?) == std.math.maxInt(usize)) {
+        Logger.warn("dlsym(RTLD_NEXT, \"{s}\"): incomplete implementation invoked for handle = RTLD_NEXT", .{sym_name}); // TODO
+    }
 
-    const sym = getResolvedSymbolByName(dyn_object, std.mem.span(sym_name)) catch |err| {
+    const dyn_object = if (lib_handle != null and @intFromPtr(lib_handle.?) != std.math.maxInt(usize) - 1 and @intFromPtr(lib_handle.?) != std.math.maxInt(usize)) &dyn_objects.values()[@intFromPtr(lib_handle.?) - 1] else null;
+
+    const sym = getResolvedSymbolByName(dyn_object, std.mem.span(sym_name), lib_handle != null and @intFromPtr(lib_handle.?) == std.math.maxInt(usize)) catch |err| {
         if (last_dl_error != null) {
             dll_allocator.free(last_dl_error.?);
         }
@@ -4030,11 +4075,15 @@ fn dlsymSubstitute(lib_handle: ?*anyopaque, sym_name: [*:0]const u8) callconv(.c
 }
 
 fn dlvsymSubstitute(lib_handle: ?*anyopaque, sym_name: [*:0]const u8, version: [*:0]const u8) callconv(.c) ?*anyopaque {
-    Logger.debug("intercepted call: dlvsym({d}, \"{s}\" \"{s}\")", .{ @intFromPtr(lib_handle), sym_name, version });
+    Logger.debug("intercepted call: dlvsym({d}, \"{s}\", \"{s}\")", .{ @intFromPtr(lib_handle), sym_name, version });
 
-    const dyn_object = if (lib_handle != null and @intFromPtr(lib_handle.?) != std.math.maxInt(usize) - 1) &dyn_objects.values()[@intFromPtr(lib_handle.?) - 1] else null;
+    if (lib_handle != null and @intFromPtr(lib_handle.?) == std.math.maxInt(usize)) {
+        Logger.warn("dlsym(RTLD_NEXT, \"{s}\", \"{s}\"): incomplete implementation invoked for handle = RTLD_NEXT", .{ sym_name, version }); // TODO
+    }
 
-    const sym = getResolvedSymbolByNameAndVersion(dyn_object, std.mem.span(sym_name), std.mem.span(version)) catch |err| {
+    const dyn_object = if (lib_handle != null and @intFromPtr(lib_handle.?) != std.math.maxInt(usize) - 1 and @intFromPtr(lib_handle.?) != std.math.maxInt(usize)) &dyn_objects.values()[@intFromPtr(lib_handle.?) - 1] else null;
+
+    const sym = getResolvedSymbolByNameAndVersion(dyn_object, std.mem.span(sym_name), std.mem.span(version), lib_handle != null and @intFromPtr(lib_handle.?) == std.math.maxInt(usize)) catch |err| {
         if (last_dl_error != null) {
             dll_allocator.free(last_dl_error.?);
         }
@@ -4349,7 +4398,7 @@ fn threadRoutine(ctx: ThreadRoutineContext) void {
     applyLibcWriteOps(new_tp, true) catch @panic("error setting tp fields");
 
     // TODO should be lib_specifics.call_ops
-    const maybe_sym = getResolvedSymbolByName(null, "__ctype_init") catch null;
+    const maybe_sym = getResolvedSymbolByName(null, "__ctype_init", false) catch null;
     if (maybe_sym) |sym| {
         const ctypeInit: *const fn () callconv(.c) void = @ptrFromInt(sym.address);
         Logger.debug("thread {d}: call __ctype_init", .{ctx.idx});
