@@ -80,6 +80,37 @@ const Reloc = struct {
 
 const RelocList = std.ArrayList(Reloc);
 
+const DlHandle = packed struct(u64) {
+    tag: u2,
+    epoch: u30,
+    index: u32,
+
+    const rtld_main: DlHandle = .{
+        .tag = 0b10,
+        .epoch = 0,
+        .index = std.math.maxInt(u32),
+    };
+
+    const rtld_default: DlHandle = @bitCast(@as(u64, 0));
+    const rtld_next: DlHandle = @bitCast(~@as(u64, 0));
+
+    fn fromInt(raw: u64) DlHandle {
+        return @bitCast(raw);
+    }
+
+    fn toInt(handle: DlHandle) u64 {
+        return @bitCast(handle);
+    }
+};
+
+const DlHandleMetadata = struct {
+    dyn_object_idx: usize,
+    epoch: u30,
+    open_count: usize,
+};
+
+const DlHandleMap = std.AutoArrayHashMapUnmanaged(u64, DlHandleMetadata);
+
 // TODO global state
 var ifunc_resolved_addrs: std.AutoArrayHashMapUnmanaged(usize, usize) = .empty;
 var irel_resolved_targets: std.AutoArrayHashMapUnmanaged(usize, usize) = .empty;
@@ -121,6 +152,7 @@ const DynObject = struct {
     fini_array_size: usize,
     loaded: bool,
     init_called: bool,
+    current_epoch: u30,
     ref_count: usize,
     loaded_at: ?usize,
     loaded_size: usize,
@@ -163,6 +195,7 @@ const DynObject = struct {
             .fini_array_size = 0,
             .loaded = false,
             .init_called = false,
+            .current_epoch = 0,
             .ref_count = 0,
             .loaded_at = null,
             .loaded_size = 0,
@@ -208,7 +241,9 @@ pub const DynamicLibrary = struct {
 // TODO global state
 var dyn_objects: DynObjectList = .empty;
 var dyn_objects_sorted_indices: std.ArrayList(usize) = .empty;
+var dyn_objects_init_indices: std.ArrayList(usize) = .empty;
 var preload_root_indices: std.ArrayList(usize) = .empty;
+var dl_handles: DlHandleMap = .empty;
 
 const Logger = struct {
     const Level = enum {
@@ -316,8 +351,6 @@ pub fn init(options: InitOptions) !void {
     dll_io = options.io;
     Logger.level = options.log_level;
 
-    dll_alloc_arena = .init(dll_allocator);
-    // alloc_allocator = alloc_arena.allocator();
     dll_alloc_allocator = dll_allocator;
 
     dll_args = options.args;
@@ -334,11 +367,11 @@ pub fn init(options: InitOptions) !void {
 
 // TODO thread safety
 pub fn deinit() void {
-    var nb_dyn_objects = dyn_objects_sorted_indices.items.len;
+    var nb_dyn_objects = dyn_objects_init_indices.items.len;
     while (nb_dyn_objects > 0) {
         nb_dyn_objects -= 1;
 
-        const dyn_object_idx = dyn_objects_sorted_indices.items[nb_dyn_objects];
+        const dyn_object_idx = dyn_objects_init_indices.items[nb_dyn_objects];
         const dyn_object = &dyn_objects.values()[dyn_object_idx];
 
         if (!dyn_object.init_called) {
@@ -385,7 +418,9 @@ pub fn deinit() void {
 
     dyn_objects.clearAndFree(dll_allocator);
     dyn_objects_sorted_indices.deinit(dll_allocator);
+    dyn_objects_init_indices.deinit(dll_allocator);
     preload_root_indices.deinit(dll_allocator);
+    dl_handles.clearAndFree(dll_allocator);
 
     ifunc_resolved_addrs.clearAndFree(dll_allocator);
     irel_resolved_targets.clearAndFree(dll_allocator);
@@ -440,7 +475,6 @@ pub fn deinit() void {
         Logger.info("{B:.2} of memory allocated ({d} allocations) from libraries not freed", .{ not_freed, extra_allocations.count() });
     }
     extra_allocations.clearAndFree(dll_allocator);
-    dll_alloc_arena.deinit();
 
     CustomSelfInfo.clearExtraElfs(dll_allocator);
 
@@ -751,11 +785,16 @@ pub fn load(f_path: []const u8) !DynamicLibrary {
             continue;
         }
 
+        dyn_obj.current_epoch += 1;
+
         dyn_obj.init_called = true;
         callInitFunctions(dyn_obj) catch |err| {
             dyn_obj.init_called = false;
+            dyn_obj.current_epoch -= 1;
             return err;
         };
+
+        try dyn_objects_init_indices.append(dll_allocator, idx);
     }
 
     return lib;
@@ -1656,6 +1695,7 @@ fn loadDso(o_path: []const u8) !usize {
         .fini_array_size = fini_array_size,
         .loaded = false,
         .init_called = false,
+        .current_epoch = 0,
         .ref_count = 0,
         .loaded_at = null,
         .loaded_size = 0,
@@ -4027,7 +4067,6 @@ var extra_threads: std.ArrayList(*std.Thread) = .empty;
 var last_dl_error: ?[:0]const u8 = null;
 var extra_allocations: std.AutoArrayHashMapUnmanaged(usize, ExtraAlloc) = .empty;
 var alloc_mutex: std.Io.Mutex = .init;
-var dll_alloc_arena: std.heap.ArenaAllocator = undefined;
 var dll_alloc_allocator: std.mem.Allocator = undefined;
 // var extra_onces: std.AutoHashMapUnmanaged(usize, void) = .empty;
 
@@ -4124,7 +4163,7 @@ fn freeSubstitute(p: ?*anyopaque) callconv(.c) void {
         }
     }
 
-    Logger.info("intercepted call: success: free(0x{x}) [{d} allocs remaining, mem used: {B:.2}]", .{ @intFromPtr(p), extra_allocations.count(), dll_alloc_arena.queryCapacity() });
+    Logger.info("intercepted call: success: free(0x{x}) [{d} allocs remaining", .{ @intFromPtr(p), extra_allocations.count() });
 
     alloc_mutex.unlock(dll_io);
 }
@@ -4274,7 +4313,8 @@ fn dlopenSubstitute(path: ?[*:0]const u8, flags: c_int) callconv(.c) ?*anyopaque
     Logger.debug("intercepted call: dlopen(\"{?s}\", 0x{x})", .{ path, flags });
 
     if (path == null) {
-        return @ptrFromInt(std.math.maxInt(usize) - 1);
+        Logger.info("intercepted call: success: dlopen(NULL, 0x{x}) = 0x{x}", .{ flags, DlHandle.rtld_main.toInt() });
+        return @ptrFromInt(@as(usize, @intCast(DlHandle.rtld_main.toInt())));
     }
 
     const owned_path = dll_allocator.dupe(u8, std.mem.span(path.?)) catch @panic("OOM");
@@ -4291,43 +4331,106 @@ fn dlopenSubstitute(path: ?[*:0]const u8, flags: c_int) callconv(.c) ?*anyopaque
         return null;
     };
 
-    Logger.info("intercepted call: success: dlopen(\"{?s}\", 0x{x}) = 0x{x}", .{ path, flags, lib.index + 1 });
+    std.debug.assert(lib.index <= std.math.maxInt(u32));
 
-    return @ptrFromInt(lib.index + 1);
+    const dyn_object = &dyn_objects.values()[lib.index];
+    const handle: DlHandle = .{
+        .tag = 0b10,
+        .epoch = dyn_object.current_epoch,
+        .index = @intCast(lib.index),
+    };
+    const handle_raw = handle.toInt();
+    const gop = dl_handles.getOrPut(dll_allocator, handle_raw) catch @panic("OOM");
+    if (gop.found_existing) {
+        std.debug.assert(gop.value_ptr.dyn_object_idx == lib.index);
+        std.debug.assert(gop.value_ptr.epoch == dyn_object.current_epoch);
+        gop.value_ptr.open_count += 1;
+    } else {
+        gop.value_ptr.* = .{
+            .dyn_object_idx = lib.index,
+            .epoch = dyn_object.current_epoch,
+            .open_count = 1,
+        };
+    }
+
+    Logger.info("intercepted call: success: dlopen(\"{?s}\", 0x{x}) = 0x{x}", .{ path, flags, handle_raw });
+
+    return @ptrFromInt(@as(usize, @intCast(handle_raw)));
 }
 
 fn dlcloseSubstitute(lib: *anyopaque) callconv(.c) c_int {
     Logger.debug("intercepted call: dlclose(0x{x})", .{@intFromPtr(lib)});
 
-    const handle = @intFromPtr(lib);
-    if (handle == std.math.maxInt(usize) - 1) {
-        Logger.info("intercepted call: success: dlclose(0x{x} [RTLD_MAIN]) = 0", .{handle});
+    const handle_raw: u64 = @intCast(@intFromPtr(lib));
+    const handle = DlHandle.fromInt(handle_raw);
+
+    if (handle == DlHandle.rtld_main) {
+        Logger.info("intercepted call: success: dlclose(0x{x} [MAIN]) = 0", .{handle_raw});
         return 0;
     }
 
-    if (handle == 0 or handle - 1 >= dyn_objects.count()) {
+    if (handle == DlHandle.rtld_default or handle == DlHandle.rtld_next or handle.tag != 0b10) {
         if (last_dl_error != null) {
             dll_allocator.free(last_dl_error.?);
         }
-        last_dl_error = std.fmt.allocPrintSentinel(dll_allocator, "invalid library handle 0x{x}", .{handle}, 0) catch @panic("OOM");
+        last_dl_error = std.fmt.allocPrintSentinel(dll_allocator, "invalid library handle 0x{x}", .{handle_raw}, 0) catch @panic("OOM");
 
-        Logger.warn("dlclose(0x{x}) failed: invalid library handle", .{handle});
+        Logger.warn("dlclose(0x{x}) failed: invalid library handle", .{handle_raw});
 
         return 1;
     }
 
-    const dyn_object_idx = handle - 1;
-    const dyn_object = &dyn_objects.values()[dyn_object_idx];
-
-    if (dyn_object.ref_count == 0) {
+    const metadata = dl_handles.getPtr(handle_raw) orelse {
         if (last_dl_error != null) {
             dll_allocator.free(last_dl_error.?);
         }
-        last_dl_error = std.fmt.allocPrintSentinel(dll_allocator, "library {s} is already closed", .{dyn_object.name}, 0) catch @panic("OOM");
+        last_dl_error = std.fmt.allocPrintSentinel(dll_allocator, "invalid library handle 0x{x}", .{handle_raw}, 0) catch @panic("OOM");
 
-        Logger.warn("dlclose(0x{x} [{s}]) failed: already closed", .{ handle, dyn_object.name });
+        Logger.warn("dlclose(0x{x}) failed: invalid library handle", .{handle_raw});
 
         return 1;
+    };
+
+    if (metadata.open_count == 0) {
+        if (last_dl_error != null) {
+            dll_allocator.free(last_dl_error.?);
+        }
+        last_dl_error = std.fmt.allocPrintSentinel(dll_allocator, "library handle 0x{x} is already closed", .{handle_raw}, 0) catch @panic("OOM");
+
+        Logger.warn("dlclose(0x{x}) failed: already closed", .{handle_raw});
+
+        return 1;
+    }
+
+    if (metadata.epoch != handle.epoch) {
+        if (last_dl_error != null) {
+            dll_allocator.free(last_dl_error.?);
+        }
+        last_dl_error = std.fmt.allocPrintSentinel(dll_allocator, "invalid library handle 0x{x}: stale epoch", .{handle_raw}, 0) catch @panic("OOM");
+
+        Logger.warn("dlclose(0x{x}) failed: stale handle epoch", .{handle_raw});
+
+        return 1;
+    }
+
+    const dyn_object_idx = metadata.dyn_object_idx;
+    const dyn_object = &dyn_objects.values()[dyn_object_idx];
+
+    if (dyn_object.current_epoch != metadata.epoch) {
+        if (last_dl_error != null) {
+            dll_allocator.free(last_dl_error.?);
+        }
+        last_dl_error = std.fmt.allocPrintSentinel(dll_allocator, "library handle 0x{x} is stale", .{handle_raw}, 0) catch @panic("OOM");
+
+        Logger.warn("dlclose(0x{x} [{s}]) failed: stale handle", .{ handle_raw, dyn_object.name });
+
+        return 1;
+    }
+
+    if (dyn_object.ref_count == 0) {
+        metadata.open_count -= 1;
+        Logger.info("intercepted call: success: dlclose(0x{x} [{s}]) = 0 (already unloaded)", .{ handle_raw, dyn_object.name });
+        return 0;
     }
 
     for (dyn_object.deps_breadth_first.items) |dep_idx| {
@@ -4358,13 +4461,37 @@ fn dlcloseSubstitute(lib: *anyopaque) callconv(.c) c_int {
             }
             last_dl_error = std.fmt.allocPrintSentinel(dll_allocator, "unable to close library {s}: {}", .{ dep_dyn_object.name, err }, 0) catch @panic("OOM");
 
-            Logger.warn("dlclose(0x{x} [{s}]) failed: {}", .{ handle, dep_dyn_object.name, err });
+            Logger.warn("dlclose(0x{x} [{s}]) failed: {}", .{ handle_raw, dep_dyn_object.name, err });
 
             return 1;
         };
     }
 
-    Logger.info("intercepted call: success: dlclose(0x{x} [{s}]) = 0", .{ handle, dyn_object.name });
+    Logger.info("intercepted call: success: dlclose(0x{x} [{s}]) = 0", .{ handle_raw, dyn_object.name });
+
+    const metadata_after = dl_handles.getPtr(handle_raw) orelse {
+        if (last_dl_error != null) {
+            dll_allocator.free(last_dl_error.?);
+        }
+        last_dl_error = std.fmt.allocPrintSentinel(dll_allocator, "invalid library handle 0x{x}", .{handle_raw}, 0) catch @panic("OOM");
+
+        Logger.warn("dlclose(0x{x}) failed: invalid library handle", .{handle_raw});
+
+        return 1;
+    };
+
+    if (metadata_after.open_count == 0) {
+        if (last_dl_error != null) {
+            dll_allocator.free(last_dl_error.?);
+        }
+        last_dl_error = std.fmt.allocPrintSentinel(dll_allocator, "library handle 0x{x} is already closed", .{handle_raw}, 0) catch @panic("OOM");
+
+        Logger.warn("dlclose(0x{x}) failed: already closed", .{handle_raw});
+
+        return 1;
+    }
+
+    metadata_after.open_count -= 1;
 
     return 0;
 }
@@ -4381,18 +4508,9 @@ fn dlsymSubstitute(lib_handle: ?*anyopaque, sym_name: [*:0]const u8) callconv(.c
         }
     }
 
-    if (lib_handle != null and @intFromPtr(lib_handle.?) != std.math.maxInt(usize) - 1 and @intFromPtr(lib_handle.?) != std.math.maxInt(usize) and @intFromPtr(lib_handle.?) - 1 >= dyn_objects.count()) {
-        if (last_dl_error != null) {
-            dll_allocator.free(last_dl_error.?);
-        }
-        last_dl_error = std.fmt.allocPrintSentinel(dll_allocator, "unable to get symbol {s}: invalid library handle 0x{x}", .{ sym_name, @intFromPtr(lib_handle.?) }, 0) catch @panic("OOM");
-
-        Logger.warn("dlsym({d}, \"{s}\") failed: invalid library handle", .{ @intFromPtr(lib_handle), sym_name });
-
-        return null;
-    }
-
-    const find_next = lib_handle != null and @intFromPtr(lib_handle.?) == std.math.maxInt(usize);
+    const handle_raw: u64 = if (lib_handle) |h| @intCast(@intFromPtr(h)) else DlHandle.rtld_default.toInt();
+    const handle = DlHandle.fromInt(handle_raw);
+    const find_next = lib_handle != null and handle == DlHandle.rtld_next;
 
     var dyn_object: ?*DynObject = null;
 
@@ -4409,8 +4527,52 @@ fn dlsymSubstitute(lib_handle: ?*anyopaque, sym_name: [*:0]const u8) callconv(.c
         };
 
         dyn_object = infos.dyn_object;
-    } else if (lib_handle != null and @intFromPtr(lib_handle.?) != std.math.maxInt(usize) - 1) {
-        dyn_object = &dyn_objects.values()[@intFromPtr(lib_handle.?) - 1];
+    } else if (lib_handle != null and handle != DlHandle.rtld_default and handle != DlHandle.rtld_main) {
+        if (handle.tag != 0b10) {
+            if (last_dl_error != null) {
+                dll_allocator.free(last_dl_error.?);
+            }
+            last_dl_error = std.fmt.allocPrintSentinel(dll_allocator, "unable to get symbol {s}: invalid library handle 0x{x}", .{ sym_name, handle_raw }, 0) catch @panic("OOM");
+
+            Logger.warn("dlsym({d}, \"{s}\") failed: invalid library handle", .{ @intFromPtr(lib_handle), sym_name });
+
+            return null;
+        }
+
+        const metadata = dl_handles.getPtr(handle_raw) orelse {
+            if (last_dl_error != null) {
+                dll_allocator.free(last_dl_error.?);
+            }
+            last_dl_error = std.fmt.allocPrintSentinel(dll_allocator, "unable to get symbol {s}: invalid library handle 0x{x}", .{ sym_name, handle_raw }, 0) catch @panic("OOM");
+
+            Logger.warn("dlsym({d}, \"{s}\") failed: invalid library handle", .{ @intFromPtr(lib_handle), sym_name });
+
+            return null;
+        };
+
+        if (metadata.open_count == 0) {
+            if (last_dl_error != null) {
+                dll_allocator.free(last_dl_error.?);
+            }
+            last_dl_error = std.fmt.allocPrintSentinel(dll_allocator, "unable to get symbol {s}: library handle 0x{x} is closed", .{ sym_name, handle_raw }, 0) catch @panic("OOM");
+
+            Logger.warn("dlsym({d}, \"{s}\") failed: library handle is closed", .{ @intFromPtr(lib_handle), sym_name });
+
+            return null;
+        }
+
+        dyn_object = &dyn_objects.values()[metadata.dyn_object_idx];
+
+        if (dyn_object.?.current_epoch != metadata.epoch) {
+            if (last_dl_error != null) {
+                dll_allocator.free(last_dl_error.?);
+            }
+            last_dl_error = std.fmt.allocPrintSentinel(dll_allocator, "unable to get symbol {s}: library handle 0x{x} is stale", .{ sym_name, handle_raw }, 0) catch @panic("OOM");
+
+            Logger.warn("dlsym({d}, \"{s}\") failed: library handle is stale", .{ @intFromPtr(lib_handle), sym_name });
+
+            return null;
+        }
     }
 
     if (dyn_object != null and dyn_object.?.ref_count == 0) {
@@ -4454,18 +4616,9 @@ fn dlvsymSubstitute(lib_handle: ?*anyopaque, sym_name: [*:0]const u8, version: [
         }
     }
 
-    if (lib_handle != null and @intFromPtr(lib_handle.?) != std.math.maxInt(usize) - 1 and @intFromPtr(lib_handle.?) != std.math.maxInt(usize) and @intFromPtr(lib_handle.?) - 1 >= dyn_objects.count()) {
-        if (last_dl_error != null) {
-            dll_allocator.free(last_dl_error.?);
-        }
-        last_dl_error = std.fmt.allocPrintSentinel(dll_allocator, "unable to get symbol {s}@{s}: invalid library handle 0x{x}", .{ sym_name, version, @intFromPtr(lib_handle.?) }, 0) catch @panic("OOM");
-
-        Logger.warn("dlvsym({d}, \"{s}\", \"{s}\") failed: invalid library handle", .{ @intFromPtr(lib_handle), sym_name, version });
-
-        return null;
-    }
-
-    const find_next = lib_handle != null and @intFromPtr(lib_handle.?) == std.math.maxInt(usize);
+    const handle_raw: u64 = if (lib_handle) |h| @intCast(@intFromPtr(h)) else DlHandle.rtld_default.toInt();
+    const handle = DlHandle.fromInt(handle_raw);
+    const find_next = lib_handle != null and handle == DlHandle.rtld_next;
 
     var dyn_object: ?*DynObject = null;
 
@@ -4482,8 +4635,52 @@ fn dlvsymSubstitute(lib_handle: ?*anyopaque, sym_name: [*:0]const u8, version: [
         };
 
         dyn_object = infos.dyn_object;
-    } else if (lib_handle != null and @intFromPtr(lib_handle.?) != std.math.maxInt(usize) - 1) {
-        dyn_object = &dyn_objects.values()[@intFromPtr(lib_handle.?) - 1];
+    } else if (lib_handle != null and handle != DlHandle.rtld_default and handle != DlHandle.rtld_main) {
+        if (handle.tag != 0b10) {
+            if (last_dl_error != null) {
+                dll_allocator.free(last_dl_error.?);
+            }
+            last_dl_error = std.fmt.allocPrintSentinel(dll_allocator, "unable to get symbol {s}@{s}: invalid library handle 0x{x}", .{ sym_name, version, handle_raw }, 0) catch @panic("OOM");
+
+            Logger.warn("dlvsym({d}, \"{s}\", \"{s}\") failed: invalid library handle", .{ @intFromPtr(lib_handle), sym_name, version });
+
+            return null;
+        }
+
+        const metadata = dl_handles.getPtr(handle_raw) orelse {
+            if (last_dl_error != null) {
+                dll_allocator.free(last_dl_error.?);
+            }
+            last_dl_error = std.fmt.allocPrintSentinel(dll_allocator, "unable to get symbol {s}@{s}: invalid library handle 0x{x}", .{ sym_name, version, handle_raw }, 0) catch @panic("OOM");
+
+            Logger.warn("dlvsym({d}, \"{s}\", \"{s}\") failed: invalid library handle", .{ @intFromPtr(lib_handle), sym_name, version });
+
+            return null;
+        };
+
+        if (metadata.open_count == 0) {
+            if (last_dl_error != null) {
+                dll_allocator.free(last_dl_error.?);
+            }
+            last_dl_error = std.fmt.allocPrintSentinel(dll_allocator, "unable to get symbol {s}@{s}: library handle 0x{x} is closed", .{ sym_name, version, handle_raw }, 0) catch @panic("OOM");
+
+            Logger.warn("dlvsym({d}, \"{s}\", \"{s}\") failed: library handle is closed", .{ @intFromPtr(lib_handle), sym_name, version });
+
+            return null;
+        }
+
+        dyn_object = &dyn_objects.values()[metadata.dyn_object_idx];
+
+        if (dyn_object.?.current_epoch != metadata.epoch) {
+            if (last_dl_error != null) {
+                dll_allocator.free(last_dl_error.?);
+            }
+            last_dl_error = std.fmt.allocPrintSentinel(dll_allocator, "unable to get symbol {s}@{s}: library handle 0x{x} is stale", .{ sym_name, version, handle_raw }, 0) catch @panic("OOM");
+
+            Logger.warn("dlvsym({d}, \"{s}\", \"{s}\") failed: library handle is stale", .{ @intFromPtr(lib_handle), sym_name, version });
+
+            return null;
+        }
     }
 
     if (dyn_object != null and dyn_object.?.ref_count == 0) {
