@@ -881,10 +881,7 @@ fn resolvePath(r_path: []const u8, check_mode: bool) ![]const u8 {
                 continue;
             }
 
-            const a_path = std.fmt.bufPrint(&buf, "{s}/{s}", .{ dir, r_path }) catch |err| switch (err) {
-                error.NoSpaceLeft => continue,
-                else => |e| return e,
-            };
+            const a_path = if (std.mem.startsWith(u8, dir, "/")) try std.fmt.bufPrint(&buf, "{s}/{s}", .{ dir, r_path }) else try std.fmt.bufPrint(&buf, "/{s}/{s}", .{ dir, r_path });
 
             std.Io.Dir.accessAbsolute(dll_io, a_path, .{ .read = true }) catch continue;
 
