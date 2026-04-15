@@ -12,6 +12,26 @@ See [this thread](https://ziggit.dev/t/dynamic-linking-without-libc-adventures) 
 
 ### Usage
 
+For now, the library always follows the latest "master" x86_64 tarball available on [ziglang.org](https://ziglang.org/download/).
+
+```sh
+zig fetch --save=dll https://github.com/TibboddiT/dyn-loader/archive/refs/heads/main.tar.gz
+```
+
+```zig
+// build.zig
+
+// ...
+
+    const dll_dep = b.dependency("dll", .{
+        .optimize = optimize,
+        // no `target`, because it is always x86_64 linux baseline
+    });
+    const dll_mod = dll_dep.module("dll");
+
+// then add the module to your executable as usual
+```
+
 ```zig
 const std = @import("std");
 const dll = @import("dll");
