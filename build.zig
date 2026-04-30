@@ -29,7 +29,7 @@ pub fn build(b: *std.Build) void {
     addExecutable(b, &resources_dir.step, check_step, dll_mod, target, optimize, false, "printf", "examples/printf.zig");
     addExecutable(b, &resources_dir.step, check_step, dll_mod, target, optimize, false, "printf_musl", "examples/printf_musl.zig");
     addExecutable(b, &resources_dir.step, check_step, dll_mod, target, optimize, true, "segfault", "examples/segfault.zig");
-    addExecutable(b, &resources_dir.step, check_step, dll_mod, target, optimize, true, "leak", "examples/leak.zig");
+    addExecutable(b, &resources_dir.step, check_step, dll_mod, target, .Debug, true, "leak", "examples/leak.zig");
     addExecutable(b, &resources_dir.step, check_step, dll_mod, target, optimize, false, "vulkan_version", "examples/vulkan_version.zig");
     addExecutable(b, &resources_dir.step, check_step, dll_mod, target, optimize, false, "vulkan_version_musl", "examples/vulkan_version_musl.zig");
     addExecutable(b, &resources_dir.step, check_step, dll_mod, target, optimize, false, "x11_window", "examples/x11_window.zig");
