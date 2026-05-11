@@ -40,7 +40,7 @@ pub fn main(init: std.process.Init) !void {
     const printf_addr = printf_sym.addr;
     const printf: *const fn ([*:0]const u8, ...) callconv(.c) c_int = @ptrFromInt(printf_addr);
 
-    var world: [:0]u8 = try allocator.dupeZ(u8, "World");
+    var world: [:0]u8 = try allocator.dupeSentinel(u8, "World", 0);
     defer allocator.free(world);
 
     world.ptr[0] = 'w';

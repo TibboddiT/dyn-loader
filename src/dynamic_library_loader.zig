@@ -4859,7 +4859,7 @@ fn dladdrSubstitute(addr: *anyopaque, dl_info: *DlInfo) callconv(.c) c_int {
         return 0;
     };
 
-    const owned_name = dll_allocator.dupeZ(u8, infos.dyn_object.name) catch @panic("OOM");
+    const owned_name = dll_allocator.dupeSentinel(u8, infos.dyn_object.name, 0) catch @panic("OOM");
     extra_strs_z.append(dll_allocator, owned_name) catch @panic("OOM");
 
     dl_info.dli_fname = owned_name.ptr;
@@ -4869,7 +4869,7 @@ fn dladdrSubstitute(addr: *anyopaque, dl_info: *DlInfo) callconv(.c) c_int {
         const sym = infos.dyn_object.syms_array.items[sidx];
         const sym_addr = vAddressToLoadedAddress(infos.dyn_object, sym.value, false) catch unreachable;
 
-        const owned_sym_name = dll_allocator.dupeZ(u8, sym.name) catch @panic("OOM");
+        const owned_sym_name = dll_allocator.dupeSentinel(u8, sym.name, 0) catch @panic("OOM");
         extra_strs_z.append(dll_allocator, owned_sym_name) catch @panic("OOM");
 
         dl_info.dli_fsname = owned_sym_name.ptr;
@@ -4930,7 +4930,7 @@ fn dladdr1Substitute(addr: *anyopaque, dl_info: *DlInfo, extra_infos: *anyopaque
         return 0;
     };
 
-    const owned_name = dll_allocator.dupeZ(u8, infos.dyn_object.name) catch @panic("OOM");
+    const owned_name = dll_allocator.dupeSentinel(u8, infos.dyn_object.name, 0) catch @panic("OOM");
     extra_strs_z.append(dll_allocator, owned_name) catch @panic("OOM");
 
     dl_info.dli_fname = owned_name.ptr;
@@ -4940,7 +4940,7 @@ fn dladdr1Substitute(addr: *anyopaque, dl_info: *DlInfo, extra_infos: *anyopaque
         const sym = infos.dyn_object.syms_array.items[sidx];
         const sym_addr = vAddressToLoadedAddress(infos.dyn_object, sym.value, false) catch unreachable;
 
-        const owned_sym_name = dll_allocator.dupeZ(u8, sym.name) catch @panic("OOM");
+        const owned_sym_name = dll_allocator.dupeSentinel(u8, sym.name, 0) catch @panic("OOM");
         extra_strs_z.append(dll_allocator, owned_sym_name) catch @panic("OOM");
 
         dl_info.dli_fsname = owned_sym_name.ptr;
@@ -5040,7 +5040,7 @@ fn dlFindDsoForObjectSubstitute(addr: *anyopaque) callconv(.c) ?*DlLinkMap {
         return null;
     };
 
-    const owned_name = dll_allocator.dupeZ(u8, infos.dyn_object.name) catch @panic("OOM");
+    const owned_name = dll_allocator.dupeSentinel(u8, infos.dyn_object.name, 0) catch @panic("OOM");
     extra_strs_z.append(dll_allocator, owned_name) catch @panic("OOM");
 
     Logger.warn("_dl_find_dso_for_object: partial implementation: link maps should be reused as they can be compared by address", .{});
