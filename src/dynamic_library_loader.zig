@@ -2474,19 +2474,44 @@ fn detectLibC(dyn_object: *DynObject) !void {
             };
 
             const search_start_offset = @max(div_offset, 64) - 64;
-            const use_offset = uo_blk: {
-                if (std.mem.find(u8, ei_sym_content[search_start_offset..div_offset], &.{ 0x4c, 0x8b, 0x80 })) |uo| break :uo_blk uo;
-                if (std.mem.find(u8, ei_sym_content[search_start_offset..div_offset], &.{ 0x48, 0x8b, 0xb0 })) |uo| break :uo_blk uo;
+
+            const TlsOffsets = struct {
+                tls_size_offset: u32,
+                tls_align_offset: u32,
+            };
+
+            const tls_offsets: TlsOffsets = to_blk: {
+                const search_content = ei_sym_content[search_start_offset..div_offset];
+
+                if (std.mem.find(u8, search_content, &.{ 0x4c, 0x8b, 0x80 })) |use_offset| {
+                    break :to_blk .{
+                        .tls_size_offset = std.mem.readInt(u32, ei_sym_content[search_start_offset + use_offset + 10 ..][0..4], .little),
+                        .tls_align_offset = std.mem.readInt(u32, ei_sym_content[search_start_offset + use_offset + 3 ..][0..4], .little),
+                    };
+                }
+
+                if (std.mem.find(u8, search_content, &.{ 0x48, 0x8b, 0xb0 })) |use_offset| {
+                    break :to_blk .{
+                        .tls_size_offset = std.mem.readInt(u32, ei_sym_content[search_start_offset + use_offset + 10 ..][0..4], .little),
+                        .tls_align_offset = std.mem.readInt(u32, ei_sym_content[search_start_offset + use_offset + 3 ..][0..4], .little),
+                    };
+                }
+
+                if (std.mem.find(u8, search_content, &.{ 0xf3, 0x0f, 0x6f, 0x80 })) |use_offset| {
+                    const tls_size_offset = std.mem.readInt(u32, ei_sym_content[search_start_offset + use_offset + 4 ..][0..4], .little);
+                    break :to_blk .{
+                        .tls_size_offset = tls_size_offset,
+                        .tls_align_offset = tls_size_offset + 8,
+                    };
+                }
+
                 return error.UnableToDetectGlibcRtldGlobalFieldOffset;
             };
 
             Logger.debug("libc detection: __libc_early_init div offset: 0x{x}, search offset: 0x{x}", .{ div_offset, search_start_offset });
 
-            const tls_size_use_offset = search_start_offset + use_offset + 10;
-            const tls_align_use_offset = search_start_offset + use_offset + 3;
-
-            const tls_size_offset = std.mem.readInt(u32, ei_sym_content[tls_size_use_offset..][0..4], .little);
-            const tls_align_offset = std.mem.readInt(u32, ei_sym_content[tls_align_use_offset..][0..4], .little);
+            const tls_size_offset = tls_offsets.tls_size_offset;
+            const tls_align_offset = tls_offsets.tls_align_offset;
 
             Logger.debug("libc detection: tls_size field offset: {d}, tls_align field offset: {d}", .{ tls_size_offset, tls_align_offset });
 

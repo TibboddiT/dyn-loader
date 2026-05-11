@@ -1,3 +1,5 @@
+// based on lib/std/debug/SelfInfo/Elf.zig @ 6707a5efee
+
 // TODO move this to dll global state
 var extra_phdr_infos: std.ArrayList(*std.posix.dl_phdr_info) = .empty;
 
