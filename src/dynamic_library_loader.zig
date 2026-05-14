@@ -838,11 +838,13 @@ fn loadDepTree(o_path: []const u8) !DynamicLibrary {
     var has_unloaded = true;
     while (has_unloaded) {
         has_unloaded = false;
+        var mapped_count: usize = 0;
 
         const do_count = dyn_objects.count();
 
         for (0..do_count) |dyn_object_idx| {
             const dyn_object_name = dyn_objects.values()[dyn_object_idx].name;
+            const dyn_object_path = dyn_objects.values()[dyn_object_idx].path;
 
             {
                 const dyn_object = &dyn_objects.values()[dyn_object_idx];
@@ -857,10 +859,25 @@ fn loadDepTree(o_path: []const u8) !DynamicLibrary {
 
             has_unloaded = true;
 
-            const idx = try loadDso(if (dyn_object_idx == lib_idx) o_path else dyn_object_name);
+            const idx = try loadDso(if (dyn_object_idx == lib_idx) o_path else dyn_object_path);
+
+            // TODO these two checks are potentially over defensive, maybe we can assert `idx == dyn_object_idx`
             if (dyn_objects.values()[idx].mapped_at != 0) {
                 Logger.debug("dep tree: {s} has been mapped", .{dyn_object_name});
             }
+            if (dyn_objects.values()[dyn_object_idx].mapped_at != 0) {
+                mapped_count += 1;
+            }
+        }
+
+        if (has_unloaded and mapped_count == 0 and dyn_objects.count() == do_count) {
+            for (dyn_objects.values(), 0..) |dyn_object, dyn_object_idx| {
+                if (dyn_object.mapped_at == 0) {
+                    Logger.err("dep tree stalled at {d}: {s} => {s}", .{ dyn_object_idx, dyn_object.name, dyn_object.path });
+                    break;
+                }
+            }
+            return error.DependencyLoadStalled;
         }
     }
 
@@ -871,27 +888,35 @@ fn loadDepTree(o_path: []const u8) !DynamicLibrary {
     };
 }
 
-fn findDynObjectByName(name: []const u8) ?*const DynObject {
-    var it = dyn_objects.iterator();
-    while (it.next()) |e| {
-        if (std.mem.eql(u8, name, e.value_ptr.name)) {
-            return e.value_ptr;
-        }
+// TODO these two functions should be factorized
+fn validateSupportedElfHeader(path: []const u8, eh: *const std.elf.Elf64_Ehdr) !void {
+    if (!std.mem.eql(u8, eh.e_ident[0..4], std.elf.MAGIC)) return error.NotAnElfFile;
+    if (eh.e_ident[std.elf.EI_CLASS] != std.elf.ELFCLASS64) {
+        Logger.err("unsupported ELF class for {s}: class={d} data={d} version={d} type={} machine=0x{x} expected_machine=0x{x}", .{ path, eh.e_ident[std.elf.EI_CLASS], eh.e_ident[std.elf.EI_DATA], eh.e_ident[std.elf.EI_VERSION], eh.e_type, @intFromEnum(eh.e_machine), @intFromEnum(std.elf.EM.X86_64) });
+        return error.UnsupportedElfClass;
     }
-
-    return null;
+    if (eh.e_ident[std.elf.EI_DATA] != std.elf.ELFDATA2LSB) {
+        Logger.err("unsupported ELF data encoding for {s}: class={d} data={d} version={d} type={} machine=0x{x} expected_machine=0x{x}", .{ path, eh.e_ident[std.elf.EI_CLASS], eh.e_ident[std.elf.EI_DATA], eh.e_ident[std.elf.EI_VERSION], eh.e_type, @intFromEnum(eh.e_machine), @intFromEnum(std.elf.EM.X86_64) });
+        return error.UnsupportedElfEndian;
+    }
+    if (eh.e_machine != std.elf.EM.X86_64) {
+        Logger.err("unsupported ELF machine for {s}: class={d} data={d} version={d} type={} machine=0x{x} expected_machine=0x{x}", .{ path, eh.e_ident[std.elf.EI_CLASS], eh.e_ident[std.elf.EI_DATA], eh.e_ident[std.elf.EI_VERSION], eh.e_type, @intFromEnum(eh.e_machine), @intFromEnum(std.elf.EM.X86_64) });
+        return error.UnsupportedElfMachine;
+    }
 }
 
-fn resolveDynObjectKeyByNameOrPath(nameOrPath: []const u8) !DynObjectId {
-    const path: []const u8 = if (std.mem.findScalar(u8, nameOrPath, '/') != null) try dll_allocator.dupe(u8, nameOrPath) else try resolvePath(nameOrPath, false);
-    defer dll_allocator.free(path);
-
-    const f = try std.Io.Dir.openFileAbsolute(dll_io, path, .{ .mode = .read_only });
+fn isSupportedElfPath(path: []const u8) bool {
+    const f = std.Io.Dir.openFileAbsolute(dll_io, path, .{ .mode = .read_only }) catch return false;
     defer f.close(dll_io);
 
-    const stat = try f.stat(dll_io);
+    var eh: std.elf.Elf64_Ehdr = undefined;
+    const read = f.readPositional(dll_io, &.{std.mem.asBytes(&eh)}, 0) catch return false;
+    if (read != @sizeOf(std.elf.Elf64_Ehdr)) return false;
 
-    return .{ .ino = stat.inode };
+    return std.mem.eql(u8, eh.e_ident[0..4], std.elf.MAGIC) and
+        eh.e_ident[std.elf.EI_CLASS] == std.elf.ELFCLASS64 and
+        eh.e_ident[std.elf.EI_DATA] == std.elf.ELFDATA2LSB and
+        eh.e_machine == std.elf.EM.X86_64;
 }
 
 // TODO mimic path resolution of linux-ld better
@@ -924,6 +949,10 @@ fn resolvePath(r_path: []const u8, check_mode: bool) ![]const u8 {
             const a_path = if (std.mem.startsWith(u8, dir, "/")) try std.fmt.bufPrint(&buf, "{s}/{s}", .{ dir, r_path }) else try std.fmt.bufPrint(&buf, "/{s}/{s}", .{ dir, r_path });
 
             std.Io.Dir.accessAbsolute(dll_io, a_path, .{ .read = true }) catch continue;
+            if (!isSupportedElfPath(a_path)) {
+                Logger.debug("skipping unsupported library candidate {s}", .{a_path});
+                continue;
+            }
 
             const path = try std.fmt.allocPrint(dll_allocator, "{s}", .{a_path});
             Logger.debug("found {s} via LD_LIBRARY_PATH: {s}", .{ r_path, path });
@@ -936,6 +965,10 @@ fn resolvePath(r_path: []const u8, check_mode: bool) ![]const u8 {
         const a_path = try std.fmt.bufPrint(&buf, "{s}/{s}", .{ dir, r_path });
 
         std.Io.Dir.accessAbsolute(dll_io, a_path, .{ .read = true }) catch continue;
+        if (!isSupportedElfPath(a_path)) {
+            Logger.debug("skipping unsupported library candidate {s}", .{a_path});
+            continue;
+        }
 
         path = try std.fmt.allocPrint(dll_allocator, "{s}", .{a_path});
 
@@ -953,6 +986,33 @@ fn resolvePath(r_path: []const u8, check_mode: bool) ![]const u8 {
     }
 
     return path orelse error.LibraryNotFound;
+}
+
+const ResolvedDynObjectInfos = struct {
+    key: DynObjectId,
+    path: []const u8,
+};
+
+fn resolveDynObjectInfosByNameOrPath(nameOrPath: []const u8) !ResolvedDynObjectInfos {
+    const path: []const u8 = if (std.mem.findScalar(u8, nameOrPath, '/') != null) try dll_allocator.dupe(u8, nameOrPath) else try resolvePath(nameOrPath, false);
+    errdefer dll_allocator.free(path);
+
+    const f = try std.Io.Dir.openFileAbsolute(dll_io, path, .{ .mode = .read_only });
+    defer f.close(dll_io);
+
+    const stat = try f.stat(dll_io);
+    const size = std.math.cast(usize, stat.size) orelse return error.FileTooBig;
+    if (size < @sizeOf(std.elf.Elf64_Ehdr)) return error.NotAnElfFile;
+
+    var eh: std.elf.Elf64_Ehdr = undefined;
+    const read = try f.readPositional(dll_io, &.{std.mem.asBytes(&eh)}, 0);
+    if (read != @sizeOf(std.elf.Elf64_Ehdr)) return error.NotAnElfFile;
+    try validateSupportedElfHeader(path, &eh);
+
+    return .{
+        .key = .{ .ino = stat.inode },
+        .path = path,
+    };
 }
 
 fn loadDso(o_path: []const u8) !usize {
@@ -980,15 +1040,11 @@ fn loadDso(o_path: []const u8) !usize {
 
     const dyn_object_key: DynObjectId = .{ .ino = stat.inode };
 
-    if (!dyn_objects.contains(dyn_object_key)) {
-        const owned_name = try dll_allocator.dupe(u8, dyn_object_name);
-        const owned_path = try dll_allocator.dupe(u8, path);
-        try dyn_objects.putNoClobber(dll_allocator, dyn_object_key, .init(dyn_object_key, owned_name, owned_path));
-    } else if (dyn_objects.get(dyn_object_key).?.mapped_at != 0) {
+    if (dyn_objects.get(dyn_object_key)) |dyn_object| if (dyn_object.mapped_at != 0) {
         f.close(dll_io);
 
         return dyn_objects.getIndex(dyn_object_key).?;
-    }
+    };
 
     Logger.debug("loading: {s} [{s}]", .{ o_path, path });
 
@@ -1005,8 +1061,13 @@ fn loadDso(o_path: []const u8) !usize {
     const file_addr = @intFromPtr(file_bytes.ptr);
 
     const eh: *std.elf.Elf64_Ehdr = @ptrCast(file_bytes);
-    if (!std.mem.eql(u8, eh.e_ident[0..4], std.elf.MAGIC)) return error.NotAnElfFile;
-    if (eh.e_machine != std.elf.EM.X86_64) return error.UnsupportedElfMachine;
+    try validateSupportedElfHeader(path, eh);
+
+    if (!dyn_objects.contains(dyn_object_key)) {
+        const owned_name = try dll_allocator.dupe(u8, dyn_object_name);
+        const owned_path = try dll_allocator.dupe(u8, path);
+        try dyn_objects.putNoClobber(dll_allocator, dyn_object_key, .init(dyn_object_key, owned_name, owned_path));
+    }
 
     Logger.debug("elf type: {s}", .{@tagName(eh.e_type)});
 
@@ -1165,19 +1226,29 @@ fn loadDso(o_path: []const u8) !usize {
 
                     const libNameLen = std.mem.len(libName);
 
-                    const maybe_dep = findDynObjectByName(libName[0..libNameLen]);
+                    const resolved_dep = resolveDynObjectInfosByNameOrPath(libName[0..libNameLen]) catch |err| {
+                        Logger.err("unresolved {s} dependency: {s}", .{ dyn_object_name, libName });
+                        return err;
+                    };
+                    var resolved_dep_path: ?[]const u8 = resolved_dep.path;
+                    errdefer if (resolved_dep_path) |p| dll_allocator.free(p);
+
+                    const maybe_dep = dyn_objects.getPtr(resolved_dep.key);
                     if (maybe_dep == null) {
                         // TODO assert DT_NEEDED is not a path
-                        const dep_name = try dll_allocator.dupe(u8, libName[0..libNameLen]);
-                        const dep_path = try dll_allocator.dupe(u8, libName[0..libNameLen]);
-                        const dep_key = resolveDynObjectKeyByNameOrPath(dep_name) catch |err| {
-                            Logger.err("unresolved {s} dependency: {s}", .{ dyn_object_name, dep_name });
-                            return err;
-                        };
-                        try dyn_objects.putNoClobber(dll_allocator, dep_key, .init(dep_key, dep_name, dep_path));
+                        var dep_name: ?[]const u8 = try dll_allocator.dupe(u8, libName[0..libNameLen]);
+                        errdefer if (dep_name) |n| dll_allocator.free(n);
+
+                        try dyn_objects.putNoClobber(dll_allocator, resolved_dep.key, .init(resolved_dep.key, dep_name.?, resolved_dep_path.?));
+                        dep_name = null;
+                        resolved_dep_path = null;
+
                         Logger.debug("dep tree: {s} loading deferred", .{dyn_object_name});
                         has_unloaded_deps = true;
                     } else {
+                        dll_allocator.free(resolved_dep_path.?);
+                        resolved_dep_path = null;
+
                         const dep = maybe_dep.?;
                         if (dep.mapped_at != 0) {
                             Logger.debug("dep tree: registering dependency: {s} => {s}", .{ dyn_object_name, libName });
