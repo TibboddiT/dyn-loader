@@ -65,37 +65,83 @@ pub fn getSymbols(
     const vaddr = address - module.load_offset;
 
     const loaded_elf = try module.getLoadedElf(gpa, io);
-    if (loaded_elf.file.dwarf) |*dwarf| {
-        if (!loaded_elf.scanned_dwarf) {
-            dwarf.open(gpa, native_endian) catch |err| switch (err) {
+    if (!loaded_elf.bad_dwarf) {
+        if (loaded_elf.file.dwarf) |*dwarf| {
+            if (!loaded_elf.scanned_dwarf) {
+                dwarf.open(gpa, native_endian) catch |err| switch (err) {
+                    error.OutOfMemory => |e| return e,
+                    error.InvalidDebugInfo,
+                    error.MissingDebugInfo,
+                    error.EndOfStream,
+                    error.Overflow,
+                    error.ReadFailed,
+                    error.StreamTooLong,
+                    => {
+                        loaded_elf.bad_dwarf = true;
+                        return appendSymtabSymbol(&loaded_elf.file, gpa, symbol_allocator, vaddr, symbols);
+                    },
+                };
+                loaded_elf.scanned_dwarf = true;
+            }
+            const original_len = symbols.items.len;
+            dwarf.getSymbols(
+                symbol_allocator,
+                text_arena,
+                native_endian,
+                vaddr,
+                resolve_inline_callers,
+                symbols,
+            ) catch |err| switch (err) {
                 error.InvalidDebugInfo,
                 error.MissingDebugInfo,
+                error.UnsupportedDebugInfo,
+                => {
+                    symbols.items.len = original_len;
+                    return appendSymtabSymbol(&loaded_elf.file, gpa, symbol_allocator, vaddr, symbols);
+                },
                 error.OutOfMemory,
-                => |e| return e,
-                error.EndOfStream,
-                error.Overflow,
                 error.ReadFailed,
-                error.StreamTooLong,
-                => return error.InvalidDebugInfo,
+                error.Unexpected,
+                error.Canceled,
+                => |e| return e,
             };
-            loaded_elf.scanned_dwarf = true;
+
+            if (symbols.items.len > original_len) {
+                fillMissingSymbolNameFromSymtab(&loaded_elf.file, gpa, vaddr, &symbols.items[original_len]);
+            }
+            return;
         }
-        return dwarf.getSymbols(
-            symbol_allocator,
-            text_arena,
-            native_endian,
-            vaddr,
-            resolve_inline_callers,
-            symbols,
-        );
     }
     // When DWARF is unavailable, fall back to searching the symtab.
-    try symbols.append(symbol_allocator, loaded_elf.file.searchSymtab(gpa, vaddr) catch |err| switch (err) {
+    try appendSymtabSymbol(&loaded_elf.file, gpa, symbol_allocator, vaddr, symbols);
+}
+
+fn appendSymtabSymbol(
+    elf_file: *std.debug.ElfFile,
+    gpa: Allocator,
+    symbol_allocator: Allocator,
+    vaddr: u64,
+    symbols: *std.ArrayList(std.debug.Symbol),
+) Error!void {
+    try symbols.append(symbol_allocator, elf_file.searchSymtab(gpa, vaddr) catch |err| switch (err) {
         error.NoSymtab, error.NoStrtab => return error.MissingDebugInfo,
         error.BadSymtab => return error.InvalidDebugInfo,
         error.OutOfMemory => |e| return e,
     });
 }
+
+fn fillMissingSymbolNameFromSymtab(
+    elf_file: *std.debug.ElfFile,
+    gpa: Allocator,
+    vaddr: u64,
+    symbol: *std.debug.Symbol,
+) void {
+    if (symbol.name != null) return;
+
+    const symtab_symbol = elf_file.searchSymtab(gpa, vaddr) catch return;
+    symbol.name = symtab_symbol.name;
+}
+
 pub fn getModuleName(si: *SelfInfo, io: Io, address: usize) Error![]const u8 {
     const gpa = std.debug.getDebugInfoAllocator();
     const module = try si.findModule(gpa, io, address, .shared);
@@ -103,6 +149,7 @@ pub fn getModuleName(si: *SelfInfo, io: Io, address: usize) Error![]const u8 {
     if (module.name.len == 0) return error.MissingDebugInfo;
     return module.name;
 }
+
 pub fn getModuleSlide(si: *SelfInfo, io: Io, address: usize) Error!usize {
     const gpa = std.debug.getDebugInfoAllocator();
     const module = try si.findModule(gpa, io, address, .shared);
@@ -272,6 +319,7 @@ const Module = struct {
     const LoadedElf = struct {
         file: std.debug.ElfFile,
         scanned_dwarf: bool,
+        bad_dwarf: bool,
     };
 
     const UnwindSections = struct {
@@ -398,6 +446,7 @@ const Module = struct {
         return .{
             .file = elf_file,
             .scanned_dwarf = false,
+            .bad_dwarf = false,
         };
     }
 };
