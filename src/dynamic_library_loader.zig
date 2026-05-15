@@ -248,6 +248,7 @@ var dyn_objects_sorted_indices: std.ArrayList(usize) = .empty;
 var dyn_objects_init_indices: std.ArrayList(usize) = .empty;
 var preload_root_indices: std.ArrayList(usize) = .empty;
 var dl_handles: DlHandleMap = .empty;
+var load_request_cache: std.StringArrayHashMapUnmanaged(usize) = .empty;
 
 const Logger = struct {
     const Level = enum {
@@ -415,6 +416,11 @@ pub fn deinit() void {
     dyn_objects_init_indices.deinit(dll_allocator);
     preload_root_indices.deinit(dll_allocator);
     dl_handles.clearAndFree(dll_allocator);
+
+    for (load_request_cache.keys()) |key| {
+        dll_allocator.free(key);
+    }
+    load_request_cache.deinit(dll_allocator);
 
     ifunc_resolved_addrs.clearAndFree(dll_allocator);
     irel_resolved_targets.clearAndFree(dll_allocator);
@@ -739,7 +745,18 @@ pub fn load(f_path: []const u8) !DynamicLibrary {
 
     loadPreloads();
 
-    const lib = try loadDepTree(f_path);
+    const lib: DynamicLibrary = blk: {
+        if (load_request_cache.get(f_path)) |cached_lib_idx| {
+            break :blk .{ .index = cached_lib_idx };
+        }
+
+        const loaded_lib = try loadDepTree(f_path);
+        var owned_cache_key: ?[]const u8 = try dll_allocator.dupe(u8, f_path);
+        errdefer if (owned_cache_key) |key| dll_allocator.free(key);
+        try load_request_cache.putNoClobber(dll_allocator, owned_cache_key.?, loaded_lib.index);
+        owned_cache_key = null;
+        break :blk loaded_lib;
+    };
 
     const root_dyn_object = &dyn_objects.values()[lib.index];
     for (root_dyn_object.deps_breadth_first.items) |dep_idx| {
@@ -1464,6 +1481,13 @@ fn loadDso(o_path: []const u8) !usize {
     var fini_array_addr: usize = 0;
     var fini_array_size: usize = 0;
 
+    var rela_reloc_tbl_addr: usize = 0;
+    var rela_reloc_tbl_size: usize = 0;
+    var rela_reloc_tbl_entry_size: usize = 0;
+    var relr_reloc_tbl_addr: usize = 0;
+    var relr_reloc_tbl_size: usize = 0;
+    var relr_reloc_tbl_entry_size: usize = 0;
+
     ph_addr = file_addr + eh.e_phoff;
 
     i = 0;
@@ -1541,14 +1565,7 @@ fn loadDso(o_path: []const u8) !usize {
 
             var runpath: [*:0]u8 = undefined;
 
-            var rela_reloc_tbl_addr: usize = 0;
-            var rela_reloc_tbl_size: usize = 0;
-            var rela_reloc_tbl_entry_size: usize = 0;
             var rela_reloc_nb_entry: usize = 0;
-
-            var relr_reloc_tbl_addr: usize = 0;
-            var relr_reloc_tbl_size: usize = 0;
-            var relr_reloc_tbl_entry_size: usize = 0;
 
             var plt_reloc_type: usize = 0;
             var plt_reloc_tbl_size: usize = 0;
@@ -1662,17 +1679,19 @@ fn loadDso(o_path: []const u8) !usize {
                         rela_reloc.r_addend,
                     });
 
+                    const reloc_type: std.elf.R_X86_64 = @enumFromInt(rela_reloc.r_type());
+                    if (reloc_type == .RELATIVE) {
+                        std.debug.assert(rela_reloc.r_addend != 0);
+                        continue;
+                    }
+
                     try relocs.append(dll_allocator, .{
-                        .type = @as(std.elf.R_X86_64, @enumFromInt(rela_reloc.r_type())),
+                        .type = reloc_type,
                         .is_relr = false,
                         .sym_idx = rela_reloc.r_sym(),
                         .offset = rela_reloc.r_offset,
                         .addend = rela_reloc.r_addend,
                     });
-
-                    if (@as(std.elf.R_X86_64, @enumFromInt(rela_reloc.r_type())) == .RELATIVE) {
-                        std.debug.assert(rela_reloc.r_addend != 0);
-                    }
                 }
             }
 
@@ -1727,14 +1746,6 @@ fn loadDso(o_path: []const u8) !usize {
                             relr_reloc.*,
                             0,
                         });
-                        try relocs.append(dll_allocator, .{
-                            .type = .RELATIVE,
-                            .is_relr = true,
-                            .sym_idx = 0,
-                            .offset = relr_reloc.*,
-                            .addend = 0,
-                        });
-
                         next = relr_reloc.* + @sizeOf(std.elf.Elf64_Addr);
                     } else {
                         for (0..(8 * @sizeOf(std.elf.Elf64_Addr) - 1)) |sr| {
@@ -1746,13 +1757,6 @@ fn loadDso(o_path: []const u8) !usize {
                                     0,
                                     next + sr * @sizeOf(std.elf.Elf64_Addr),
                                     0,
-                                });
-                                try relocs.append(dll_allocator, .{
-                                    .type = .RELATIVE,
-                                    .is_relr = true,
-                                    .sym_idx = 0,
-                                    .offset = next + sr * @sizeOf(std.elf.Elf64_Addr),
-                                    .addend = 0,
                                 });
                             }
                         }
@@ -1829,6 +1833,16 @@ fn loadDso(o_path: []const u8) !usize {
     const dyn_object = do_entry.value_ptr;
 
     try mapSegments(dyn_object, file_bytes);
+
+    try processRelativeRelocationsFast(
+        dyn_object,
+        rela_reloc_tbl_addr,
+        rela_reloc_tbl_size,
+        rela_reloc_tbl_entry_size,
+        relr_reloc_tbl_addr,
+        relr_reloc_tbl_size,
+        relr_reloc_tbl_entry_size,
+    );
 
     try collectDepsBreadthFirst(dyn_object);
 
@@ -2042,6 +2056,58 @@ fn mapSegments(dyn_object: *DynObject, file_bytes: []const u8) !void {
     }
 
     Logger.debug("successfully mapped {d} segments for {s} at base 0x{x}", .{ dyn_object.segments.count(), dyn_object.name, base_addr });
+}
+
+fn processRelativeRelocationsFast(
+    dyn_object: *DynObject,
+    rela_reloc_tbl_addr: usize,
+    rela_reloc_tbl_size: usize,
+    rela_reloc_tbl_entry_size: usize,
+    relr_reloc_tbl_addr: usize,
+    relr_reloc_tbl_size: usize,
+    relr_reloc_tbl_entry_size: usize,
+) !void {
+    const base_addr = dyn_object.loaded_at.?;
+
+    if (rela_reloc_tbl_addr > 0) {
+        const nb_entries = rela_reloc_tbl_size / rela_reloc_tbl_entry_size;
+        for (0..nb_entries) |r| {
+            const rela_reloc_addr = rela_reloc_tbl_addr + r * rela_reloc_tbl_entry_size;
+            const rela_reloc: *std.elf.Elf64_Rela = @ptrFromInt(rela_reloc_addr);
+            const reloc_type: std.elf.R_X86_64 = @enumFromInt(rela_reloc.r_type());
+            if (reloc_type != .RELATIVE) {
+                continue;
+            }
+
+            const ptr: *usize = @ptrFromInt(base_addr + rela_reloc.r_offset);
+            ptr.* = base_addr + @as(usize, @intCast(rela_reloc.r_addend));
+        }
+    }
+
+    if (relr_reloc_tbl_addr > 0) {
+        const nb_entries = relr_reloc_tbl_size / relr_reloc_tbl_entry_size;
+        var next: std.elf.Elf64_Addr = undefined;
+
+        for (0..nb_entries) |r| {
+            const relr_reloc_addr = relr_reloc_tbl_addr + r * relr_reloc_tbl_entry_size;
+            const relr_reloc: *std.elf.Elf64_Relr = @ptrFromInt(relr_reloc_addr);
+
+            if ((relr_reloc.* & 1) == 0) {
+                const ptr: *usize = @ptrFromInt(base_addr + relr_reloc.*);
+                ptr.* = base_addr + ptr.*;
+                next = relr_reloc.* + @sizeOf(std.elf.Elf64_Addr);
+            } else {
+                for (0..(8 * @sizeOf(std.elf.Elf64_Addr) - 1)) |sr| {
+                    if (((relr_reloc.* >> @as(u6, @intCast(sr + 1))) & 1) != 0) {
+                        const ptr: *usize = @ptrFromInt(base_addr + next + sr * @sizeOf(std.elf.Elf64_Addr));
+                        ptr.* = base_addr + ptr.*;
+                    }
+                }
+
+                next += @sizeOf(std.elf.Elf64_Addr) * (8 * @sizeOf(std.elf.Elf64_Addr) - 1);
+            }
+        }
+    }
 }
 
 const AbiTcb = extern struct {
