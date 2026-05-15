@@ -919,6 +919,16 @@ fn isSupportedElfPath(path: []const u8) bool {
         eh.e_machine == std.elf.EM.X86_64;
 }
 
+fn findDynObjectIndexByName(name: []const u8) ?usize {
+    for (dyn_objects.values(), 0..) |dyn_object, dyn_object_idx| {
+        if (std.mem.eql(u8, name, dyn_object.name)) {
+            return dyn_object_idx;
+        }
+    }
+
+    return null;
+}
+
 // TODO mimic path resolution of linux-ld better
 fn resolvePath(r_path: []const u8, check_mode: bool) ![]const u8 {
     const lib_dirs = [_][]const u8{
@@ -1225,8 +1235,21 @@ fn loadDso(o_path: []const u8) !usize {
                     Logger.debug("dep tree: found dependency: {s} => {s}", .{ dyn_object_name, libName });
 
                     const libNameLen = std.mem.len(libName);
+                    const dep_name = libName[0..libNameLen];
 
-                    const resolved_dep = resolveDynObjectInfosByNameOrPath(libName[0..libNameLen]) catch |err| {
+                    if (findDynObjectIndexByName(dep_name)) |dep_idx| {
+                        const dep = &dyn_objects.values()[dep_idx];
+                        if (dep.mapped_at != 0) {
+                            Logger.debug("dep tree: registering dependency: {s} => {s}", .{ dyn_object_name, libName });
+                            try dependencies.append(dll_allocator, dep_idx);
+                        } else {
+                            Logger.debug("dep tree: {s} loading deferred", .{dyn_object_name});
+                            has_unloaded_deps = true;
+                        }
+                        continue;
+                    }
+
+                    const resolved_dep = resolveDynObjectInfosByNameOrPath(dep_name) catch |err| {
                         Logger.err("unresolved {s} dependency: {s}", .{ dyn_object_name, libName });
                         return err;
                     };
@@ -1236,11 +1259,11 @@ fn loadDso(o_path: []const u8) !usize {
                     const maybe_dep = dyn_objects.getPtr(resolved_dep.key);
                     if (maybe_dep == null) {
                         // TODO assert DT_NEEDED is not a path
-                        var dep_name: ?[]const u8 = try dll_allocator.dupe(u8, libName[0..libNameLen]);
-                        errdefer if (dep_name) |n| dll_allocator.free(n);
+                        var owned_dep_name: ?[]const u8 = try dll_allocator.dupe(u8, dep_name);
+                        errdefer if (owned_dep_name) |n| dll_allocator.free(n);
 
-                        try dyn_objects.putNoClobber(dll_allocator, resolved_dep.key, .init(resolved_dep.key, dep_name.?, resolved_dep_path.?));
-                        dep_name = null;
+                        try dyn_objects.putNoClobber(dll_allocator, resolved_dep.key, .init(resolved_dep.key, owned_dep_name.?, resolved_dep_path.?));
+                        owned_dep_name = null;
                         resolved_dep_path = null;
 
                         Logger.debug("dep tree: {s} loading deferred", .{dyn_object_name});
