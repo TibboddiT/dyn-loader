@@ -107,6 +107,8 @@ pub fn getSymbols(
             };
 
             if (symbols.items.len > original_len) {
+                // `Dwarf.getSymbols` currently appends exactly one symbol and ignores inline callers,
+                // so `&symbols.items[original_len]` points to the only DWARF result that may need a symtab name.
                 fillMissingSymbolNameFromSymtab(&loaded_elf.file, gpa, vaddr, &symbols.items[original_len]);
             }
             return;
