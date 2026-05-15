@@ -394,10 +394,6 @@ pub fn deinit() void {
     }
 
     for (dyn_objects.values()) |*dyn_object| {
-        for (dyn_object.syms_array.items) |*sym| {
-            dll_allocator.free(sym.name);
-            dll_allocator.free(sym.version);
-        }
         dyn_object.syms_array.deinit(dll_allocator);
 
         for (dyn_object.syms.values()) |*v| {
@@ -1306,10 +1302,6 @@ fn loadDso(o_path: []const u8) !usize {
     var syms_array: std.ArrayList(DynSym) = .empty;
     var syms: DynSymList = .empty;
     errdefer {
-        for (syms_array.items) |*sym| {
-            dll_allocator.free(sym.name);
-            dll_allocator.free(sym.version);
-        }
         syms_array.deinit(dll_allocator);
 
         for (syms.values()) |*v| {
@@ -1329,18 +1321,15 @@ fn loadDso(o_path: []const u8) !usize {
 
     Logger.debug("{s}: symbols: ", .{dyn_object_name});
 
-    for (0..dyn_symtab_size / @sizeOf(std.elf.Sym)) |j| {
+    const dyn_sym_count = dyn_symtab_size / @sizeOf(std.elf.Sym);
+    try syms_array.ensureTotalCapacity(dll_allocator, dyn_sym_count);
+    try syms.ensureTotalCapacity(dll_allocator, dyn_sym_count);
+
+    for (0..dyn_sym_count) |j| {
         const sym: *std.elf.Elf64.Sym = @ptrFromInt(dyn_symtab_addr + j * @sizeOf(std.elf.Elf64.Sym));
 
-        // TODO max len of sym name / aux name ?
-        var buf_str: [2048]u8 = @splat(0);
         const strs: [*]u8 = @ptrFromInt(dyn_strtab_addr);
-        var k: usize = 0;
-        while (strs[k + sym.name] != 0) : (k += 1) {
-            buf_str[k] = strs[k + sym.name];
-        }
-
-        const name = try std.fmt.allocPrint(dll_allocator, "{s}", .{buf_str[0..k]});
+        const name = std.mem.sliceTo(@as([*:0]const u8, @ptrCast(strs + sym.name)), 0);
 
         const hidden = sym.other.visibility != .DEFAULT;
 
@@ -1353,9 +1342,9 @@ fn loadDso(o_path: []const u8) !usize {
             ver_idx = ver_sym.?.VERSION;
 
             if (ver_sym == std.elf.Versym.GLOBAL) {
-                version = try dll_allocator.dupe(u8, "GLOBAL");
+                version = "GLOBAL";
             } else if (ver_sym == std.elf.Versym.LOCAL) {
-                version = try dll_allocator.dupe(u8, "LOCAL");
+                version = "LOCAL";
             } else {
                 if (sym.shndx == std.elf.SHN_UNDEF) {
                     const ver_table_addr = verneed_tab_addr;
@@ -1367,12 +1356,7 @@ fn loadDso(o_path: []const u8) !usize {
                         var aux: *std.elf.Vernaux = @ptrFromInt(ver_table_cursor + curr_def.vn_aux);
                         while (true) {
                             if (aux.other == ver_idx.?) {
-                                k = 0;
-                                while (strs[k + aux.name] != 0) : (k += 1) {
-                                    buf_str[k] = strs[k + aux.name];
-                                }
-
-                                version = try std.fmt.allocPrint(dll_allocator, "{s}", .{buf_str[0..k]});
+                                version = std.mem.sliceTo(@as([*:0]const u8, @ptrCast(strs + aux.name)), 0);
                                 break :outer;
                             }
 
@@ -1400,12 +1384,7 @@ fn loadDso(o_path: []const u8) !usize {
                         if (curr_def.ndx == @as(std.elf.VER_NDX, @enumFromInt(ver_idx.?))) {
                             const aux: *std.elf.Verdaux = @ptrFromInt(ver_table_cursor + curr_def.aux);
 
-                            k = 0;
-                            while (strs[k + aux.name] != 0) : (k += 1) {
-                                buf_str[k] = strs[k + aux.name];
-                            }
-
-                            version = try std.fmt.allocPrint(dll_allocator, "{s}", .{buf_str[0..k]});
+                            version = std.mem.sliceTo(@as([*:0]const u8, @ptrCast(strs + aux.name)), 0);
                             break;
                         }
 
