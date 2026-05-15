@@ -433,11 +433,6 @@ pub fn deinit() void {
     }
     extra_strs.deinit(dll_allocator);
 
-    for (extra_strs_z.items) |e| {
-        dll_allocator.free(e);
-    }
-    extra_strs_z.deinit(dll_allocator);
-
     for (extra_phdrs.items) |e| {
         dll_allocator.destroy(e);
     }
@@ -475,6 +470,11 @@ pub fn deinit() void {
     extra_allocations.clearAndFree(dll_allocator);
 
     CustomSelfInfo.clearExtraElfs(dll_allocator);
+
+    for (extra_strs_z.items) |e| {
+        dll_allocator.free(e);
+    }
+    extra_strs_z.deinit(dll_allocator);
 
     // TODO
     // - unmap unnecessary maps
@@ -785,10 +785,18 @@ pub fn load(f_path: []const u8) !DynamicLibrary {
             dyn_obj.loaded = true;
 
             const dl_phdr_info = try dll_allocator.create(std.posix.dl_phdr_info);
+            var dl_phdr_info_registered = false;
+            errdefer if (!dl_phdr_info_registered) dll_allocator.destroy(dl_phdr_info);
+
+            const owned_path_z = try dll_allocator.dupeSentinel(u8, dyn_obj.path, 0);
+            extra_strs_z.append(dll_allocator, owned_path_z) catch |err| {
+                dll_allocator.free(owned_path_z);
+                return err;
+            };
 
             dl_phdr_info.* = .{
                 .addr = dyn_obj.loaded_at.?,
-                .name = @ptrCast(dyn_obj.path),
+                .name = owned_path_z.ptr,
                 .phdr = @ptrFromInt(dyn_obj.loaded_at.? + dyn_obj.eh.e_phoff),
                 .phnum = dyn_obj.eh.e_phnum,
             };
@@ -796,6 +804,7 @@ pub fn load(f_path: []const u8) !DynamicLibrary {
             Logger.debug("unwinding: registering {s} at 0x{x}", .{ dyn_obj.name, dyn_obj.loaded_at.? });
 
             try CustomSelfInfo.addExtraElf(dll_allocator, dl_phdr_info);
+            dl_phdr_info_registered = true;
         }
 
         if (dyn_obj.ref_count == 0 or dyn_obj.init_called) {
@@ -5166,9 +5175,12 @@ fn dlIteratePhdrSubstitute(callback: *const fn (*anyopaque, c_uint, *anyopaque) 
         const dl_phdr_info = dll_allocator.create(std.posix.dl_phdr_info) catch @panic("OOM");
         extra_phdrs.append(dll_allocator, dl_phdr_info) catch @panic("OOM");
 
+        const owned_path_z = dll_allocator.dupeSentinel(u8, dyn_obj.path, 0) catch @panic("OOM");
+        extra_strs_z.append(dll_allocator, owned_path_z) catch @panic("OOM");
+
         dl_phdr_info.* = .{
             .addr = dyn_obj.loaded_at.?,
-            .name = @ptrCast(dyn_obj.path),
+            .name = owned_path_z.ptr,
             .phdr = @ptrFromInt(dyn_obj.loaded_at.? + dyn_obj.eh.e_phoff),
             .phnum = dyn_obj.eh.e_phnum,
         };
