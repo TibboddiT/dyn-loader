@@ -372,6 +372,10 @@ pub fn init(options: InitOptions) !void {
 
 // TODO thread safety
 pub fn deinit() void {
+    if (!dll_initialized) {
+        return;
+    }
+
     var nb_dyn_objects = dyn_objects_init_indices.items.len;
     while (nb_dyn_objects > 0) {
         nb_dyn_objects -= 1;
@@ -409,6 +413,10 @@ pub fn deinit() void {
 
         dll_allocator.free(dyn_object.name);
         dll_allocator.free(dyn_object.path);
+
+        if (dyn_object.file_handle != -1) {
+            _ = std.os.linux.close(dyn_object.file_handle);
+        }
     }
 
     dyn_objects.clearAndFree(dll_allocator);
@@ -452,6 +460,7 @@ pub fn deinit() void {
 
     if (last_dl_error) |dle| {
         dll_allocator.free(dle);
+        last_dl_error = null;
     }
 
     thread_infos.clearAndFree(dll_allocator);
@@ -477,6 +486,8 @@ pub fn deinit() void {
         dll_allocator.free(e);
     }
     extra_strs_z.deinit(dll_allocator);
+
+    dll_initialized = false;
 
     // TODO
     // - unmap unnecessary maps
@@ -553,6 +564,10 @@ fn logSummary() void {
 
 // TODO thread safety
 pub fn resolve(name: []const u8) !?[]const u8 {
+    if (!dll_initialized) {
+        return error.Uninitialized;
+    }
+
     return resolvePath(name, true) catch |err| switch (err) {
         error.LibraryNotFound => null,
         else => |e| return e,
@@ -562,6 +577,10 @@ pub fn resolve(name: []const u8) !?[]const u8 {
 // TODO thread safety
 // TODO handle errors gracefully
 pub fn loadSystemLibC() !DynamicLibrary {
+    if (!dll_initialized) {
+        return error.Uninitialized;
+    }
+
     const candidates = [_][]const u8{
         "libc.so.6",
         "libc.so",
@@ -735,7 +754,7 @@ fn loadPreloads() void {
 // TODO handle errors gracefully
 pub fn load(f_path: []const u8) !DynamicLibrary {
     if (!dll_initialized) {
-        return error.Unitialized;
+        return error.Uninitialized;
     }
 
     // TODO
@@ -751,10 +770,9 @@ pub fn load(f_path: []const u8) !DynamicLibrary {
         }
 
         const loaded_lib = try loadDepTree(f_path);
-        var owned_cache_key: ?[]const u8 = try dll_allocator.dupe(u8, f_path);
-        errdefer if (owned_cache_key) |key| dll_allocator.free(key);
-        try load_request_cache.putNoClobber(dll_allocator, owned_cache_key.?, loaded_lib.index);
-        owned_cache_key = null;
+        const owned_cache_key = try dll_allocator.dupe(u8, f_path);
+        errdefer dll_allocator.free(owned_cache_key);
+        try load_request_cache.putNoClobber(dll_allocator, owned_cache_key, loaded_lib.index);
         break :blk loaded_lib;
     };
 
@@ -840,6 +858,10 @@ pub fn load(f_path: []const u8) !DynamicLibrary {
 }
 
 pub fn getSymbol(sym_name: []const u8) !Symbol {
+    if (!dll_initialized) {
+        return error.Uninitialized;
+    }
+
     const sym = try getResolvedSymbolByName(null, sym_name, false, false, true);
     return .{
         .addr = sym.address,
@@ -1065,7 +1087,8 @@ fn loadDso(o_path: []const u8) !usize {
     }
 
     const f = try std.Io.Dir.openFileAbsolute(dll_io, path, .{ .mode = .read_only });
-    errdefer f.close(dll_io);
+    var file_open = true;
+    errdefer if (file_open) f.close(dll_io);
 
     const stat = try f.stat(dll_io);
     const size = std.math.cast(usize, stat.size) orelse return error.FileTooBig;
@@ -1074,6 +1097,7 @@ fn loadDso(o_path: []const u8) !usize {
 
     if (dyn_objects.get(dyn_object_key)) |dyn_object| if (dyn_object.mapped_at != 0) {
         f.close(dll_io);
+        file_open = false;
 
         return dyn_objects.getIndex(dyn_object_key).?;
     };
@@ -1097,7 +1121,11 @@ fn loadDso(o_path: []const u8) !usize {
 
     if (!dyn_objects.contains(dyn_object_key)) {
         const owned_name = try dll_allocator.dupe(u8, dyn_object_name);
+        errdefer dll_allocator.free(owned_name);
+
         const owned_path = try dll_allocator.dupe(u8, path);
+        errdefer dll_allocator.free(owned_path);
+
         try dyn_objects.putNoClobber(dll_allocator, dyn_object_key, .init(dyn_object_key, owned_name, owned_path));
     }
 
@@ -1281,11 +1309,10 @@ fn loadDso(o_path: []const u8) !usize {
                     const maybe_dep = dyn_objects.getPtr(resolved_dep.key);
                     if (maybe_dep == null) {
                         // TODO assert DT_NEEDED is not a path
-                        var owned_dep_name: ?[]const u8 = try dll_allocator.dupe(u8, dep_name);
-                        errdefer if (owned_dep_name) |n| dll_allocator.free(n);
+                        const owned_dep_name = try dll_allocator.dupe(u8, dep_name);
+                        errdefer dll_allocator.free(owned_dep_name);
 
-                        try dyn_objects.putNoClobber(dll_allocator, resolved_dep.key, .init(resolved_dep.key, owned_dep_name.?, resolved_dep_path.?));
-                        owned_dep_name = null;
+                        try dyn_objects.putNoClobber(dll_allocator, resolved_dep.key, .init(resolved_dep.key, owned_dep_name, resolved_dep.path));
                         resolved_dep_path = null;
 
                         Logger.debug("dep tree: {s} loading deferred", .{dyn_object_name});
@@ -1309,6 +1336,8 @@ fn loadDso(o_path: []const u8) !usize {
             if (has_unloaded_deps) {
                 dependencies.deinit(dll_allocator);
                 std.posix.munmap(file_bytes);
+                f.close(dll_io);
+                file_open = false;
                 return dyn_objects.getIndex(dyn_object_key).?;
             }
 
@@ -1778,63 +1807,100 @@ fn loadDso(o_path: []const u8) !usize {
     }
 
     const do_entry = try dyn_objects.getOrPut(dll_allocator, dyn_object_key);
+    const previous_dyn_object: ?DynObject = if (do_entry.found_existing) do_entry.value_ptr.* else null;
 
-    // TODO really, having an interned string set could avoid so many unneeded allocations
-    if (do_entry.found_existing) {
-        dll_allocator.free(do_entry.value_ptr.name);
-        dll_allocator.free(do_entry.value_ptr.path);
+    {
+        const owned_name = try dll_allocator.dupe(u8, dyn_object_name);
+        errdefer dll_allocator.free(owned_name);
+
+        const owned_path = try dll_allocator.dupe(u8, path);
+        errdefer dll_allocator.free(owned_path);
+
+        do_entry.value_ptr.* = .{
+            .key = dyn_object_key,
+            .name = owned_name,
+            .path = owned_path,
+            .file_handle = f.handle,
+            .mapped_at = file_addr,
+            .mapped_size = file_bytes.len,
+            .segments = segments,
+            .tls_init_file_offset = tls_init_file_offset,
+            .tls_init_file_size = tls_init_file_size,
+            .tls_init_mem_offset = tls_init_mem_offset,
+            .tls_init_mem_size = tls_init_mem_size,
+            .tls_align = tls_align,
+            .tls_mapped_at = 0,
+            .tls_offset = 0,
+            .eh = eh,
+            .eh_init_file_offset = eh_init_file_offset,
+            .eh_init_file_size = eh_init_file_size,
+            .eh_init_mem_offset = eh_init_mem_offset,
+            .eh_init_mem_size = eh_init_mem_size,
+            .eh_align = eh_align,
+            .dyn_section_offset = dyn_addr,
+            .plt_got_section_offset = plt_got_addr,
+            .plt_got_section_size = plt_got_size,
+            .syms = syms,
+            .syms_array = syms_array,
+            .relocs = relocs,
+            .dependencies = dependencies,
+            .deps_breadth_first = .empty,
+            .init_addr = init_addr,
+            .fini_addr = fini_addr,
+            .init_array_addr = init_array_addr,
+            .init_array_size = init_array_size,
+            .fini_array_addr = fini_array_addr,
+            .fini_array_size = fini_array_size,
+            .loaded = false,
+            .init_called = false,
+            .current_epoch = 0,
+            .ref_count = 0,
+            .loaded_at = null,
+            .loaded_size = 0,
+        };
     }
+    segments = .empty;
+    dependencies = .empty;
+    relocs = .empty;
+    syms_array = .empty;
+    syms = .empty;
+    var dyn_object_installed = true;
+    errdefer if (dyn_object_installed) {
+        const current_dyn_object = do_entry.value_ptr;
+        const current_name = current_dyn_object.name;
+        const current_path = current_dyn_object.path;
 
-    do_entry.value_ptr.* = .{
-        .key = dyn_object_key,
-        .name = try dll_allocator.dupe(u8, dyn_object_name),
-        .path = try dll_allocator.dupe(u8, path),
-        .file_handle = f.handle,
-        .mapped_at = file_addr,
-        .mapped_size = file_bytes.len,
-        .segments = segments,
-        .tls_init_file_offset = tls_init_file_offset,
-        .tls_init_file_size = tls_init_file_size,
-        .tls_init_mem_offset = tls_init_mem_offset,
-        .tls_init_mem_size = tls_init_mem_size,
-        .tls_align = tls_align,
-        .tls_mapped_at = 0,
-        .tls_offset = 0,
-        .eh = eh,
-        .eh_init_file_offset = eh_init_file_offset,
-        .eh_init_file_size = eh_init_file_size,
-        .eh_init_mem_offset = eh_init_mem_offset,
-        .eh_init_mem_size = eh_init_mem_size,
-        .eh_align = eh_align,
-        .dyn_section_offset = dyn_addr,
-        .plt_got_section_offset = plt_got_addr,
-        .plt_got_section_size = plt_got_size,
-        .syms = syms,
-        .syms_array = syms_array,
-        .relocs = relocs,
-        .dependencies = dependencies,
-        .deps_breadth_first = .empty,
-        .init_addr = init_addr,
-        .fini_addr = fini_addr,
-        .init_array_addr = init_array_addr,
-        .init_array_size = init_array_size,
-        .fini_array_addr = fini_array_addr,
-        .fini_array_size = fini_array_size,
-        .loaded = false,
-        .init_called = false,
-        .current_epoch = 0,
-        .ref_count = 0,
-        .loaded_at = null,
-        .loaded_size = 0,
+        current_dyn_object.syms_array.deinit(dll_allocator);
+        for (current_dyn_object.syms.values()) |*v| {
+            v.deinit(dll_allocator);
+        }
+        current_dyn_object.syms.deinit(dll_allocator);
+        current_dyn_object.relocs.deinit(dll_allocator);
+        current_dyn_object.dependencies.deinit(dll_allocator);
+        current_dyn_object.deps_breadth_first.deinit(dll_allocator);
+        current_dyn_object.segments.deinit(dll_allocator);
+
+        if (previous_dyn_object) |previous| {
+            dll_allocator.free(current_name);
+            dll_allocator.free(current_path);
+            current_dyn_object.* = previous;
+        } else {
+            current_dyn_object.* = .init(dyn_object_key, current_name, current_path);
+        }
     };
-
-    try dyn_objects_sorted_indices.append(dll_allocator, dyn_objects.getIndex(dyn_object_key).?);
 
     const dyn_object = do_entry.value_ptr;
 
+    try collectDepsBreadthFirst(dyn_object);
+    try dyn_objects_sorted_indices.ensureUnusedCapacity(dll_allocator, 1);
+
     try mapSegments(dyn_object, file_bytes);
 
-    try processRelativeRelocationsFast(
+    f.close(dll_io);
+    file_open = false;
+    dyn_object.file_handle = -1;
+
+    processRelativeRelocationsFast(
         dyn_object,
         rela_reloc_tbl_addr,
         rela_reloc_tbl_size,
@@ -1844,9 +1910,24 @@ fn loadDso(o_path: []const u8) !usize {
         relr_reloc_tbl_entry_size,
     );
 
-    try collectDepsBreadthFirst(dyn_object);
+    dyn_objects_sorted_indices.appendAssumeCapacity(dyn_objects.getIndex(dyn_object_key).?);
 
     Logger.info("{s} loaded => {s}", .{ dyn_object_name, dyn_object.path });
+    if (previous_dyn_object) |previous| {
+        var previous_to_free = previous;
+        previous_to_free.syms_array.deinit(dll_allocator);
+        for (previous_to_free.syms.values()) |*v| {
+            v.deinit(dll_allocator);
+        }
+        previous_to_free.syms.deinit(dll_allocator);
+        previous_to_free.relocs.deinit(dll_allocator);
+        previous_to_free.dependencies.deinit(dll_allocator);
+        previous_to_free.deps_breadth_first.deinit(dll_allocator);
+        previous_to_free.segments.deinit(dll_allocator);
+        dll_allocator.free(previous_to_free.name);
+        dll_allocator.free(previous_to_free.path);
+    }
+    dyn_object_installed = false;
 
     return dyn_objects.getIndex(dyn_object_key).?;
 }
@@ -1944,6 +2025,12 @@ fn mapSegments(dyn_object: *DynObject, file_bytes: []const u8) !void {
     ) catch |err| {
         Logger.err("failed to allocate library space: {s}", .{@errorName(err)});
         return err;
+    };
+    var mapped_space_owned = true;
+    errdefer if (mapped_space_owned) {
+        std.posix.munmap(mapped_space);
+        dyn_object.loaded_at = null;
+        dyn_object.loaded_size = 0;
     };
 
     const base_addr = std.mem.alignForward(usize, @intFromPtr(mapped_space.ptr), max_align);
@@ -2056,6 +2143,7 @@ fn mapSegments(dyn_object: *DynObject, file_bytes: []const u8) !void {
     }
 
     Logger.debug("successfully mapped {d} segments for {s} at base 0x{x}", .{ dyn_object.segments.count(), dyn_object.name, base_addr });
+    mapped_space_owned = false;
 }
 
 fn processRelativeRelocationsFast(
@@ -2066,7 +2154,7 @@ fn processRelativeRelocationsFast(
     relr_reloc_tbl_addr: usize,
     relr_reloc_tbl_size: usize,
     relr_reloc_tbl_entry_size: usize,
-) !void {
+) void {
     const base_addr = dyn_object.loaded_at.?;
 
     if (rela_reloc_tbl_addr > 0) {
@@ -2736,6 +2824,9 @@ fn mapTlsBlock(dyn_object: *DynObject) !void {
     Logger.debug("tls: old_tp: 0x{x}, prev area: 0x{x}", .{ old_tp, prev_area_addr });
 
     var new_area: ?[]u8 = null;
+    var owned_tls_mapping: ?[]align(std.heap.pageSize()) u8 = null;
+    errdefer if (owned_tls_mapping) |mapping| std.posix.munmap(mapping);
+
     var area_was_extended = false;
 
     if (current_tls_area_desc.gdt_entry_number == @as(usize, @bitCast(@as(isize, -1)))) {
@@ -2744,6 +2835,7 @@ fn mapTlsBlock(dyn_object: *DynObject) !void {
             Logger.err("failed to allocate tls space: {s}", .{@errorName(err)});
             return err;
         };
+        owned_tls_mapping = space;
         Logger.debug("tls: setting new area start at 0x{x} (0x{x})", .{ current_surplus_size, @intFromPtr(space.ptr) + current_surplus_size });
         new_area = space[current_surplus_size..];
     } else if (new_area_size > current_tls_area_desc.size and new_area_size <= current_tls_area_desc.size + current_surplus_size) {
@@ -2810,66 +2902,71 @@ fn mapTlsBlock(dyn_object: *DynObject) !void {
 
     // TODO this allocation could easily be avoided if loaded dyn object has no static tls data
     Logger.debug("tls: allocating new init block: size: 0x{x}", .{new_abi_tcb_offset});
-    const new_initial_block = try dll_allocator.alloc(u8, new_abi_tcb_offset);
+    const new_initial_block = init_blk: {
+        const block = try dll_allocator.alloc(u8, new_abi_tcb_offset);
+        errdefer dll_allocator.free(block);
 
-    Logger.debug("tls: copying initial tdata: from 0x{x} to 0x{x} (size: 0x{x})", .{
-        new_abi_tcb_offset - initial_tls_offset,
-        new_abi_tcb_offset - initial_tls_offset + initial_tls_init_file_size,
-        initial_tls_init_file_size,
-    });
-    if (initial_tls_init_file_size > 0) {
-        @memcpy(new_initial_block[new_abi_tcb_offset - initial_tls_offset ..][0..initial_tls_init_file_size], initial_tls_init_block);
-    }
-    Logger.debug("tls: zeroing initial tbss: from 0x{x} to 0x{x} (size: 0x{x})", .{
-        new_abi_tcb_offset - initial_tls_offset + initial_tls_init_file_size,
-        new_abi_tcb_offset - initial_tls_offset + initial_tls_init_mem_size,
-        initial_tls_init_mem_size - initial_tls_init_file_size,
-    });
-    if (initial_tls_init_mem_size > 0) {
-        @memset(new_initial_block[new_abi_tcb_offset - initial_tls_offset + initial_tls_init_file_size ..][0 .. initial_tls_init_mem_size - initial_tls_init_file_size], 0);
-    }
+        Logger.debug("tls: copying initial tdata: from 0x{x} to 0x{x} (size: 0x{x})", .{
+            new_abi_tcb_offset - initial_tls_offset,
+            new_abi_tcb_offset - initial_tls_offset + initial_tls_init_file_size,
+            initial_tls_init_file_size,
+        });
+        if (initial_tls_init_file_size > 0) {
+            @memcpy(block[new_abi_tcb_offset - initial_tls_offset ..][0..initial_tls_init_file_size], initial_tls_init_block);
+        }
+        Logger.debug("tls: zeroing initial tbss: from 0x{x} to 0x{x} (size: 0x{x})", .{
+            new_abi_tcb_offset - initial_tls_offset + initial_tls_init_file_size,
+            new_abi_tcb_offset - initial_tls_offset + initial_tls_init_mem_size,
+            initial_tls_init_mem_size - initial_tls_init_file_size,
+        });
+        if (initial_tls_init_mem_size > 0) {
+            @memset(block[new_abi_tcb_offset - initial_tls_offset + initial_tls_init_file_size ..][0 .. initial_tls_init_mem_size - initial_tls_init_file_size], 0);
+        }
 
-    for (dyn_objects.values()) |*do| {
-        if (do.tls_mapped_at != 0) {
-            Logger.debug("tls: copying {s} tdata: from 0x{x} to 0x{x} (size: 0x{x})", .{
-                do.name,
-                new_abi_tcb_offset - do.tls_offset,
-                new_abi_tcb_offset - do.tls_offset + do.tls_init_file_size,
-                do.tls_init_file_size,
-            });
-            if (do.tls_init_file_size > 0) {
-                @memcpy(new_initial_block[new_abi_tcb_offset - do.tls_offset ..][0..do.tls_init_file_size], @as([*]u8, @ptrFromInt(try vAddressToLoadedAddress(do, do.tls_init_mem_offset, false))));
-            }
-            Logger.debug("tls: zeroing {s} tbss: from 0x{x} to 0x{x} (size: 0x{x})", .{
-                do.name,
-                new_abi_tcb_offset - do.tls_offset + do.tls_init_file_size,
-                new_abi_tcb_offset - do.tls_offset + do.tls_init_mem_size,
-                do.tls_init_mem_size - do.tls_init_file_size,
-            });
-            if (do.tls_init_mem_size > 0) {
-                @memset(new_initial_block[new_abi_tcb_offset - do.tls_offset + do.tls_init_file_size ..][0 .. do.tls_init_mem_size - do.tls_init_file_size], 0);
+        for (dyn_objects.values()) |*do| {
+            if (do.tls_mapped_at != 0) {
+                Logger.debug("tls: copying {s} tdata: from 0x{x} to 0x{x} (size: 0x{x})", .{
+                    do.name,
+                    new_abi_tcb_offset - do.tls_offset,
+                    new_abi_tcb_offset - do.tls_offset + do.tls_init_file_size,
+                    do.tls_init_file_size,
+                });
+                if (do.tls_init_file_size > 0) {
+                    @memcpy(block[new_abi_tcb_offset - do.tls_offset ..][0..do.tls_init_file_size], @as([*]u8, @ptrFromInt(try vAddressToLoadedAddress(do, do.tls_init_mem_offset, false))));
+                }
+                Logger.debug("tls: zeroing {s} tbss: from 0x{x} to 0x{x} (size: 0x{x})", .{
+                    do.name,
+                    new_abi_tcb_offset - do.tls_offset + do.tls_init_file_size,
+                    new_abi_tcb_offset - do.tls_offset + do.tls_init_mem_size,
+                    do.tls_init_mem_size - do.tls_init_file_size,
+                });
+                if (do.tls_init_mem_size > 0) {
+                    @memset(block[new_abi_tcb_offset - do.tls_offset + do.tls_init_file_size ..][0 .. do.tls_init_mem_size - do.tls_init_file_size], 0);
+                }
             }
         }
-    }
 
-    Logger.debug("tls: copying {s} tdata: from 0x{x} to 0x{x} (size: 0x{x})", .{
-        dyn_object.name,
-        0,
-        dyn_object.tls_init_file_size,
-        dyn_object.tls_init_file_size,
-    });
-    if (dyn_object.tls_init_file_size > 0) {
-        @memcpy(new_initial_block[0..dyn_object.tls_init_file_size], @as([*]u8, @ptrFromInt(try vAddressToLoadedAddress(dyn_object, dyn_object.tls_init_mem_offset, false))));
-    }
-    Logger.debug("tls: zeroing {s} tbss: from 0x{x} to 0x{x} (size: 0x{x})", .{
-        dyn_object.name,
-        dyn_object.tls_init_file_size,
-        dyn_object.tls_init_mem_size,
-        dyn_object.tls_init_mem_size - dyn_object.tls_init_file_size,
-    });
-    if (dyn_object.tls_init_mem_size > 0) {
-        @memset(new_initial_block[dyn_object.tls_init_file_size..dyn_object.tls_init_mem_size], 0);
-    }
+        Logger.debug("tls: copying {s} tdata: from 0x{x} to 0x{x} (size: 0x{x})", .{
+            dyn_object.name,
+            0,
+            dyn_object.tls_init_file_size,
+            dyn_object.tls_init_file_size,
+        });
+        if (dyn_object.tls_init_file_size > 0) {
+            @memcpy(block[0..dyn_object.tls_init_file_size], @as([*]u8, @ptrFromInt(try vAddressToLoadedAddress(dyn_object, dyn_object.tls_init_mem_offset, false))));
+        }
+        Logger.debug("tls: zeroing {s} tbss: from 0x{x} to 0x{x} (size: 0x{x})", .{
+            dyn_object.name,
+            dyn_object.tls_init_file_size,
+            dyn_object.tls_init_mem_size,
+            dyn_object.tls_init_mem_size - dyn_object.tls_init_file_size,
+        });
+        if (dyn_object.tls_init_mem_size > 0) {
+            @memset(block[dyn_object.tls_init_file_size..dyn_object.tls_init_mem_size], 0);
+        }
+
+        break :init_blk block;
+    };
 
     const new_block_init = new_initial_block;
     const new_block_size = new_block_init.len;
@@ -2913,6 +3010,8 @@ fn mapTlsBlock(dyn_object: *DynObject) !void {
 
         .gdt_entry_number = 1,
     };
+
+    owned_tls_mapping = null;
 
     if (current_tls_area_desc.gdt_entry_number != @as(usize, @bitCast(@as(isize, -1)))) {
         dll_allocator.free(current_tls_area_desc.block.init);
