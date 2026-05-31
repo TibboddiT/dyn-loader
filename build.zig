@@ -61,9 +61,7 @@ fn addExecutable(b: *std.Build, resources_step: *std.Build.Step, check_step: *st
 
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(&install.step);
-    if (b.args) |args| {
-        run_cmd.addArgs(args);
-    }
+    run_cmd.addPassthruArgs();
 
     const run_step = b.step(std.fmt.allocPrint(b.allocator, "run-{s}", .{name}) catch unreachable, "Run");
     run_step.dependOn(&run_cmd.step);
