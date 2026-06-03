@@ -51,7 +51,7 @@ fn FlagFormatMixin(comptime FlagsType: type) type {
             try writer.writeAll(@typeName(FlagsType) ++ "{");
             var first = true;
             @setEvalBranchQuota(100_000);
-            inline for (comptime std.meta.fieldNames(FlagsType)) |name| {
+            for (std.meta.fieldNames(FlagsType)) |name| {
                 if (name[0] == '_') continue;
                 if (@field(self, name)) {
                     if (first) {
@@ -27815,9 +27815,9 @@ pub fn BaseWrapperWithCustomDispatch(DispatchType: type) type {
         dispatch: Dispatch,
         pub fn load(loader: anytype) Self {
             var self: Self = .{ .dispatch = .{} };
-            inline for (std.meta.fields(Dispatch)) |field| {
-                if (loader(Instance.null_handle, field.name.ptr)) |cmd_ptr| {
-                    @field(self.dispatch, field.name) = @ptrCast(cmd_ptr);
+            inline for (comptime std.meta.fieldNames(Dispatch)) |field| {
+                if (loader(Instance.null_handle, field.ptr)) |cmd_ptr| {
+                    @field(self.dispatch, field) = @ptrCast(cmd_ptr);
                 }
             }
             return self;
@@ -27990,9 +27990,9 @@ pub fn InstanceWrapperWithCustomDispatch(DispatchType: type) type {
         dispatch: Dispatch,
         pub fn load(instance: Instance, loader: anytype) Self {
             var self: Self = .{ .dispatch = .{} };
-            inline for (std.meta.fields(Dispatch)) |field| {
-                if (loader(instance, field.name.ptr)) |cmd_ptr| {
-                    @field(self.dispatch, field.name) = @ptrCast(cmd_ptr);
+            inline for (comptime std.meta.fieldNames(Dispatch)) |field| {
+                if (loader(instance, field.ptr)) |cmd_ptr| {
+                    @field(self.dispatch, field) = @ptrCast(cmd_ptr);
                 }
             }
             return self;
@@ -30990,9 +30990,9 @@ pub fn DeviceWrapperWithCustomDispatch(DispatchType: type) type {
         dispatch: Dispatch,
         pub fn load(device: Device, loader: anytype) Self {
             var self: Self = .{ .dispatch = .{} };
-            inline for (std.meta.fields(Dispatch)) |field| {
-                if (loader(device, field.name.ptr)) |cmd_ptr| {
-                    @field(self.dispatch, field.name) = @ptrCast(cmd_ptr);
+            inline for (comptime std.meta.fieldNames(Dispatch)) |field| {
+                if (loader(device, field)) |cmd_ptr| {
+                    @field(self.dispatch, field) = @ptrCast(cmd_ptr);
                 }
             }
             return self;
