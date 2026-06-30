@@ -119,6 +119,7 @@ const DynObject = struct {
     key: DynObjectId,
     name: []const u8,
     path: []const u8,
+    runpath: ?[]const u8,
     file_handle: i32,
     mapped_at: usize,
     mapped_size: usize,
@@ -162,6 +163,7 @@ const DynObject = struct {
             .key = key,
             .name = name,
             .path = path,
+            .runpath = null,
             .file_handle = -1,
             .mapped_at = 0,
             .mapped_size = 0,
@@ -413,6 +415,9 @@ pub fn deinit() void {
 
         dll_allocator.free(dyn_object.name);
         dll_allocator.free(dyn_object.path);
+        if (dyn_object.runpath) |runpath| {
+            dll_allocator.free(runpath);
+        }
 
         if (dyn_object.file_handle != -1) {
             _ = std.os.linux.close(dyn_object.file_handle);
@@ -568,7 +573,7 @@ pub fn resolve(name: []const u8) !?[]const u8 {
         return error.Uninitialized;
     }
 
-    return resolvePath(name, true) catch |err| switch (err) {
+    return resolvePath(name, true, null, null, null) catch |err| switch (err) {
         error.LibraryNotFound => null,
         else => |e| return e,
     };
@@ -591,7 +596,7 @@ pub fn loadSystemLibC() !DynamicLibrary {
     for (candidates) |c| {
         Logger.debug("libc: trying {s}", .{c});
 
-        const path = resolvePath(c, true) catch |err| switch (err) {
+        const path = resolvePath(c, true, null, null, null) catch |err| switch (err) {
             error.LibraryNotFound => continue,
             else => |e| return e,
         };
@@ -619,27 +624,31 @@ pub fn loadSystemLibC() !DynamicLibrary {
 // TODO global state
 var preloads_processed: bool = false;
 
-fn appendLdExpansions(list: *std.ArrayList([]const u8), value: []const u8) !void {
+fn appendLdExpansions(list: *std.ArrayList([]const u8), value: []const u8, origin_dir: ?[]const u8) !void {
     // TODO max len?
-    var expanded_buf: [2048]u8 = @splat(0);
+    var expanded_buf: [std.fs.max_path_bytes]u8 = @splat(0);
     var expanded = try std.fmt.bufPrint(&expanded_buf, "{s}", .{value});
 
-    var expanded_tmp_buf: [2048]u8 = @splat(0);
+    var expanded_tmp_buf: [std.fs.max_path_bytes]u8 = @splat(0);
 
     // TODO what if `value` contains the same token multiple times?
 
+    var owned_origin: ?[]const u8 = null;
+    defer if (owned_origin) |origin| dll_allocator.free(origin);
+
+    const origin = origin_dir orelse blk: {
+        owned_origin = try std.process.executableDirPathAlloc(dll_io, dll_allocator);
+        break :blk owned_origin.?;
+    };
+
     if (std.mem.find(u8, expanded, "$ORIGIN")) |idx| {
-        const origin = try std.process.executableDirPathAlloc(dll_io, dll_allocator);
-        defer dll_allocator.free(origin);
         @memcpy(expanded_tmp_buf[0..expanded.len], expanded);
-        expanded = try std.fmt.bufPrint(&expanded_buf, "{s}{s}{s}", .{ expanded_tmp_buf[0..idx], origin, expanded_tmp_buf[idx + "$ORIGIN".len ..] });
+        expanded = try std.fmt.bufPrint(&expanded_buf, "{s}{s}{s}", .{ expanded_tmp_buf[0..idx], origin, expanded_tmp_buf[idx + "$ORIGIN".len .. expanded.len] });
     }
 
     if (std.mem.find(u8, expanded, "${ORIGIN}")) |idx| {
-        const origin = try std.process.executableDirPathAlloc(dll_io, dll_allocator);
-        defer dll_allocator.free(origin);
         @memcpy(expanded_tmp_buf[0..expanded.len], expanded);
-        expanded = try std.fmt.bufPrint(&expanded_buf, "{s}{s}{s}", .{ expanded_tmp_buf[0..idx], origin, expanded_tmp_buf[idx + "${ORIGIN}".len ..] });
+        expanded = try std.fmt.bufPrint(&expanded_buf, "{s}{s}{s}", .{ expanded_tmp_buf[0..idx], origin, expanded_tmp_buf[idx + "${ORIGIN}".len .. expanded.len] });
     }
 
     if (std.mem.find(u8, expanded, "$PLATFORM")) |idx| {
@@ -647,7 +656,7 @@ fn appendLdExpansions(list: *std.ArrayList([]const u8), value: []const u8) !void
         const platform = if (platform_ptr == 0) try dll_allocator.dupe(u8, "x86_64") else try dll_allocator.dupe(u8, std.mem.span(@as([*:0]const u8, @ptrFromInt(platform_ptr))));
         defer dll_allocator.free(platform);
         @memcpy(expanded_tmp_buf[0..expanded.len], expanded);
-        expanded = try std.fmt.bufPrint(&expanded_buf, "{s}{s}{s}", .{ expanded_tmp_buf[0..idx], platform, expanded_tmp_buf[idx + "$PLATFORM".len ..] });
+        expanded = try std.fmt.bufPrint(&expanded_buf, "{s}{s}{s}", .{ expanded_tmp_buf[0..idx], platform, expanded_tmp_buf[idx + "$PLATFORM".len .. expanded.len] });
     }
 
     if (std.mem.find(u8, expanded, "${PLATFORM}")) |idx| {
@@ -655,7 +664,7 @@ fn appendLdExpansions(list: *std.ArrayList([]const u8), value: []const u8) !void
         const platform = if (platform_ptr == 0) try dll_allocator.dupe(u8, "x86_64") else try dll_allocator.dupe(u8, std.mem.span(@as([*:0]const u8, @ptrFromInt(platform_ptr))));
         defer dll_allocator.free(platform);
         @memcpy(expanded_tmp_buf[0..expanded.len], expanded);
-        expanded = try std.fmt.bufPrint(&expanded_buf, "{s}{s}{s}", .{ expanded_tmp_buf[0..idx], platform, expanded_tmp_buf[idx + "${PLATFORM}".len ..] });
+        expanded = try std.fmt.bufPrint(&expanded_buf, "{s}{s}{s}", .{ expanded_tmp_buf[0..idx], platform, expanded_tmp_buf[idx + "${PLATFORM}".len .. expanded.len] });
     }
 
     if (std.mem.find(u8, expanded, "$LIB") == null and std.mem.find(u8, expanded, "${LIB}") == null) {
@@ -665,7 +674,7 @@ fn appendLdExpansions(list: *std.ArrayList([]const u8), value: []const u8) !void
 
     const lib_values = [_][]const u8{ "lib/x86_64-linux-gnu", "lib64", "lib" };
 
-    var expanded_candidate_buf: [2048]u8 = @splat(0);
+    var expanded_candidate_buf: [std.fs.max_path_bytes]u8 = @splat(0);
 
     if (std.mem.find(u8, expanded, "$LIB")) |idx| {
         for (lib_values) |lv| {
@@ -676,7 +685,7 @@ fn appendLdExpansions(list: *std.ArrayList([]const u8), value: []const u8) !void
 
     if (std.mem.find(u8, expanded, "${LIB}")) |idx| {
         for (lib_values) |lv| {
-            const expanded_candidate = try std.fmt.bufPrint(&expanded_candidate_buf, "{s}{s}{s}", .{ expanded[0..idx], lv, expanded[idx + "$LIB".len ..] });
+            const expanded_candidate = try std.fmt.bufPrint(&expanded_candidate_buf, "{s}{s}{s}", .{ expanded[0..idx], lv, expanded[idx + "${LIB}".len ..] });
             try list.append(dll_allocator, try dll_allocator.dupe(u8, expanded_candidate));
         }
     }
@@ -702,7 +711,7 @@ fn loadPreloads() void {
             candidates.clearRetainingCapacity();
         }
 
-        appendLdExpansions(&candidates, entry) catch |err| {
+        appendLdExpansions(&candidates, entry, null) catch |err| {
             Logger.err("preload: cannot expand {s}: {}", .{ entry, err });
             continue;
         };
@@ -710,11 +719,11 @@ fn loadPreloads() void {
         var last_err: ?anyerror = null;
         var loaded = false;
         for (candidates.items) |candidate| {
-            var real_candidate_buf: [2048]u8 = undefined;
+            var real_candidate_buf: [std.fs.max_path_bytes]u8 = undefined;
             const slash_pos = std.mem.findScalar(u8, candidate, '/');
             const real_candidate = blk_rc: {
                 if (slash_pos != null and slash_pos.? != 0) {
-                    var cwd_buf: [1024]u8 = undefined;
+                    var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
                     const cwd_len = std.process.currentPath(dll_io, &cwd_buf) catch |err| {
                         last_err = err;
                         continue;
@@ -753,6 +762,10 @@ fn loadPreloads() void {
 // TODO thread safety
 // TODO handle errors gracefully
 pub fn load(f_path: []const u8) !DynamicLibrary {
+    return loadWithRootResolveContext(f_path, null, null);
+}
+
+fn loadWithRootResolveContext(f_path: []const u8, root_runpath: ?[]const u8, root_origin_dir: ?[]const u8) !DynamicLibrary {
     if (!dll_initialized) {
         return error.Uninitialized;
     }
@@ -769,7 +782,7 @@ pub fn load(f_path: []const u8) !DynamicLibrary {
             break :blk .{ .index = cached_lib_idx };
         }
 
-        const loaded_lib = try loadDepTree(f_path);
+        const loaded_lib = try loadDepTree(f_path, root_runpath, root_origin_dir);
         const owned_cache_key = try dll_allocator.dupe(u8, f_path);
         errdefer dll_allocator.free(owned_cache_key);
         try load_request_cache.putNoClobber(dll_allocator, owned_cache_key, loaded_lib.index);
@@ -869,10 +882,10 @@ pub fn getSymbol(sym_name: []const u8) !Symbol {
 }
 
 // TODO inefficient strategy
-fn loadDepTree(o_path: []const u8) !DynamicLibrary {
+fn loadDepTree(o_path: []const u8, root_runpath: ?[]const u8, root_origin_dir: ?[]const u8) !DynamicLibrary {
     Logger.debug("dep tree: checking {s}", .{o_path});
 
-    const lib_idx = try loadDso(o_path);
+    const lib_idx = try loadDso(o_path, root_runpath, root_origin_dir);
     if (dyn_objects.values()[lib_idx].mapped_at != 0) {
         return .{
             .index = lib_idx,
@@ -887,7 +900,6 @@ fn loadDepTree(o_path: []const u8) !DynamicLibrary {
         const do_count = dyn_objects.count();
 
         for (0..do_count) |dyn_object_idx| {
-            const dyn_object_name = dyn_objects.values()[dyn_object_idx].name;
             const dyn_object_path = dyn_objects.values()[dyn_object_idx].path;
 
             {
@@ -903,11 +915,15 @@ fn loadDepTree(o_path: []const u8) !DynamicLibrary {
 
             has_unloaded = true;
 
-            const idx = try loadDso(if (dyn_object_idx == lib_idx) o_path else dyn_object_path);
+            const idx = try loadDso(
+                if (dyn_object_idx == lib_idx) o_path else dyn_object_path,
+                if (dyn_object_idx == lib_idx) root_runpath else null,
+                if (dyn_object_idx == lib_idx) root_origin_dir else null,
+            );
 
             // TODO these two checks are potentially over defensive, maybe we can assert `idx == dyn_object_idx`
             if (dyn_objects.values()[idx].mapped_at != 0) {
-                Logger.debug("dep tree: {s} has been mapped", .{dyn_object_name});
+                Logger.debug("dep tree: {s} has been mapped", .{dyn_objects.values()[idx].name});
             }
             if (dyn_objects.values()[dyn_object_idx].mapped_at != 0) {
                 mapped_count += 1;
@@ -947,6 +963,10 @@ fn validateSupportedElfHeader(path: []const u8, eh: *const std.elf.Elf64_Ehdr) !
         Logger.err("unsupported ELF machine for {s}: class={d} data={d} version={d} type={} machine=0x{x} expected_machine=0x{x}", .{ path, eh.e_ident[std.elf.EI_CLASS], eh.e_ident[std.elf.EI_DATA], eh.e_ident[std.elf.EI_VERSION], eh.e_type, @intFromEnum(eh.e_machine), @intFromEnum(std.elf.EM.X86_64) });
         return error.UnsupportedElfMachine;
     }
+    if (eh.e_type != .DYN) {
+        Logger.err("unsupported ELF type for {s}: class={d} data={d} version={d} type={} machine=0x{x} expected_type={}", .{ path, eh.e_ident[std.elf.EI_CLASS], eh.e_ident[std.elf.EI_DATA], eh.e_ident[std.elf.EI_VERSION], eh.e_type, @intFromEnum(eh.e_machine), std.elf.ET.DYN });
+        return error.UnsupportedElfType;
+    }
 }
 
 fn isSupportedElfPath(path: []const u8) bool {
@@ -960,7 +980,13 @@ fn isSupportedElfPath(path: []const u8) bool {
     return std.mem.eql(u8, eh.e_ident[0..4], std.elf.MAGIC) and
         eh.e_ident[std.elf.EI_CLASS] == std.elf.ELFCLASS64 and
         eh.e_ident[std.elf.EI_DATA] == std.elf.ELFDATA2LSB and
-        eh.e_machine == std.elf.EM.X86_64;
+        eh.e_machine == std.elf.EM.X86_64 and
+        eh.e_type == .DYN;
+}
+
+fn isLdLinuxName(name: []const u8) bool {
+    return std.mem.eql(u8, name, "ld-linux-x86-64.so.2") or
+        std.mem.eql(u8, name, "ld-linux.so.2");
 }
 
 fn findDynObjectIndexByName(name: []const u8) ?usize {
@@ -974,7 +1000,7 @@ fn findDynObjectIndexByName(name: []const u8) ?usize {
 }
 
 // TODO mimic path resolution of linux-ld better
-fn resolvePath(r_path: []const u8, check_mode: bool) ![]const u8 {
+fn resolvePath(requested_path: []const u8, check_mode: bool, requester_name: ?[]const u8, runpath: ?[]const u8, origin_dir: ?[]const u8) ![]const u8 {
     const lib_dirs = [_][]const u8{
         "/usr/local/lib/x86_64-linux-gnu",
         "/lib/x86_64-linux-gnu",
@@ -991,7 +1017,7 @@ fn resolvePath(r_path: []const u8, check_mode: bool) ![]const u8 {
     };
 
     // TODO max path len
-    var buf: [2048]u8 = @splat(0);
+    var buf: [std.fs.max_path_bytes]u8 = @splat(0);
 
     if (dll_environ.getPosix("LD_LIBRARY_PATH")) |dir_list| {
         var dirs_it = std.mem.splitScalar(u8, dir_list, ':');
@@ -1000,7 +1026,7 @@ fn resolvePath(r_path: []const u8, check_mode: bool) ![]const u8 {
                 continue;
             }
 
-            const a_path = if (std.mem.startsWith(u8, dir, "/")) try std.fmt.bufPrint(&buf, "{s}/{s}", .{ dir, r_path }) else try std.fmt.bufPrint(&buf, "/{s}/{s}", .{ dir, r_path });
+            const a_path = if (std.mem.startsWith(u8, dir, "/")) try std.fmt.bufPrint(&buf, "{s}/{s}", .{ dir, requested_path }) else try std.fmt.bufPrint(&buf, "/{s}/{s}", .{ dir, requested_path });
 
             std.Io.Dir.accessAbsolute(dll_io, a_path, .{ .read = true }) catch continue;
             if (!isSupportedElfPath(a_path)) {
@@ -1009,14 +1035,61 @@ fn resolvePath(r_path: []const u8, check_mode: bool) ![]const u8 {
             }
 
             const path = try std.fmt.allocPrint(dll_allocator, "{s}", .{a_path});
-            Logger.debug("found {s} via LD_LIBRARY_PATH: {s}", .{ r_path, path });
+            Logger.debug("found {s} via LD_LIBRARY_PATH: {s}", .{ requested_path, path });
             return path;
+        }
+    }
+
+    if (requester_name) |name| {
+        if (isLibcName(name) and isLdLinuxName(requested_path)) {
+            if (origin_dir) |dir| {
+                const a_path = try std.fmt.bufPrint(&buf, "{s}/{s}", .{ dir, requested_path });
+
+                std.Io.Dir.accessAbsolute(dll_io, a_path, .{ .read = true }) catch {};
+                if (isSupportedElfPath(a_path)) {
+                    const path = try std.fmt.allocPrint(dll_allocator, "{s}", .{a_path});
+                    Logger.debug("found {s} next to libc: {s}", .{ requested_path, path });
+                    return path;
+                }
+            }
+        }
+    }
+
+    if (runpath) |dir_list| {
+        var dirs_it = std.mem.splitScalar(u8, dir_list, ':');
+        while (dirs_it.next()) |dir| {
+            if (dir.len == 0) {
+                continue;
+            }
+
+            var candidates: std.ArrayList([]const u8) = .empty;
+            defer {
+                for (candidates.items) |candidate| {
+                    dll_allocator.free(candidate);
+                }
+                candidates.deinit(dll_allocator);
+            }
+
+            try appendLdExpansions(&candidates, dir, origin_dir);
+            for (candidates.items) |candidate| {
+                const a_path = if (std.mem.startsWith(u8, candidate, "/")) try std.fmt.bufPrint(&buf, "{s}/{s}", .{ candidate, requested_path }) else try std.fmt.bufPrint(&buf, "{s}/{s}", .{ candidate, requested_path });
+
+                std.Io.Dir.accessAbsolute(dll_io, a_path, .{ .read = true }) catch continue;
+                if (!isSupportedElfPath(a_path)) {
+                    Logger.debug("skipping unsupported library candidate {s}", .{a_path});
+                    continue;
+                }
+
+                const path = try std.fmt.allocPrint(dll_allocator, "{s}", .{a_path});
+                Logger.debug("found {s} via RUNPATH: {s}", .{ requested_path, path });
+                return path;
+            }
         }
     }
 
     var path: ?[]const u8 = null;
     for (lib_dirs) |dir| {
-        const a_path = try std.fmt.bufPrint(&buf, "{s}/{s}", .{ dir, r_path });
+        const a_path = try std.fmt.bufPrint(&buf, "{s}/{s}", .{ dir, requested_path });
 
         std.Io.Dir.accessAbsolute(dll_io, a_path, .{ .read = true }) catch continue;
         if (!isSupportedElfPath(a_path)) {
@@ -1026,16 +1099,16 @@ fn resolvePath(r_path: []const u8, check_mode: bool) ![]const u8 {
 
         path = try std.fmt.allocPrint(dll_allocator, "{s}", .{a_path});
 
-        Logger.debug("found {s}: {s}", .{ r_path, path.? });
+        Logger.debug("found {s}: {s}", .{ requested_path, path.? });
 
         break;
     }
 
     if (path == null) {
         if (check_mode) {
-            Logger.debug("cannot find library {s}", .{r_path});
+            Logger.debug("cannot find library {s}", .{requested_path});
         } else {
-            Logger.err("cannot find library {s}", .{r_path});
+            Logger.err("cannot find library {s}", .{requested_path});
         }
     }
 
@@ -1047,8 +1120,8 @@ const ResolvedDynObjectInfos = struct {
     path: []const u8,
 };
 
-fn resolveDynObjectInfosByNameOrPath(nameOrPath: []const u8) !ResolvedDynObjectInfos {
-    const path: []const u8 = if (std.mem.findScalar(u8, nameOrPath, '/') != null) try dll_allocator.dupe(u8, nameOrPath) else try resolvePath(nameOrPath, false);
+fn resolveDynObjectInfosByNameOrPath(nameOrPath: []const u8, requester_name: ?[]const u8, runpath: ?[]const u8, origin_dir: ?[]const u8) !ResolvedDynObjectInfos {
+    const path: []const u8 = if (std.mem.findScalar(u8, nameOrPath, '/') != null) try dll_allocator.dupe(u8, nameOrPath) else try resolvePath(nameOrPath, false, requester_name, runpath, origin_dir);
     errdefer dll_allocator.free(path);
 
     const f = try std.Io.Dir.openFileAbsolute(dll_io, path, .{ .mode = .read_only });
@@ -1069,10 +1142,10 @@ fn resolveDynObjectInfosByNameOrPath(nameOrPath: []const u8) !ResolvedDynObjectI
     };
 }
 
-fn loadDso(o_path: []const u8) !usize {
+fn loadDso(o_path: []const u8, root_runpath: ?[]const u8, root_origin_dir: ?[]const u8) !usize {
     var scratch_buf: [1024]u8 = undefined;
 
-    const path: []const u8 = if (std.mem.findScalar(u8, o_path, '/') != null) try dll_allocator.dupe(u8, o_path) else try resolvePath(o_path, false);
+    const path: []const u8 = if (std.mem.findScalar(u8, o_path, '/') != null) try dll_allocator.dupe(u8, o_path) else try resolvePath(o_path, false, null, root_runpath, root_origin_dir);
     defer dll_allocator.free(path);
 
     const dyn_object_name = try dll_allocator.dupe(u8, std.fs.path.basename(path));
@@ -1140,7 +1213,7 @@ fn loadDso(o_path: []const u8) !usize {
     const sh_strtbl: *std.elf.Shdr = @ptrFromInt(sh_section_strtbl_addr);
     const sh_strtab_addr: usize = file_addr + sh_strtbl.sh_offset;
 
-    var dyn_strtab_addr: usize = undefined;
+    var maybe_dyn_strtab_addr: ?usize = null;
     var versym_tab_addr: ?usize = null;
     var verdef_tab_addr: usize = undefined;
     var verneed_tab_addr: usize = undefined;
@@ -1148,8 +1221,9 @@ fn loadDso(o_path: []const u8) !usize {
     var plt_got_addr: usize = 0;
     var plt_got_size: usize = 0;
 
-    var dyn_symtab_addr: usize = undefined;
-    var dyn_symtab_size: usize = undefined;
+    var maybe_dyn_symtab_addr: ?usize = null;
+    var maybe_dyn_symtab_size: ?usize = null;
+    var dyn_runpath: ?[]const u8 = null;
 
     var segments: LoadSegmentList = .empty;
     var dependencies: std.ArrayList(usize) = .empty;
@@ -1205,14 +1279,14 @@ fn loadDso(o_path: []const u8) !usize {
             }
 
             if (std.mem.eql(u8, std.mem.sliceTo(name, 0), ".dynstr")) {
-                dyn_strtab_addr = file_addr + sh.offset;
+                maybe_dyn_strtab_addr = file_addr + sh.offset;
             } else if (!std.mem.eql(u8, std.mem.sliceTo(name, 0), ".shstrtab")) {
                 Logger.debug("    == TODO: STRTAB: {s}", .{std.mem.sliceTo(name, 0)});
             }
         } else if (sh.type == .DYNSYM) {
             if (std.mem.eql(u8, std.mem.sliceTo(name, 0), ".dynsym")) {
-                dyn_symtab_addr = file_addr + sh.offset;
-                dyn_symtab_size = sh.size;
+                maybe_dyn_symtab_addr = file_addr + sh.offset;
+                maybe_dyn_symtab_size = sh.size;
             } else {
                 Logger.debug("    == TODO: DYNSYM: {s}", .{std.mem.sliceTo(name, 0)});
             }
@@ -1260,8 +1334,14 @@ fn loadDso(o_path: []const u8) !usize {
         }
     }
 
+    const dyn_strtab_addr = maybe_dyn_strtab_addr orelse {
+        Logger.err("missing .dynstr for {s} => {s}", .{ dyn_object_name, path });
+        return error.DynamicStringTableNotFound;
+    };
+
     var ph_addr: usize = file_addr + eh.e_phoff;
     var dyn_addr: usize = undefined;
+    var found_dynamic = false;
 
     i = 0;
     while (i < eh.e_phnum) : ({
@@ -1271,8 +1351,19 @@ fn loadDso(o_path: []const u8) !usize {
         const ph: *std.elf.Elf64.Phdr = @ptrFromInt(ph_addr);
 
         if (ph.type == .DYNAMIC) {
+            found_dynamic = true;
             dyn_addr = file_addr + ph.offset;
             const dyns: [*]std.elf.Dyn = @ptrFromInt(dyn_addr);
+
+            var runpath_scan_idx: usize = 0;
+            while (dyns[runpath_scan_idx].d_tag != 0) : (runpath_scan_idx += 1) {
+                if (dyns[runpath_scan_idx].d_tag == std.elf.DT_RUNPATH) {
+                    const runpath_z: [*:0]const u8 = @ptrFromInt(dyn_strtab_addr + dyns[runpath_scan_idx].d_val);
+                    dyn_runpath = std.mem.span(runpath_z);
+                    Logger.debug("dep tree: found RUNPATH: {s} => {s}", .{ dyn_object_name, dyn_runpath.? });
+                    break;
+                }
+            }
 
             var libName: [*:0]u8 = undefined;
 
@@ -1299,8 +1390,9 @@ fn loadDso(o_path: []const u8) !usize {
                         continue;
                     }
 
-                    const resolved_dep = resolveDynObjectInfosByNameOrPath(dep_name) catch |err| {
-                        Logger.err("unresolved {s} dependency: {s}", .{ dyn_object_name, libName });
+                    const origin_dir = std.fs.path.dirname(path) orelse "/";
+                    const resolved_dep = resolveDynObjectInfosByNameOrPath(dep_name, dyn_object_name, dyn_runpath, origin_dir) catch |err| {
+                        Logger.err("unresolved {s} dependency: {s}: {}", .{ dyn_object_name, libName, err });
                         return err;
                     };
                     var resolved_dep_path: ?[]const u8 = resolved_dep.path;
@@ -1362,12 +1454,27 @@ fn loadDso(o_path: []const u8) !usize {
 
     const versym_table: ?[*]std.elf.Half = if (versym_tab_addr) |vst| @ptrFromInt(vst) else null;
 
+    if (!found_dynamic) {
+        Logger.err("no PT_DYNAMIC segment for {s} => {s}", .{ dyn_object_name, path });
+    }
+
+    const dyn_symtab_addr = maybe_dyn_symtab_addr orelse {
+        Logger.err("missing .dynsym for {s} => {s} (found_dynamic={})", .{ dyn_object_name, path, found_dynamic });
+        return error.DynamicSymbolTableNotFound;
+    };
+    const dyn_symtab_size = maybe_dyn_symtab_size orelse {
+        Logger.err("missing .dynsym size for {s} => {s} (found_dynamic={})", .{ dyn_object_name, path, found_dynamic });
+        return error.DynamicSymbolTableSizeNotFound;
+    };
+
     Logger.debug("dynamic string table addr: 0x{x}", .{dyn_strtab_addr});
     Logger.debug("dynamic sym table addr: 0x{x}", .{dyn_symtab_addr});
 
     Logger.debug("{s}: symbols: ", .{dyn_object_name});
 
     const dyn_sym_count = dyn_symtab_size / @sizeOf(std.elf.Sym);
+    Logger.debug("{s}: dynamic symbol count: {d}", .{ dyn_object_name, dyn_sym_count });
+
     try syms_array.ensureTotalCapacity(dll_allocator, dyn_sym_count);
     try syms.ensureTotalCapacity(dll_allocator, dyn_sym_count);
 
@@ -1608,7 +1715,7 @@ fn loadDso(o_path: []const u8) !usize {
 
                 if (dyns[j].d_tag == std.elf.DT_RUNPATH) {
                     runpath = @ptrFromInt(dyn_strtab_addr + dyns[j].d_val);
-                    Logger.debug("        => lib rpath: {s}", .{runpath});
+                    Logger.debug("        => lib RUNPATH: {s}", .{runpath});
                 } else if (dyns[j].d_tag == std.elf.DT_RELA) {
                     rela_reloc_tbl_addr = file_addr + dyns[j].d_val;
                     Logger.debug("        => rela reloc table addr: 0x{x}", .{rela_reloc_tbl_addr});
@@ -1816,10 +1923,14 @@ fn loadDso(o_path: []const u8) !usize {
         const owned_path = try dll_allocator.dupe(u8, path);
         errdefer dll_allocator.free(owned_path);
 
+        const owned_runpath = if (dyn_runpath) |runpath| try dll_allocator.dupe(u8, runpath) else null;
+        errdefer if (owned_runpath) |runpath| dll_allocator.free(runpath);
+
         do_entry.value_ptr.* = .{
             .key = dyn_object_key,
             .name = owned_name,
             .path = owned_path,
+            .runpath = owned_runpath,
             .file_handle = f.handle,
             .mapped_at = file_addr,
             .mapped_size = file_bytes.len,
@@ -1883,8 +1994,10 @@ fn loadDso(o_path: []const u8) !usize {
         if (previous_dyn_object) |previous| {
             dll_allocator.free(current_name);
             dll_allocator.free(current_path);
+            if (current_dyn_object.runpath) |runpath| dll_allocator.free(runpath);
             current_dyn_object.* = previous;
         } else {
+            if (current_dyn_object.runpath) |runpath| dll_allocator.free(runpath);
             current_dyn_object.* = .init(dyn_object_key, current_name, current_path);
         }
     };
@@ -1926,6 +2039,7 @@ fn loadDso(o_path: []const u8) !usize {
         previous_to_free.segments.deinit(dll_allocator);
         dll_allocator.free(previous_to_free.name);
         dll_allocator.free(previous_to_free.path);
+        if (previous_to_free.runpath) |runpath| dll_allocator.free(runpath);
     }
     dyn_object_installed = false;
 
