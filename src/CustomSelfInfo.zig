@@ -1,4 +1,4 @@
-// based on lib/std/debug/SelfInfo/Elf.zig @ 6707a5efee
+// based on lib/std/debug/SelfInfo/Elf.zig @ 6c25d2bd58
 
 // TODO move this to dll global state
 var extra_phdr_infos: std.ArrayList(*std.posix.dl_phdr_info) = .empty;
@@ -65,85 +65,60 @@ pub fn getSymbols(
     const vaddr = address - module.load_offset;
 
     const loaded_elf = try module.getLoadedElf(gpa, io);
-    if (!loaded_elf.bad_dwarf) {
-        if (loaded_elf.file.dwarf) |*dwarf| {
-            if (!loaded_elf.scanned_dwarf) {
-                dwarf.open(gpa, native_endian) catch |err| switch (err) {
-                    error.OutOfMemory => |e| return e,
-                    error.InvalidDebugInfo,
-                    error.MissingDebugInfo,
-                    error.EndOfStream,
-                    error.Overflow,
-                    error.ReadFailed,
-                    error.StreamTooLong,
-                    => {
-                        loaded_elf.bad_dwarf = true;
-                        return appendSymtabSymbol(&loaded_elf.file, gpa, symbol_allocator, vaddr, symbols);
-                    },
-                };
-                loaded_elf.scanned_dwarf = true;
-            }
-            const original_len = symbols.items.len;
-            dwarf.getSymbols(
-                symbol_allocator,
-                text_arena,
-                native_endian,
-                vaddr,
-                resolve_inline_callers,
-                symbols,
-            ) catch |err| switch (err) {
+    const dwarf_err: ?Error = err: {
+        const dwarf = &(loaded_elf.file.dwarf orelse break :err null);
+        switch (loaded_elf.dwarf) {
+            .not_scanned => if (dwarf.open(gpa, native_endian)) {
+                loaded_elf.dwarf = .ok;
+            } else |err| switch (err) {
                 error.InvalidDebugInfo,
-                error.MissingDebugInfo,
-                error.UnsupportedDebugInfo,
-                => {
-                    symbols.items.len = original_len;
-                    return appendSymtabSymbol(&loaded_elf.file, gpa, symbol_allocator, vaddr, symbols);
-                },
-                error.OutOfMemory,
+                error.EndOfStream,
+                error.Overflow,
                 error.ReadFailed,
-                error.Unexpected,
-                error.Canceled,
-                => |e| return e,
-            };
-
-            if (symbols.items.len > original_len) {
-                // `Dwarf.getSymbols` currently appends exactly one symbol and ignores inline callers,
-                // so `&symbols.items[original_len]` points to the only DWARF result that may need a symtab name.
-                fillMissingSymbolNameFromSymtab(&loaded_elf.file, gpa, vaddr, &symbols.items[original_len]);
-            }
-            return;
+                error.StreamTooLong,
+                => {
+                    loaded_elf.dwarf = .invalid;
+                    break :err error.InvalidDebugInfo;
+                },
+                error.MissingDebugInfo => {
+                    loaded_elf.dwarf = .missing;
+                    break :err error.MissingDebugInfo;
+                },
+                error.OutOfMemory => |e| return e,
+            },
+            .invalid => break :err error.InvalidDebugInfo,
+            .missing => break :err error.MissingDebugInfo,
+            .ok => {},
         }
-    }
-    // When DWARF is unavailable, fall back to searching the symtab.
-    try appendSymtabSymbol(&loaded_elf.file, gpa, symbol_allocator, vaddr, symbols);
-}
+        return dwarf.getSymbols(
+            symbol_allocator,
+            text_arena,
+            native_endian,
+            vaddr,
+            resolve_inline_callers,
+            symbols,
+        ) catch |err| switch (err) {
+            error.InvalidDebugInfo,
+            error.MissingDebugInfo,
+            error.UnsupportedDebugInfo,
+            => |e| break :err e,
 
-fn appendSymtabSymbol(
-    elf_file: *std.debug.ElfFile,
-    gpa: Allocator,
-    symbol_allocator: Allocator,
-    vaddr: u64,
-    symbols: *std.ArrayList(std.debug.Symbol),
-) Error!void {
-    try symbols.append(symbol_allocator, elf_file.searchSymtab(gpa, vaddr) catch |err| switch (err) {
+            error.ReadFailed,
+            error.OutOfMemory,
+            error.Canceled,
+            error.Unexpected,
+            => |e| return e,
+        };
+    };
+    // When DWARF is unavailable, fall back to searching the symtab.
+    try symbols.append(symbol_allocator, loaded_elf.file.searchSymtab(gpa, vaddr) catch |err| switch (err) {
         error.NoSymtab, error.NoStrtab => return error.MissingDebugInfo,
         error.BadSymtab => return error.InvalidDebugInfo,
         error.OutOfMemory => |e| return e,
     });
+    // After searching the symtab, still report the DWARF error.
+    if (dwarf_err) |e| return e;
 }
-
-fn fillMissingSymbolNameFromSymtab(
-    elf_file: *std.debug.ElfFile,
-    gpa: Allocator,
-    vaddr: u64,
-    symbol: *std.debug.Symbol,
-) void {
-    if (symbol.name != null) return;
-
-    const symtab_symbol = elf_file.searchSymtab(gpa, vaddr) catch return;
-    symbol.name = symtab_symbol.name;
-}
-
 pub fn getModuleName(si: *SelfInfo, io: Io, address: usize) Error![]const u8 {
     const gpa = std.debug.getDebugInfoAllocator();
     const module = try si.findModule(gpa, io, address, .shared);
@@ -151,7 +126,6 @@ pub fn getModuleName(si: *SelfInfo, io: Io, address: usize) Error![]const u8 {
     if (module.name.len == 0) return error.MissingDebugInfo;
     return module.name;
 }
-
 pub fn getModuleSlide(si: *SelfInfo, io: Io, address: usize) Error!usize {
     const gpa = std.debug.getDebugInfoAllocator();
     const module = try si.findModule(gpa, io, address, .shared);
@@ -160,32 +134,26 @@ pub fn getModuleSlide(si: *SelfInfo, io: Io, address: usize) Error!usize {
 }
 
 pub const can_unwind: bool = s: {
-    // The DWARF code can't deal with ILP32 ABIs yet: https://github.com/ziglang/zig/issues/25447
-    switch (builtin.target.abi) {
-        .gnuabin32,
-        .muslabin32,
-        .gnux32,
-        .muslx32,
-        => break :s false,
-        else => {},
-    }
-
-    // Notably, we are yet to support unwinding on ARM. There, unwinding is not done through
-    // `.eh_frame`, but instead with the `.ARM.exidx` section, which has a different format.
     const archs: []const std.Target.Cpu.Arch = switch (builtin.target.os.tag) {
-        // Not supported yet: arm
         .haiku => &.{
             .aarch64,
-            .m68k,
+            .arm,
             .riscv64,
             .x86,
             .x86_64,
         },
-        // Not supported yet: arm/armeb/thumb/thumbeb, xtensa/xtensaeb
+        .illumos => &.{
+            .x86,
+            .x86_64,
+        },
+        // Not supported yet: hppa, hppa64, microblaze/microblazeel, sh/sheb
         .linux => &.{
             .aarch64,
             .aarch64_be,
+            .alpha,
             .arc,
+            .arm,
+            .armeb,
             .csky,
             .loongarch32,
             .loongarch64,
@@ -198,6 +166,8 @@ pub const can_unwind: bool = s: {
             .riscv32,
             .riscv64,
             .s390x,
+            .thumb,
+            .thumbeb,
             .x86,
             .x86_64,
         },
@@ -210,33 +180,36 @@ pub const can_unwind: bool = s: {
         .dragonfly => &.{
             .x86_64,
         },
-        // Not supported yet: arm
         .freebsd => &.{
             .aarch64,
+            .arm,
             .riscv64,
+            .x86,
             .x86_64,
         },
-        // Not supported yet: arm/armeb, mips64/mips64el
+        // Not supported yet: hppa, mips64/mips64el, sh/sheb
         .netbsd => &.{
             .aarch64,
             .aarch64_be,
+            .alpha,
+            .arm,
+            .armeb,
             .m68k,
             .mips,
             .mipsel,
-            .x86,
-            .x86_64,
-        },
-        // Not supported yet: arm
-        .openbsd => &.{
-            .aarch64,
-            .mips64,
-            .mips64el,
+            .riscv32,
             .riscv64,
             .x86,
             .x86_64,
         },
-
-        .illumos => &.{
+        // Not supported yet: hppa, sh
+        .openbsd => &.{
+            .aarch64,
+            .arm,
+            .m88k,
+            .mips64,
+            .mips64el,
+            .riscv64,
             .x86,
             .x86_64,
         },
@@ -320,8 +293,7 @@ const Module = struct {
 
     const LoadedElf = struct {
         file: std.debug.ElfFile,
-        scanned_dwarf: bool,
-        bad_dwarf: bool,
+        dwarf: enum { not_scanned, invalid, missing, ok },
     };
 
     const UnwindSections = struct {
@@ -447,8 +419,7 @@ const Module = struct {
 
         return .{
             .file = elf_file,
-            .scanned_dwarf = false,
-            .bad_dwarf = false,
+            .dwarf = .not_scanned,
         };
     }
 };
