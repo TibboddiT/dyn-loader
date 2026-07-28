@@ -4127,26 +4127,20 @@ const DynObjectSegmentResult = struct {
     sym_index: ?usize,
 };
 
-fn findDynObjectSegmentForLoadedAddr(addr: usize) !DynObjectSegmentResult {
-    for (dyn_objects.values()) |*dyn_object| {
+const DynObjectAddressResult = struct {
+    dyn_object_index: usize,
+    segment_index: usize,
+};
+
+fn findDynObjectForLoadedAddr(addr: usize) ?DynObjectAddressResult {
+    for (dyn_objects.values(), 0..) |*dyn_object, dyn_object_idx| {
         for (dyn_object.segments.values(), 0..) |*s, s_idx| {
             const segment_start = s.loaded_at;
             const segment_end = segment_start + s.mem_size;
             if (addr >= segment_start and addr < segment_end) {
-                for (dyn_object.syms_array.items, 0..) |*sym, sym_idx| {
-                    const sym_addr = try vAddressToLoadedAddress(dyn_object, sym.value, false);
-                    if (sym_addr <= addr and sym_addr + sym.size > addr) {
-                        return .{
-                            .dyn_object = dyn_object,
-                            .segment_index = s_idx,
-                            .sym_index = sym_idx,
-                        };
-                    }
-                }
                 return .{
-                    .dyn_object = dyn_object,
+                    .dyn_object_index = dyn_object_idx,
                     .segment_index = s_idx,
-                    .sym_index = null,
                 };
             }
         }
@@ -4154,7 +4148,29 @@ fn findDynObjectSegmentForLoadedAddr(addr: usize) !DynObjectSegmentResult {
 
     // TODO also search the main executable, in case it is c++ that wants to unwind an exception
 
-    return error.LoadedAddressNotMapped;
+    return null;
+}
+
+fn findDynObjectSegmentForLoadedAddr(addr: usize) !DynObjectSegmentResult {
+    const object_result = findDynObjectForLoadedAddr(addr) orelse return error.LoadedAddressNotMapped;
+    const dyn_object = &dyn_objects.values()[object_result.dyn_object_index];
+
+    for (dyn_object.syms_array.items, 0..) |*sym, sym_idx| {
+        const sym_addr = try vAddressToLoadedAddress(dyn_object, sym.value, false);
+        if (sym_addr <= addr and sym_addr + sym.size > addr) {
+            return .{
+                .dyn_object = dyn_object,
+                .segment_index = object_result.segment_index,
+                .sym_index = sym_idx,
+            };
+        }
+    }
+
+    return .{
+        .dyn_object = dyn_object,
+        .segment_index = object_result.segment_index,
+        .sym_index = null,
+    };
 }
 
 fn vAddressToLoadedAddress(dyn_object: *DynObject, addr: usize, allow_outside: bool) !usize {
@@ -4746,6 +4762,7 @@ const rtld_flags = struct {
 };
 
 fn dlopenSubstitute(path: ?[*:0]const u8, flags: c_int) callconv(.c) ?*anyopaque {
+    const caller_addr = @returnAddress();
     Logger.debug("intercepted call: dlopen(\"{?s}\", 0x{x})", .{ path, flags });
 
     if (path == null) {
@@ -4756,8 +4773,19 @@ fn dlopenSubstitute(path: ?[*:0]const u8, flags: c_int) callconv(.c) ?*anyopaque
     const owned_path = dll_allocator.dupe(u8, std.mem.span(path.?)) catch @panic("OOM");
     extra_strs.append(dll_allocator, owned_path) catch @panic("OOM");
 
+    var caller_runpath: ?[]const u8 = null;
+    var caller_origin_dir: ?[]const u8 = null;
+    if (findDynObjectForLoadedAddr(caller_addr)) |caller_result| {
+        const caller = &dyn_objects.values()[caller_result.dyn_object_index];
+        caller_runpath = caller.runpath;
+        caller_origin_dir = std.fs.path.dirname(caller.path) orelse "/";
+        Logger.debug("dlopen caller: {s} at 0x{x}", .{ caller.name, caller_addr });
+    } else {
+        Logger.debug("dlopen caller at 0x{x} is not a dynamically loaded object", .{caller_addr});
+    }
+
     // TODO we should not try to load the library if RTLD_NOLOAD is set
-    const lib = load(owned_path) catch |err| {
+    const lib = loadWithRootResolveContext(owned_path, caller_runpath, caller_origin_dir) catch |err| {
         if ((flags & rtld_flags.noload) == 0) {
             if (last_dl_error != null) {
                 dll_allocator.free(last_dl_error.?);
