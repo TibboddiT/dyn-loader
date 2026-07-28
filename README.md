@@ -118,6 +118,7 @@ zig build run-vulkan_instance
 zig build run-x11_window
 zig build run-x11_egl
 zig build run-x11_vulkan_triangle
+zig build run-wayland_vulkan_triangle
 ```
 
 The following example will intentionally trigger a segfault to demonstrate stack traces across loaded libraries:

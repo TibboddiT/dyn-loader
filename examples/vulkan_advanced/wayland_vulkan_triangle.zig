@@ -1,7 +1,7 @@
 const std = @import("std");
 const dll = @import("dll");
 const vk = @import("vk.zig");
-const Xlib = @import("xlib.zig").Xlib;
+const wl = @import("wayland.zig");
 const VulkanProcResolver = @import("vulkan_proc_resolver.zig").VulkanProcResolver;
 const GraphicsContext = @import("graphics_context.zig").GraphicsContext;
 const Swapchain = @import("swapchain.zig").Swapchain;
@@ -55,6 +55,88 @@ const vertices = [_]Vertex{
     .{ .pos = .{ -0.5, 0.5 }, .color = .{ 0, 0, 1 } },
 };
 
+const WaylandState = struct {
+    api: *const wl.Api,
+    compositor: ?*wl.Compositor = null,
+    wm_base: ?*wl.XdgWmBase = null,
+    extent: vk.Extent2D = .{ .width = 800, .height = 600 },
+    pending_extent: ?vk.Extent2D = null,
+    resize_pending: bool = false,
+    configured: bool = false,
+    running: bool = true,
+    bind_failed: bool = false,
+
+    fn registryGlobal(data: ?*anyopaque, registry: *wl.Registry, name: u32, interface: [*:0]const u8, version: u32) callconv(.c) void {
+        const self: *WaylandState = @ptrCast(@alignCast(data.?));
+        const interface_name = std.mem.span(interface);
+
+        if (self.compositor == null and std.mem.eql(u8, interface_name, "wl_compositor")) {
+            const proxy = self.api.bind(registry, name, self.api.compositor_interface, @min(version, 1)) catch {
+                self.bind_failed = true;
+                return;
+            };
+            self.compositor = @ptrCast(proxy);
+        } else if (self.wm_base == null and std.mem.eql(u8, interface_name, "xdg_wm_base")) {
+            const proxy = self.api.bind(registry, name, &wl.xdg_wm_base_interface, @min(version, 1)) catch {
+                self.bind_failed = true;
+                return;
+            };
+            self.wm_base = @ptrCast(proxy);
+        }
+    }
+
+    fn registryGlobalRemove(_: ?*anyopaque, _: *wl.Registry, _: u32) callconv(.c) void {}
+
+    fn wmBasePing(data: ?*anyopaque, wm_base: *wl.XdgWmBase, serial: u32) callconv(.c) void {
+        const self: *WaylandState = @ptrCast(@alignCast(data.?));
+        self.api.pong(wm_base, serial);
+    }
+
+    fn surfaceConfigure(data: ?*anyopaque, xdg_surface: *wl.XdgSurface, serial: u32) callconv(.c) void {
+        const self: *WaylandState = @ptrCast(@alignCast(data.?));
+        self.api.ackConfigure(xdg_surface, serial);
+
+        if (self.pending_extent) |extent| {
+            if (self.configured and !std.meta.eql(self.extent, extent)) self.resize_pending = true;
+            self.extent = extent;
+            self.pending_extent = null;
+        }
+        self.configured = true;
+    }
+
+    fn toplevelConfigure(data: ?*anyopaque, _: *wl.XdgToplevel, width: i32, height: i32, _: *wl.Array) callconv(.c) void {
+        const self: *WaylandState = @ptrCast(@alignCast(data.?));
+        var extent = self.extent;
+        var changed = false;
+
+        if (width > 0) {
+            extent.width = @intCast(width);
+            changed = true;
+        }
+        if (height > 0) {
+            extent.height = @intCast(height);
+            changed = true;
+        }
+        if (changed) self.pending_extent = extent;
+    }
+
+    fn toplevelClose(data: ?*anyopaque, _: *wl.XdgToplevel) callconv(.c) void {
+        const self: *WaylandState = @ptrCast(@alignCast(data.?));
+        self.running = false;
+    }
+};
+
+const registry_listener = wl.RegistryListener{
+    .global = &WaylandState.registryGlobal,
+    .global_remove = &WaylandState.registryGlobalRemove,
+};
+const wm_base_listener = wl.XdgWmBaseListener{ .ping = &WaylandState.wmBasePing };
+const surface_listener = wl.XdgSurfaceListener{ .configure = &WaylandState.surfaceConfigure };
+const toplevel_listener = wl.XdgToplevelListener{
+    .configure = &WaylandState.toplevelConfigure,
+    .close = &WaylandState.toplevelClose,
+};
+
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
     const io = init.io;
@@ -64,61 +146,58 @@ pub fn main(init: std.process.Init) !void {
     try dll.init(.{ .allocator = allocator, .io = io, .args = args, .environ = environ });
     defer dll.deinit();
 
-    std.log.info("loading 'libX11.so.6'...", .{});
+    std.log.info("loading 'libwayland-client.so.0'...", .{});
 
-    const lib_x11 = try dll.load("libX11.so.6");
-
-    const xOpenDisplay: *Xlib.XOpenDisplay = @ptrFromInt((try lib_x11.getSymbol("XOpenDisplay")).addr);
-    const xDefaultScreen: *Xlib.XDefaultScreen = @ptrFromInt((try lib_x11.getSymbol("XDefaultScreen")).addr);
-    const xRootWindow: *Xlib.XRootWindow = @ptrFromInt((try lib_x11.getSymbol("XRootWindow")).addr);
-    const xCreateSimpleWindow: *Xlib.XCreateSimpleWindow = @ptrFromInt((try lib_x11.getSymbol("XCreateSimpleWindow")).addr);
-    const xStoreName: *Xlib.XStoreName = @ptrFromInt((try lib_x11.getSymbol("XStoreName")).addr);
-    const xBlackPixel: *Xlib.XBlackPixel = @ptrFromInt((try lib_x11.getSymbol("XBlackPixel")).addr);
-    const xWhitePixel: *Xlib.XWhitePixel = @ptrFromInt((try lib_x11.getSymbol("XWhitePixel")).addr);
-    const xMapWindow: *Xlib.XMapWindow = @ptrFromInt((try lib_x11.getSymbol("XMapWindow")).addr);
-    const xFlush: *Xlib.XFlush = @ptrFromInt((try lib_x11.getSymbol("XFlush")).addr);
-    const xCloseDisplay: *Xlib.XCloseDisplay = @ptrFromInt((try lib_x11.getSymbol("XCloseDisplay")).addr);
-    const xGetWindowAttributes: *Xlib.XGetWindowAttributes = @ptrFromInt((try lib_x11.getSymbol("XGetWindowAttributes")).addr);
-    const xChangeWindowAttributes: *Xlib.XChangeWindowAttributes = @ptrFromInt((try lib_x11.getSymbol("XChangeWindowAttributes")).addr);
-    const xPending: *Xlib.XPending = @ptrFromInt((try lib_x11.getSymbol("XPending")).addr);
-    const xNextEvent: *Xlib.XNextEvent = @ptrFromInt((try lib_x11.getSymbol("XNextEvent")).addr);
-    const xSelectInput: *Xlib.XSelectInput = @ptrFromInt((try lib_x11.getSymbol("XSelectInput")).addr);
-    const xInternAtom: *Xlib.XInternAtom = @ptrFromInt((try lib_x11.getSymbol("XInternAtom")).addr);
-    const xSetWMProtocols: *Xlib.XSetWMProtocols = @ptrFromInt((try lib_x11.getSymbol("XSetWMProtocols")).addr);
+    const lib_wayland = try dll.load("libwayland-client.so.0");
+    const wayland = try wl.Api.load(lib_wayland);
 
     std.log.info("loading 'libvulkan.so.1'...", .{});
 
     const lib_vulkan = try dll.load("libvulkan.so.1");
-
     VulkanProcResolver.lib_vulkan = lib_vulkan;
 
-    var extent = vk.Extent2D{ .width = 800, .height = 600 };
+    const display = try wayland.connect();
+    defer wayland.disconnect(display);
 
-    const x11_display = xOpenDisplay(null) orelse return error.UnableToCreateDisplay;
-    defer _ = xCloseDisplay(x11_display);
+    var window = WaylandState{ .api = &wayland };
 
-    const x11_screen = xDefaultScreen(x11_display);
-    const x11_root = xRootWindow(x11_display, x11_screen);
-    const x11_window = xCreateSimpleWindow(x11_display, x11_root, 100, 100, extent.width, extent.height, 1, xBlackPixel(x11_display, x11_screen), xWhitePixel(x11_display, x11_screen));
+    const registry = try wayland.getRegistry(display);
+    defer wayland.destroyProxy(@ptrCast(registry));
+    try wayland.addListener(@ptrCast(registry), @ptrCast(&registry_listener), &window);
+    try wayland.roundtrip(display);
 
-    _ = xStoreName(x11_display, x11_window, "x11_vulkan_triangle.zig");
+    if (window.bind_failed) return error.WaylandGlobalBindFailed;
+    const compositor = window.compositor orelse return error.MissingWaylandCompositor;
+    defer wayland.destroyProxy(@ptrCast(compositor));
+    const wm_base = window.wm_base orelse return error.MissingXdgWmBase;
+    defer wayland.destroyWmBase(wm_base);
+    try wayland.addListener(@ptrCast(wm_base), @ptrCast(&wm_base_listener), &window);
 
-    _ = xSelectInput(x11_display, x11_window, Xlib.StructureNotifyMask | Xlib.ExposureMask | Xlib.KeyPressMask);
-    const wmDeleteMessage = xInternAtom(x11_display, "WM_DELETE_WINDOW", Xlib.False);
-    _ = xSetWMProtocols(x11_display, x11_window, @ptrCast(&wmDeleteMessage), 1);
+    const surface = try wayland.createSurface(compositor);
+    defer wayland.destroySurface(surface);
+    const xdg_surface = try wayland.getXdgSurface(wm_base, surface);
+    defer wayland.destroyXdgSurface(xdg_surface);
+    try wayland.addListener(@ptrCast(xdg_surface), @ptrCast(&surface_listener), &window);
 
-    _ = xMapWindow(x11_display, x11_window);
-    _ = xFlush(x11_display);
+    const toplevel = try wayland.getToplevel(xdg_surface);
+    defer wayland.destroyToplevel(toplevel);
+    try wayland.addListener(@ptrCast(toplevel), @ptrCast(&toplevel_listener), &window);
+    wayland.setTitle(toplevel, "wayland_vulkan_triangle.zig");
+    wayland.setAppId(toplevel, "wayland_vulkan_triangle");
 
-    const gc = try GraphicsContext.init(allocator, app_name, .{ .xlib = .{
-        .display = x11_display,
-        .window = x11_window,
+    wayland.commit(surface);
+    while (!window.configured and window.running) try wayland.roundtrip(display);
+    if (!window.running) return;
+
+    const gc = try GraphicsContext.init(allocator, app_name, .{ .wayland = .{
+        .display = @ptrCast(display),
+        .surface = @ptrCast(surface),
     } });
     defer gc.deinit();
 
     std.log.info("Using device: {s}", .{gc.deviceName()});
 
-    var swapchain = try Swapchain.init(&gc, allocator, extent);
+    var swapchain = try Swapchain.init(&gc, allocator, window.extent);
     defer swapchain.deinit();
 
     const pipeline_layout = try gc.dev.createPipelineLayout(&.{
@@ -169,51 +248,19 @@ pub fn main(init: std.process.Init) !void {
     );
     defer destroyCommandBuffers(&gc, pool, allocator, cmdbufs);
 
-    var attrs: Xlib.XSetWindowAttributes = .{};
-    attrs.background_pixmap = Xlib.None;
-    _ = xChangeWindowAttributes(x11_display, x11_window, Xlib.CWBackPixmap, &attrs);
-
     var state: Swapchain.PresentState = .optimal;
-    main_loop: while (true) {
-        var attr: Xlib.XWindowAttributes = undefined;
-        _ = xGetWindowAttributes(x11_display, x11_window, &attr);
+    main_loop: while (window.running) {
+        try dispatchWayland(&wayland, display);
+        if (!window.running) break :main_loop;
 
-        const w = attr.width;
-        const h = attr.height;
-
-        // Don't present or resize swapchain while the window is minimized
-        if (w == 0 or h == 0) {
-            while (xPending(x11_display) != 0) {
-                var ev: Xlib.XEvent = undefined;
-                _ = xNextEvent(x11_display, &ev);
-                // std.log.info("x11 event: {d}", .{ev.type});
-
-                if (ev.type == Xlib.DestroyNotify) {
-                    std.log.info("exiting due to DestroyNotify", .{});
-                    break :main_loop;
-                }
-
-                if (ev.type == Xlib.ClientMessage) {
-                    if (ev.xclient.data.l[0] == wmDeleteMessage) {
-                        std.log.info("exiting...", .{});
-                        break :main_loop;
-                    }
-                }
-            }
-
-            continue;
-        }
-
-        if (state == .suboptimal or extent.width != @as(u32, @intCast(w)) or extent.height != @as(u32, @intCast(h))) {
-            extent.width = @intCast(w);
-            extent.height = @intCast(h);
-            var do_recycle: bool = true;
+        if (state == .suboptimal or window.resize_pending) {
+            window.resize_pending = false;
+            var do_recycle = true;
             while (true) {
-                swapchain.recreate(extent, do_recycle) catch |err| switch (err) {
+                swapchain.recreate(window.extent, do_recycle) catch |err| switch (err) {
                     error.OutOfDateKHR => {
-                        _ = xGetWindowAttributes(x11_display, x11_window, &attr);
-                        extent.width = @intCast(attr.width);
-                        extent.height = @intCast(attr.height);
+                        try dispatchWayland(&wayland, display);
+                        if (!window.running) break :main_loop;
                         do_recycle = false;
                         continue;
                     },
@@ -239,33 +286,39 @@ pub fn main(init: std.process.Init) !void {
         }
 
         const cmdbuf = cmdbufs[swapchain.image_index];
-
         state = swapchain.present(cmdbuf) catch |err| switch (err) {
             error.OutOfDateKHR => Swapchain.PresentState.suboptimal,
             else => |narrow| return narrow,
         };
-
-        while (xPending(x11_display) != 0) {
-            var ev: Xlib.XEvent = undefined;
-            _ = xNextEvent(x11_display, &ev);
-            // std.log.info("x11 event: {d}", .{ev.type});
-
-            if (ev.type == Xlib.DestroyNotify) {
-                std.log.info("exiting due to DestroyNotify", .{});
-                break :main_loop;
-            }
-
-            if (ev.type == Xlib.ClientMessage) {
-                if (ev.xclient.data.l[0] == wmDeleteMessage) {
-                    std.log.info("exiting...", .{});
-                    break :main_loop;
-                }
-            }
-        }
     }
 
     try swapchain.waitForAllFences();
     try gc.dev.deviceWaitIdle();
+}
+
+fn dispatchWayland(api: *const wl.Api, display: *wl.Display) !void {
+    while (!api.prepareRead(display)) try api.dispatchPending(display);
+
+    var read_prepared = true;
+    defer if (read_prepared) api.cancelRead(display);
+
+    try api.flush(display);
+
+    var poll_fds = [_]std.posix.pollfd{.{
+        .fd = api.getFd(display),
+        .events = std.posix.POLL.IN,
+        .revents = 0,
+    }};
+    const ready = try std.posix.poll(&poll_fds, 0);
+    if (ready > 0 and poll_fds[0].revents & std.posix.POLL.IN != 0) {
+        try api.readEvents(display);
+    } else {
+        api.cancelRead(display);
+    }
+    read_prepared = false;
+
+    try api.dispatchPending(display);
+    try api.flush(display);
 }
 
 fn uploadVertices(gc: *const GraphicsContext, pool: vk.CommandPool, buffer: vk.Buffer) !void {
@@ -312,7 +365,6 @@ fn copyBuffer(gc: *const GraphicsContext, pool: vk.CommandPool, dst: vk.Buffer, 
         .size = size,
     };
     cmdbuf.copyBuffer(src, dst, 1, @ptrCast(&region));
-
     try cmdbuf.endCommandBuffer();
 
     const si = vk.SubmitInfo{
@@ -501,9 +553,9 @@ fn createPipeline(
 
     const pvsci = vk.PipelineViewportStateCreateInfo{
         .viewport_count = 1,
-        .p_viewports = undefined, // set in createCommandBuffers with cmdSetViewport
+        .p_viewports = undefined,
         .scissor_count = 1,
-        .p_scissors = undefined, // set in createCommandBuffers with cmdSetScissor
+        .p_scissors = undefined,
     };
 
     const prsci = vk.PipelineRasterizationStateCreateInfo{

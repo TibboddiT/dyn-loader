@@ -38,6 +38,7 @@ pub fn build(b: *std.Build) void {
 
     addExecutable(b, &resources_dir.step, check_step, dll_mod, target, optimize, false, "vulkan_instance", "examples/vulkan_advanced/vulkan_instance.zig");
     addExecutable(b, &resources_dir.step, check_step, dll_mod, target, optimize, false, "x11_vulkan_triangle", "examples/vulkan_advanced/x11_vulkan_triangle.zig");
+    addExecutable(b, &resources_dir.step, check_step, dll_mod, target, optimize, false, "wayland_vulkan_triangle", "examples/vulkan_advanced/wayland_vulkan_triangle.zig");
 }
 
 fn addExecutable(b: *std.Build, resources_step: *std.Build.Step, check_step: *std.Build.Step, mod: *std.Build.Module, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, force_unstripped: bool, name: []const u8, root_source_file: []const u8) void {

@@ -35,6 +35,17 @@ const Device = vk.DeviceProxy;
 pub const GraphicsContext = struct {
     pub const CommandBuffer = vk.CommandBufferProxy;
 
+    pub const SurfaceSource = union(enum) {
+        xlib: struct {
+            display: *Xlib.Display,
+            window: Xlib.Window,
+        },
+        wayland: struct {
+            display: *vk.wl_display,
+            surface: *vk.wl_surface,
+        },
+    };
+
     allocator: Allocator,
 
     vkb: BaseWrapper,
@@ -50,7 +61,7 @@ pub const GraphicsContext = struct {
     graphics_queue: Queue,
     present_queue: Queue,
 
-    pub fn init(allocator: Allocator, app_name: [*:0]const u8, x11_display: *Xlib.Display, x11_window: Xlib.Window) !GraphicsContext {
+    pub fn init(allocator: Allocator, app_name: [*:0]const u8, surface_source: SurfaceSource) !GraphicsContext {
         var self: GraphicsContext = undefined;
         self.allocator = allocator;
         self.vkb = BaseWrapper.load(&VulkanProcResolver.resolver);
@@ -63,7 +74,10 @@ pub const GraphicsContext = struct {
         defer extension_names.deinit(allocator);
 
         try extension_names.append(allocator, vk.extensions.ext_debug_utils.name);
-        try extension_names.append(allocator, vk.extensions.khr_xlib_surface.name);
+        try extension_names.append(allocator, switch (surface_source) {
+            .xlib => vk.extensions.khr_xlib_surface.name,
+            .wayland => vk.extensions.khr_wayland_surface.name,
+        });
         try extension_names.append(allocator, vk.extensions.khr_surface.name);
         try extension_names.append(allocator, vk.extensions.khr_portability_enumeration.name);
         try extension_names.append(allocator, vk.extensions.khr_get_physical_device_properties_2.name);
@@ -107,7 +121,7 @@ pub const GraphicsContext = struct {
             .p_user_data = null,
         }, null);
 
-        self.surface = try createSurface(self.instance, x11_display, x11_window);
+        self.surface = try createSurface(self.instance, surface_source);
         errdefer self.instance.destroySurfaceKHR(self.surface, null);
 
         const candidate = try pickPhysicalDevice(self.instance, allocator, self.surface);
@@ -190,11 +204,17 @@ pub const Queue = struct {
     }
 };
 
-fn createSurface(instance: Instance, x11_display: *Xlib.Display, x11_window: Xlib.Window) !vk.SurfaceKHR {
-    return try instance.createXlibSurfaceKHR(&.{
-        .dpy = @ptrCast(x11_display),
-        .window = x11_window,
-    }, null);
+fn createSurface(instance: Instance, source: GraphicsContext.SurfaceSource) !vk.SurfaceKHR {
+    return switch (source) {
+        .xlib => |xlib| try instance.createXlibSurfaceKHR(&.{
+            .dpy = @ptrCast(xlib.display),
+            .window = xlib.window,
+        }, null),
+        .wayland => |wayland| try instance.createWaylandSurfaceKHR(&.{
+            .display = wayland.display,
+            .surface = wayland.surface,
+        }, null),
+    };
 }
 
 fn initializeCandidate(instance: Instance, candidate: DeviceCandidate) !vk.Device {
