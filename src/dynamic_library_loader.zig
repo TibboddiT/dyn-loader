@@ -4927,11 +4927,14 @@ fn dlcloseSubstitute(lib: *anyopaque) callconv(.c) c_int {
         dep_dyn_object.ref_count -= 1;
     }
 
-    var nb_deps = dyn_object.deps_breadth_first.items.len;
-    while (nb_deps > 0) {
-        nb_deps -= 1;
+    var nb_initialized = dyn_objects_init_indices.items.len;
+    while (nb_initialized > 0) {
+        nb_initialized -= 1;
 
-        const dep_idx = dyn_object.deps_breadth_first.items[nb_deps];
+        const dep_idx = dyn_objects_init_indices.items[nb_initialized];
+        if (std.mem.findScalar(usize, dyn_object.deps_breadth_first.items, dep_idx) == null) {
+            continue;
+        }
         const dep_dyn_object = &dyn_objects.values()[dep_idx];
 
         if (dep_dyn_object.ref_count != 0 or !dep_dyn_object.init_called) {
