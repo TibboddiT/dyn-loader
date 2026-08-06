@@ -542,15 +542,15 @@ fn logSummary() void {
             Logger.debug("    version: {s}", .{sym.version});
             Logger.debug("    hidden: {}", .{sym.hidden});
             Logger.debug("    offset: 0x{x}", .{sym.offset});
-            if (@intFromEnum(sym.type) <= 6) {
+            if (@backingInt(sym.type) <= 6) {
                 Logger.debug("    type: {s}", .{@tagName(sym.type)});
             } else {
-                Logger.debug("    type: {d}", .{@intFromEnum(sym.type)});
+                Logger.debug("    type: {d}", .{@backingInt(sym.type)});
             }
-            if (@intFromEnum(sym.bind) <= 2) {
+            if (@backingInt(sym.bind) <= 2) {
                 Logger.debug("    bind: {s}", .{@tagName(sym.bind)});
             } else {
-                Logger.debug("    bind: {d}", .{@intFromEnum(sym.bind)});
+                Logger.debug("    bind: {d}", .{@backingInt(sym.bind)});
             }
             Logger.debug("    shidx: {s}", .{sym.sectionNameOrValue(&buf) catch unreachable});
             Logger.debug("    value: 0x{x}", .{sym.value});
@@ -952,19 +952,19 @@ fn loadDepTree(o_path: []const u8, root_runpath: ?[]const u8, root_origin_dir: ?
 fn validateSupportedElfHeader(path: []const u8, eh: *const std.elf.Elf64_Ehdr) !void {
     if (!std.mem.eql(u8, eh.e_ident[0..4], std.elf.MAGIC)) return error.NotAnElfFile;
     if (eh.e_ident[std.elf.EI_CLASS] != std.elf.ELFCLASS64) {
-        Logger.err("unsupported ELF class for {s}: class={d} data={d} version={d} type={} machine=0x{x} expected_machine=0x{x}", .{ path, eh.e_ident[std.elf.EI_CLASS], eh.e_ident[std.elf.EI_DATA], eh.e_ident[std.elf.EI_VERSION], eh.e_type, @intFromEnum(eh.e_machine), @intFromEnum(std.elf.EM.X86_64) });
+        Logger.err("unsupported ELF class for {s}: class={d} data={d} version={d} type={} machine=0x{x} expected_machine=0x{x}", .{ path, eh.e_ident[std.elf.EI_CLASS], eh.e_ident[std.elf.EI_DATA], eh.e_ident[std.elf.EI_VERSION], eh.e_type, @backingInt(eh.e_machine), @backingInt(std.elf.EM.X86_64) });
         return error.UnsupportedElfClass;
     }
     if (eh.e_ident[std.elf.EI_DATA] != std.elf.ELFDATA2LSB) {
-        Logger.err("unsupported ELF data encoding for {s}: class={d} data={d} version={d} type={} machine=0x{x} expected_machine=0x{x}", .{ path, eh.e_ident[std.elf.EI_CLASS], eh.e_ident[std.elf.EI_DATA], eh.e_ident[std.elf.EI_VERSION], eh.e_type, @intFromEnum(eh.e_machine), @intFromEnum(std.elf.EM.X86_64) });
+        Logger.err("unsupported ELF data encoding for {s}: class={d} data={d} version={d} type={} machine=0x{x} expected_machine=0x{x}", .{ path, eh.e_ident[std.elf.EI_CLASS], eh.e_ident[std.elf.EI_DATA], eh.e_ident[std.elf.EI_VERSION], eh.e_type, @backingInt(eh.e_machine), @backingInt(std.elf.EM.X86_64) });
         return error.UnsupportedElfEndian;
     }
     if (eh.e_machine != std.elf.EM.X86_64) {
-        Logger.err("unsupported ELF machine for {s}: class={d} data={d} version={d} type={} machine=0x{x} expected_machine=0x{x}", .{ path, eh.e_ident[std.elf.EI_CLASS], eh.e_ident[std.elf.EI_DATA], eh.e_ident[std.elf.EI_VERSION], eh.e_type, @intFromEnum(eh.e_machine), @intFromEnum(std.elf.EM.X86_64) });
+        Logger.err("unsupported ELF machine for {s}: class={d} data={d} version={d} type={} machine=0x{x} expected_machine=0x{x}", .{ path, eh.e_ident[std.elf.EI_CLASS], eh.e_ident[std.elf.EI_DATA], eh.e_ident[std.elf.EI_VERSION], eh.e_type, @backingInt(eh.e_machine), @backingInt(std.elf.EM.X86_64) });
         return error.UnsupportedElfMachine;
     }
     if (eh.e_type != .DYN) {
-        Logger.err("unsupported ELF type for {s}: class={d} data={d} version={d} type={} machine=0x{x} expected_type={}", .{ path, eh.e_ident[std.elf.EI_CLASS], eh.e_ident[std.elf.EI_DATA], eh.e_ident[std.elf.EI_VERSION], eh.e_type, @intFromEnum(eh.e_machine), std.elf.ET.DYN });
+        Logger.err("unsupported ELF type for {s}: class={d} data={d} version={d} type={} machine=0x{x} expected_type={}", .{ path, eh.e_ident[std.elf.EI_CLASS], eh.e_ident[std.elf.EI_DATA], eh.e_ident[std.elf.EI_VERSION], eh.e_type, @backingInt(eh.e_machine), std.elf.ET.DYN });
         return error.UnsupportedElfType;
     }
 }
@@ -1328,7 +1328,7 @@ fn loadDso(o_path: []const u8, root_runpath: ?[]const u8, root_origin_dir: ?[]co
                 => {},
                 std.elf.SHT.GNU_HASH => Logger.debug("    == TODO: section type GNU_HASH: {s}", .{name}),
                 else => |t| {
-                    Logger.debug("    == TODO: section type {s}: {s}", .{ if (@intFromEnum(t) <= 19) @tagName(t) else try std.fmt.bufPrint(&scratch_buf, "0x{x}", .{t}), name });
+                    Logger.debug("    == TODO: section type {s}: {s}", .{ if (@backingInt(t) <= 19) @tagName(t) else try std.fmt.bufPrint(&scratch_buf, "0x{x}", .{t}), name });
                 },
             }
         }
@@ -1534,7 +1534,7 @@ fn loadDso(o_path: []const u8, root_runpath: ?[]const u8, root_origin_dir: ?[]co
                     var curr_def: *std.elf.Verdef = @ptrFromInt(ver_table_cursor);
 
                     while (true) {
-                        if (curr_def.ndx == @as(std.elf.VER_NDX, @enumFromInt(ver_idx.?))) {
+                        if (curr_def.ndx == @as(std.elf.VER_NDX, @fromBackingInt(@intCast(ver_idx.?)))) {
                             const aux: *std.elf.Verdaux = @ptrFromInt(ver_table_cursor + curr_def.aux);
 
                             version = std.mem.sliceTo(@as([*:0]const u8, @ptrCast(strs + aux.name)), 0);
@@ -1559,15 +1559,15 @@ fn loadDso(o_path: []const u8, root_runpath: ?[]const u8, root_origin_dir: ?[]co
             Logger.debug("{s}    ver idx: {?d}", .{ dyn_object_name, if (ver_sym) |vs| vs.VERSION else null });
             Logger.debug("{s}    version: {s}", .{ dyn_object_name, version });
             Logger.debug("{s}    hidden: {}", .{ dyn_object_name, hidden });
-            if (@intFromEnum(sym.info.type) <= 6) {
+            if (@backingInt(sym.info.type) <= 6) {
                 Logger.debug("{s}    type: {s}", .{ dyn_object_name, @tagName(sym.info.type) });
             } else {
-                Logger.debug("{s}    type: {d}", .{ dyn_object_name, @intFromEnum(sym.info.type) });
+                Logger.debug("{s}    type: {d}", .{ dyn_object_name, @backingInt(sym.info.type) });
             }
-            if (@intFromEnum(sym.info.bind) <= 2) {
+            if (@backingInt(sym.info.bind) <= 2) {
                 Logger.debug("{s}    bind: {s}", .{ dyn_object_name, @tagName(sym.info.bind) });
             } else {
-                Logger.debug("{s}    bind: {d}", .{ dyn_object_name, @intFromEnum(sym.info.bind) });
+                Logger.debug("{s}    bind: {d}", .{ dyn_object_name, @backingInt(sym.info.bind) });
             }
             Logger.debug("{s}    value: 0x{x}", .{ dyn_object_name, sym.value });
             Logger.debug("{s}    sh idx: 0x{x}", .{ dyn_object_name, sym.shndx });
@@ -1809,13 +1809,13 @@ fn loadDso(o_path: []const u8, root_runpath: ?[]const u8, root_origin_dir: ?[]co
                     // logger.debug("           0x{x}: {d}", .{ rela_reloc_addr - file_addr, rela_reloc.r_type() });
                     Logger.debug("          - [{d}] rela reloc: {s}, sym: 0x{x}, offset: 0x{x}, addend: 0x{x}", .{
                         r,
-                        @tagName(@as(std.elf.R_X86_64, @enumFromInt(rela_reloc.r_type()))),
+                        @tagName(@as(std.elf.R_X86_64, @fromBackingInt(@intCast(rela_reloc.r_type())))),
                         rela_reloc.r_sym(),
                         rela_reloc.r_offset,
                         rela_reloc.r_addend,
                     });
 
-                    const reloc_type: std.elf.R_X86_64 = @enumFromInt(rela_reloc.r_type());
+                    const reloc_type: std.elf.R_X86_64 = @fromBackingInt(@intCast(rela_reloc.r_type()));
                     if (reloc_type == .RELATIVE) {
                         std.debug.assert(rela_reloc.r_addend != 0);
                         continue;
@@ -1844,21 +1844,21 @@ fn loadDso(o_path: []const u8, root_runpath: ?[]const u8, root_origin_dir: ?[]co
                     const plt_reloc: *std.elf.Elf64_Rela = @ptrFromInt(plt_reloc_addr);
                     Logger.debug("          - [{d}] plt reloc: {s}, sym: 0x{x}, offset: 0x{x}, addend: 0x{x}", .{
                         r,
-                        @tagName(@as(std.elf.R_X86_64, @enumFromInt(plt_reloc.r_type()))),
+                        @tagName(@as(std.elf.R_X86_64, @fromBackingInt(@intCast(plt_reloc.r_type())))),
                         plt_reloc.r_sym(),
                         plt_reloc.r_offset,
                         plt_reloc.r_addend,
                     });
 
                     try relocs.append(dll_allocator, .{
-                        .type = @as(std.elf.R_X86_64, @enumFromInt(plt_reloc.r_type())),
+                        .type = @as(std.elf.R_X86_64, @fromBackingInt(@intCast(plt_reloc.r_type()))),
                         .sym_idx = plt_reloc.r_sym(),
                         .is_relr = false,
                         .offset = plt_reloc.r_offset,
                         .addend = plt_reloc.r_addend,
                     });
 
-                    if (@as(std.elf.R_X86_64, @enumFromInt(plt_reloc.r_type())) == .RELATIVE) {
+                    if (@as(std.elf.R_X86_64, @fromBackingInt(@intCast(plt_reloc.r_type()))) == .RELATIVE) {
                         std.debug.assert(plt_reloc.r_addend != 0);
                     }
                 }
@@ -1903,12 +1903,12 @@ fn loadDso(o_path: []const u8, root_runpath: ?[]const u8, root_origin_dir: ?[]co
             }
         } else {
             Logger.debug("    => TODO: PT type {s}", .{pht_blk: {
-                if (@intFromEnum(ph.type) <= 8) {
+                if (@backingInt(ph.type) <= 8) {
                     break :pht_blk @tagName(ph.type);
                 } else if (ph.type == std.elf.PT.GNU_STACK) {
                     break :pht_blk "GNU_STACK";
                 }
-                break :pht_blk try std.fmt.bufPrint(&scratch_buf, "0x{x}", .{@intFromEnum(ph.type)});
+                break :pht_blk try std.fmt.bufPrint(&scratch_buf, "0x{x}", .{@backingInt(ph.type)});
             }});
         }
     }
@@ -2276,7 +2276,7 @@ fn processRelativeRelocationsFast(
         for (0..nb_entries) |r| {
             const rela_reloc_addr = rela_reloc_tbl_addr + r * rela_reloc_tbl_entry_size;
             const rela_reloc: *std.elf.Elf64_Rela = @ptrFromInt(rela_reloc_addr);
-            const reloc_type: std.elf.R_X86_64 = @enumFromInt(rela_reloc.r_type());
+            const reloc_type: std.elf.R_X86_64 = @fromBackingInt(@intCast(rela_reloc.r_type()));
             if (reloc_type != .RELATIVE) {
                 continue;
             }
@@ -3353,6 +3353,7 @@ fn processRelocations(dyn_object: *DynObject) !void {
     }
 
     // patch .plt.got
+    // TODO this whole branch is theoritically unnecessary, we keep it only temporarily to prove that fact
     if (dyn_object.plt_got_section_size > 0) {
         const PltGotEntry = packed struct {
             inst: u16,
@@ -3382,7 +3383,20 @@ fn processRelocations(dyn_object: *DynObject) !void {
                         break;
                     }
 
-                    Logger.debug(" => .PLT.GOT: sym: {s}, substitute addr: 0x{x}", .{ sym.name, substitute_addr.? });
+                    const loaded_target_addr = try vAddressToLoadedAddress(dyn_object, target_address, false);
+                    const actual_target: *const usize = @ptrFromInt(loaded_target_addr);
+
+                    if (actual_target.* == substitute_addr.?) {
+                        @branchHint(.likely);
+                        break;
+                    }
+
+                    Logger.warn(".PLT.GOT target mismatch for {s}: relocation {s}, actual 0x{x}, expected 0x{x}; patching executable stub", .{
+                        sym.name,
+                        @tagName(r.type),
+                        actual_target.*,
+                        substitute_addr.?,
+                    });
 
                     // replace `jmp *{offset}(%rip)`
 
