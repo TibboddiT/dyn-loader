@@ -652,7 +652,7 @@ fn appendLdExpansions(list: *std.ArrayList([]const u8), value: []const u8, origi
     }
 
     if (std.mem.find(u8, expanded, "$PLATFORM")) |idx| {
-        const platform_ptr = std.os.linux.getauxval(std.elf.AT_PLATFORM);
+        const platform_ptr = std.os.linux.getauxval(std.elf.AT.PLATFORM);
         const platform = if (platform_ptr == 0) try dll_allocator.dupe(u8, "x86_64") else try dll_allocator.dupe(u8, std.mem.span(@as([*:0]const u8, @ptrFromInt(platform_ptr))));
         defer dll_allocator.free(platform);
         @memcpy(expanded_tmp_buf[0..expanded.len], expanded);
@@ -660,7 +660,7 @@ fn appendLdExpansions(list: *std.ArrayList([]const u8), value: []const u8, origi
     }
 
     if (std.mem.find(u8, expanded, "${PLATFORM}")) |idx| {
-        const platform_ptr = std.os.linux.getauxval(std.elf.AT_PLATFORM);
+        const platform_ptr = std.os.linux.getauxval(std.elf.AT.PLATFORM);
         const platform = if (platform_ptr == 0) try dll_allocator.dupe(u8, "x86_64") else try dll_allocator.dupe(u8, std.mem.span(@as([*:0]const u8, @ptrFromInt(platform_ptr))));
         defer dll_allocator.free(platform);
         @memcpy(expanded_tmp_buf[0..expanded.len], expanded);
