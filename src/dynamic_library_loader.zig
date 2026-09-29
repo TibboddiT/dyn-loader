@@ -38,6 +38,7 @@ const DynSym = struct {
     name: []const u8,
     version: []const u8,
     hidden: bool,
+    default_version: bool,
     offset: usize,
     type: std.elf.STT,
     bind: std.elf.STB,
@@ -1578,6 +1579,7 @@ fn loadDso(o_path: []const u8, root_runpath: ?[]const u8, root_origin_dir: ?[]co
             .name = name,
             .version = version,
             .hidden = hidden,
+            .default_version = if (ver_sym) |vs| !vs.HIDDEN else true,
             .offset = j * @sizeOf(std.elf.Sym),
             .type = sym.info.type,
             .bind = sym.info.bind,
@@ -3965,7 +3967,11 @@ fn resolveSymbol(dyn_object: *DynObject, sym_idx: usize) !ResolvedSymbol {
         if (dep_object.syms.get(sym.name)) |dep_sym_list| {
             for (dep_sym_list.items) |dep_sym_idx| {
                 const dep_sym = dep_object.syms_array.items[dep_sym_idx];
-                if (dep_sym.shidx != std.elf.SHN_UNDEF and (dep_sym.version.len == 0 or std.mem.eql(u8, dep_sym.version, "GLOBAL") or std.mem.eql(u8, dep_sym.version, sym.version)) and !dep_sym.hidden) {
+                const unversioned = sym.version.len == 0 or std.mem.eql(u8, sym.version, "GLOBAL") or
+                    (sym.shidx == std.elf.SHN_UNDEF and sym.bind != .LOCAL and std.mem.eql(u8, sym.version, "LOCAL"));
+                const version_matches = dep_sym.version.len == 0 or std.mem.eql(u8, dep_sym.version, "GLOBAL") or
+                    std.mem.eql(u8, dep_sym.version, sym.version) or (unversioned and dep_sym.default_version);
+                if (dep_sym.shidx != std.elf.SHN_UNDEF and version_matches and !dep_sym.hidden) {
                     if (dep_sym.bind == .WEAK) {
                         Logger.debug("WARNING: WEAK SYMBOL from dep: {s}", .{if (sym_idx == 0) "ZERO" else dep_sym.name});
                     }
@@ -4007,7 +4013,7 @@ fn resolveSymbol(dyn_object: *DynObject, sym_idx: usize) !ResolvedSymbol {
 
                 if (dep_sym.shidx == std.elf.SHN_UNDEF) Logger.debug("WARNING: SKIPPING UNDEF SYMBOL from dep: {s} | {s}@{s}", .{ dep_object.name, dep_sym.name, dep_sym.version });
                 if (dep_sym.hidden) Logger.debug("WARNING: SKIPPING HIDDEN SYMBOL from dep: {s} | {s}@{s}", .{ dep_object.name, dep_sym.name, dep_sym.version });
-                if (dep_sym.version.len != 0 and !std.mem.eql(u8, dep_sym.version, "GLOBAL") and !std.mem.eql(u8, dep_sym.version, sym.version)) Logger.debug("WARNING: SKIPPING MISVERSIONED SYMBOL from dep: {s} | {s} ({s} vs {s})", .{ dep_object.name, dep_sym.name, sym.version, dep_sym.version });
+                if (!version_matches) Logger.debug("WARNING: SKIPPING MISVERSIONED SYMBOL from dep: {s} | {s} ({s} vs {s})", .{ dep_object.name, dep_sym.name, sym.version, dep_sym.version });
             }
         }
     }
