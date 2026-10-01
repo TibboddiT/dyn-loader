@@ -872,7 +872,7 @@ fn loadWithRootResolveContext(f_path: []const u8, root_runpath: ?[]const u8, roo
             dl_phdr_info.* = .{
                 .addr = dyn_obj.loaded_at.?,
                 .name = owned_path_z.ptr,
-                .phdr = @ptrFromInt(dyn_obj.loaded_at.? + dyn_obj.eh.e_phoff),
+                .phdr = @ptrFromInt(dyn_obj.mapped_at + dyn_obj.eh.e_phoff),
                 .phnum = dyn_obj.eh.e_phnum,
             };
 
@@ -1191,6 +1191,148 @@ fn reuseRetiredObjectSlot(key: DynObjectId, path: []const u8) void {
     }
 }
 
+fn checkedFileRange(bytes: []const u8, offset: usize, size: usize) ![]const u8 {
+    if (offset > bytes.len or size > bytes.len - offset) return error.InvalidElfFileRange;
+    return bytes[offset..][0..size];
+}
+
+fn elfProgramHeaders(bytes: []const u8, eh: *const std.elf.Elf64_Ehdr) ![]align(1) const std.elf.Elf64.Phdr {
+    if (eh.e_phentsize != @sizeOf(std.elf.Elf64.Phdr)) return error.InvalidProgramHeaderSize;
+    const table = try checkedFileRange(bytes, eh.e_phoff, @as(usize, eh.e_phnum) * @sizeOf(std.elf.Elf64.Phdr));
+    return std.mem.bytesAsSlice(std.elf.Elf64.Phdr, table);
+}
+
+fn elfVirtualFileRange(bytes: []const u8, phdrs: []align(1) const std.elf.Elf64.Phdr, address: usize, size: usize) ![]const u8 {
+    for (phdrs) |ph| {
+        if (ph.type != .LOAD or address < ph.vaddr) continue;
+        const offset = address - ph.vaddr;
+        if (offset > ph.filesz or size > ph.filesz - offset) continue;
+        const file_offset = std.math.add(usize, ph.offset, offset) catch return error.InvalidElfFileRange;
+        return checkedFileRange(bytes, file_offset, size);
+    }
+
+    return error.AddressNotInFileSegments;
+}
+
+fn validateElfMemoryRange(phdrs: []align(1) const std.elf.Elf64.Phdr, address: usize, size: usize, access: enum { write, execute }) !void {
+    for (phdrs) |ph| {
+        if (ph.type != .LOAD or address < ph.vaddr) continue;
+        const offset = address - ph.vaddr;
+        if (offset <= ph.memsz and size <= ph.memsz - offset) {
+            if (access == .write and !ph.flags.W) return error.UnsupportedTextRelocation;
+            if (access == .execute and !ph.flags.X) return error.InvalidRelocationResolver;
+            return;
+        }
+    }
+
+    return error.AddressNotInMappedSegments;
+}
+
+fn elfDynamicEntries(bytes: []const u8, phdrs: []align(1) const std.elf.Elf64.Phdr, ph: std.elf.Elf64.Phdr) ![]align(1) const std.elf.Dyn {
+    if (ph.filesz % @sizeOf(std.elf.Dyn) != 0) return error.InvalidDynamicSection;
+    const table = try checkedFileRange(bytes, ph.offset, ph.filesz);
+    if ((try elfVirtualFileRange(bytes, phdrs, ph.vaddr, ph.filesz)).ptr != table.ptr) return error.InvalidDynamicSection;
+    const entries = std.mem.bytesAsSlice(std.elf.Dyn, table);
+    for (entries, 0..) |entry, idx| {
+        if (entry.d_tag == std.elf.DT_NULL) return entries[0..idx];
+    }
+
+    return error.UnterminatedDynamicSection;
+}
+
+const RelocationTable = struct {
+    address: ?usize = null,
+    size: ?usize = null,
+    entry_size: ?usize = null,
+
+    fn entries(table: RelocationTable, comptime T: type, bytes: []const u8, phdrs: []align(1) const std.elf.Elf64.Phdr) ![]align(1) const T {
+        if (table.entry_size) |size| {
+            if (size != @sizeOf(T)) return error.InvalidRelocationEntrySize;
+        }
+
+        const size = table.size orelse {
+            if (table.address != null) return error.MissingRelocationTableSize;
+            return &.{};
+        };
+
+        if (size == 0) return &.{};
+
+        const address = table.address orelse return error.MissingRelocationTableAddress;
+        if (table.entry_size == null) return error.MissingRelocationEntrySize;
+        if (size % @sizeOf(T) != 0) return error.InvalidRelocationTableSize;
+
+        return std.mem.bytesAsSlice(T, try elfVirtualFileRange(bytes, phdrs, address, size));
+    }
+};
+
+fn appendRelaRelocations(relocs: *RelocList, entries: []align(1) const std.elf.Elf64_Rela, phdrs: []align(1) const std.elf.Elf64.Phdr, sym_count: usize) !void {
+    for (entries) |entry| {
+        const kind: std.elf.R_X86_64 = switch (entry.r_type()) {
+            @backingInt(std.elf.R_X86_64.NONE) => continue,
+            inline @backingInt(std.elf.R_X86_64.RELATIVE),
+            @backingInt(std.elf.R_X86_64.@"64"),
+            @backingInt(std.elf.R_X86_64.GLOB_DAT),
+            @backingInt(std.elf.R_X86_64.JUMP_SLOT),
+            @backingInt(std.elf.R_X86_64.TPOFF64),
+            @backingInt(std.elf.R_X86_64.DTPOFF64),
+            @backingInt(std.elf.R_X86_64.DTPMOD64),
+            @backingInt(std.elf.R_X86_64.TLSDESC),
+            @backingInt(std.elf.R_X86_64.IRELATIVE),
+            => |value| @fromBackingInt(value),
+            else => {
+                Logger.err("unsupported relocation type: 0x{x}", .{entry.r_type()});
+                return error.UnsupportedRelocationType;
+            },
+        };
+
+        if (entry.r_sym() >= sym_count) return error.InvalidSymbolIndex;
+        if ((kind == .RELATIVE or kind == .IRELATIVE) and entry.r_sym() != 0) return error.InvalidRelocationSymbol;
+
+        try validateElfMemoryRange(phdrs, entry.r_offset, if (kind == .TLSDESC) @sizeOf(TlsDesc) else @sizeOf(usize), .write);
+
+        if (kind == .IRELATIVE) {
+            const resolver = std.math.cast(usize, entry.r_addend) orelse return error.InvalidRelocationAddend;
+            try validateElfMemoryRange(phdrs, resolver, 1, .execute);
+        }
+
+        Logger.debug("  RELA: {s}, sym: 0x{x}, offset: 0x{x}, addend: 0x{x}", .{ @tagName(kind), entry.r_sym(), entry.r_offset, entry.r_addend });
+
+        try relocs.append(dll_allocator, .{
+            .type = kind,
+            .is_relr = false,
+            .sym_idx = entry.r_sym(),
+            .offset = entry.r_offset,
+            .addend = entry.r_addend,
+        });
+    }
+}
+
+fn appendRelrRelocations(relocs: *RelocList, entries: []align(1) const std.elf.Elf64_Relr, phdrs: []align(1) const std.elf.Elf64.Phdr) !void {
+    var next: ?usize = null;
+    for (entries) |entry| {
+        if (entry & 1 == 0) {
+            try appendRelrTarget(relocs, phdrs, entry);
+            next = std.math.add(usize, entry, @sizeOf(usize)) catch return error.InvalidRelrAddress;
+        } else {
+            const start = next orelse return error.InvalidRelrBitmap;
+            next = std.math.add(usize, start, 63 * @sizeOf(usize)) catch return error.InvalidRelrAddress;
+            for (0..63) |bit| {
+                if ((entry >> @as(u6, @intCast(bit + 1))) & 1 != 0) {
+                    try appendRelrTarget(relocs, phdrs, start + bit * @sizeOf(usize));
+                }
+            }
+        }
+    }
+}
+
+fn appendRelrTarget(relocs: *RelocList, phdrs: []align(1) const std.elf.Elf64.Phdr, address: usize) !void {
+    try validateElfMemoryRange(phdrs, address, @sizeOf(usize), .write);
+
+    Logger.debug("  RELR: offset: 0x{x}", .{address});
+
+    try relocs.append(dll_allocator, .{ .type = .RELATIVE, .is_relr = true, .sym_idx = 0, .offset = address, .addend = 0 });
+}
+
 fn loadDso(o_path: []const u8, root_runpath: ?[]const u8, root_origin_dir: ?[]const u8) !usize {
     var scratch_buf: [1024]u8 = undefined;
 
@@ -1231,11 +1373,13 @@ fn loadDso(o_path: []const u8, root_runpath: ?[]const u8, root_origin_dir: ?[]co
         return dyn_objects.getIndex(dyn_object_key).?;
     };
 
+    if (size < @sizeOf(std.elf.Elf64_Ehdr)) return error.InvalidElfFileRange;
+
     Logger.debug("loading: {s} [{s}]", .{ o_path, path });
 
     const file_bytes = try std.posix.mmap(
         null,
-        std.mem.alignForward(usize, size, std.heap.pageSize()),
+        size,
         .{ .READ = true },
         .{ .TYPE = .PRIVATE },
         f.handle,
@@ -1247,6 +1391,19 @@ fn loadDso(o_path: []const u8, root_runpath: ?[]const u8, root_origin_dir: ?[]co
 
     const eh: *std.elf.Elf64_Ehdr = @ptrCast(file_bytes);
     try validateSupportedElfHeader(path, eh);
+
+    const phdrs = try elfProgramHeaders(file_bytes, eh);
+    if (eh.e_phoff % @alignOf(std.elf.Elf64.Phdr) != 0) return error.InvalidProgramHeaderAlignment;
+    for (phdrs) |ph| {
+        if (ph.type == .LOAD) {
+            if (ph.filesz > ph.memsz) return error.InvalidLoadSegment;
+            _ = try checkedFileRange(file_bytes, ph.offset, ph.filesz);
+            _ = std.math.add(usize, ph.vaddr, ph.memsz) catch return error.InvalidLoadSegment;
+        }
+    }
+    if (eh.e_shentsize != @sizeOf(std.elf.Elf64.Shdr) or eh.e_shstrndx >= eh.e_shnum) return error.InvalidSectionHeaders;
+    if (eh.e_shoff % @alignOf(std.elf.Elf64.Shdr) != 0) return error.InvalidSectionHeaders;
+    _ = try checkedFileRange(file_bytes, eh.e_shoff, @as(usize, eh.e_shnum) * @sizeOf(std.elf.Elf64.Shdr));
 
     if (!dyn_objects.contains(dyn_object_key)) {
         const owned_name = try dll_allocator.dupe(u8, dyn_object_name);
@@ -1267,6 +1424,7 @@ fn loadDso(o_path: []const u8, root_runpath: ?[]const u8, root_origin_dir: ?[]co
 
     const sh_section_strtbl_addr = file_addr + eh.e_shoff + (eh.e_shstrndx * eh.e_shentsize);
     const sh_strtbl: *std.elf.Shdr = @ptrFromInt(sh_section_strtbl_addr);
+    _ = try checkedFileRange(file_bytes, sh_strtbl.sh_offset, sh_strtbl.sh_size);
     const sh_strtab_addr: usize = file_addr + sh_strtbl.sh_offset;
 
     var maybe_dyn_strtab_addr: ?usize = null;
@@ -1309,6 +1467,9 @@ fn loadDso(o_path: []const u8, root_runpath: ?[]const u8, root_origin_dir: ?[]co
         sh_addr += eh.e_shentsize;
     }) {
         const sh: *std.elf.Elf64.Shdr = @ptrFromInt(sh_addr);
+
+        if (sh.type != .NOBITS) _ = try checkedFileRange(file_bytes, sh.offset, sh.size);
+
         const name: [*:0]const u8 = @ptrFromInt(sh_strtab_addr + sh.name);
         Logger.debug("  - {d}:", .{i});
         Logger.debug("    name: {s}", .{name});
@@ -1375,7 +1536,7 @@ fn loadDso(o_path: []const u8, root_runpath: ?[]const u8, root_origin_dir: ?[]co
             }
         } else if (sh.type == std.elf.SHT.PROGBITS) {
             if (std.mem.eql(u8, std.mem.sliceTo(name, 0), ".plt.got")) {
-                plt_got_addr = sh.offset;
+                plt_got_addr = sh.addr;
                 plt_got_size = sh.size;
             } else {
                 // Logger.debug("    == TODO: PROGBITS: {s}", .{std.mem.sliceTo(name, 0)});
@@ -1417,11 +1578,11 @@ fn loadDso(o_path: []const u8, root_runpath: ?[]const u8, root_origin_dir: ?[]co
 
         if (ph.type == .DYNAMIC) {
             found_dynamic = true;
-            dyn_addr = file_addr + ph.offset;
-            const dyns: [*]std.elf.Dyn = @ptrFromInt(dyn_addr);
+            dyn_addr = ph.vaddr;
+            const dyns = try elfDynamicEntries(file_bytes, phdrs, ph.*);
 
             var runpath_scan_idx: usize = 0;
-            while (dyns[runpath_scan_idx].d_tag != 0) : (runpath_scan_idx += 1) {
+            while (runpath_scan_idx < dyns.len) : (runpath_scan_idx += 1) {
                 if (dyns[runpath_scan_idx].d_tag == std.elf.DT_RUNPATH) {
                     const runpath_z: [*:0]const u8 = @ptrFromInt(dyn_strtab_addr + dyns[runpath_scan_idx].d_val);
                     dyn_runpath = std.mem.span(runpath_z);
@@ -1434,7 +1595,7 @@ fn loadDso(o_path: []const u8, root_runpath: ?[]const u8, root_origin_dir: ?[]co
 
             var has_unloaded_deps = false;
             var j: usize = 0;
-            while (dyns[j].d_tag != 0) : (j += 1) {
+            while (j < dyns.len) : (j += 1) {
                 if (dyns[j].d_tag == std.elf.DT_NEEDED) {
                     libName = @ptrFromInt(dyn_strtab_addr + dyns[j].d_val);
 
@@ -1536,6 +1697,7 @@ fn loadDso(o_path: []const u8, root_runpath: ?[]const u8, root_origin_dir: ?[]co
 
     if (!found_dynamic) {
         Logger.err("no PT_DYNAMIC segment for {s} => {s}", .{ dyn_object_name, path });
+        return error.DynamicSectionNotFound;
     }
 
     const dyn_symtab_addr = maybe_dyn_symtab_addr orelse {
@@ -1698,13 +1860,6 @@ fn loadDso(o_path: []const u8, root_runpath: ?[]const u8, root_origin_dir: ?[]co
     var fini_array_addr: usize = 0;
     var fini_array_size: usize = 0;
 
-    var rela_reloc_tbl_addr: usize = 0;
-    var rela_reloc_tbl_size: usize = 0;
-    var rela_reloc_tbl_entry_size: usize = 0;
-    var relr_reloc_tbl_addr: usize = 0;
-    var relr_reloc_tbl_size: usize = 0;
-    var relr_reloc_tbl_entry_size: usize = 0;
-
     ph_addr = file_addr + eh.e_phoff;
 
     i = 0;
@@ -1777,59 +1932,56 @@ fn loadDso(o_path: []const u8, root_runpath: ?[]const u8, root_origin_dir: ?[]co
             eh_init_mem_size = ph.memsz;
             eh_align = ph.@"align";
         } else if (ph.type == .DYNAMIC) {
-            dyn_addr = file_addr + ph.offset;
-            const dyns: [*]std.elf.Dyn = @ptrFromInt(dyn_addr);
+            dyn_addr = ph.vaddr;
+            const dyns = try elfDynamicEntries(file_bytes, phdrs, ph.*);
 
             var runpath: [*:0]u8 = undefined;
 
             var rela_reloc_nb_entry: usize = 0;
-
+            var rela_table: RelocationTable = .{};
+            var relr_table: RelocationTable = .{};
+            var plt_table: RelocationTable = .{ .entry_size = @sizeOf(std.elf.Elf64_Rela) };
             var plt_reloc_type: usize = 0;
-            var plt_reloc_tbl_size: usize = 0;
-            var plt_reloc_tbl_addr: usize = 0;
 
             var dt_plt_got_addr: usize = 0;
 
             var j: usize = 0;
-            while (dyns[j].d_tag != 0) : (j += 1) {
+            while (j < dyns.len) : (j += 1) {
                 Logger.debug("      DT type 0x{x}: 0x{x}", .{ dyns[j].d_tag, dyns[j].d_val });
 
                 if (dyns[j].d_tag == std.elf.DT_RUNPATH) {
                     runpath = @ptrFromInt(dyn_strtab_addr + dyns[j].d_val);
                     Logger.debug("        => lib RUNPATH: {s}", .{runpath});
                 } else if (dyns[j].d_tag == std.elf.DT_RELA) {
-                    rela_reloc_tbl_addr = file_addr + dyns[j].d_val;
-                    Logger.debug("        => rela reloc table addr: 0x{x}", .{rela_reloc_tbl_addr});
+                    rela_table.address = dyns[j].d_val;
+                    Logger.debug("        => rela reloc table vaddr: 0x{x}", .{rela_table.address.?});
                 } else if (dyns[j].d_tag == std.elf.DT_RELASZ) {
-                    rela_reloc_tbl_size = dyns[j].d_val;
-                    Logger.debug("        => rela reloc table size: 0x{x}", .{rela_reloc_tbl_size});
+                    rela_table.size = dyns[j].d_val;
                 } else if (dyns[j].d_tag == std.elf.DT_RELAENT) {
-                    rela_reloc_tbl_entry_size = dyns[j].d_val;
-                    Logger.debug("        => rela reloc table entry size: 0x{x}", .{rela_reloc_tbl_entry_size});
+                    rela_table.entry_size = dyns[j].d_val;
                 } else if (dyns[j].d_tag == std.elf.DT_RELACOUNT) {
                     rela_reloc_nb_entry = dyns[j].d_val;
                     Logger.debug("        => rela reloc nb entry: {d}", .{rela_reloc_nb_entry});
                 } else if (dyns[j].d_tag == std.elf.DT_RELR) {
-                    relr_reloc_tbl_addr = file_addr + dyns[j].d_val;
-                    Logger.debug("        => relr reloc table addr: 0x{x}", .{relr_reloc_tbl_addr});
+                    relr_table.address = dyns[j].d_val;
+                    Logger.debug("        => relr reloc table vaddr: 0x{x}", .{relr_table.address.?});
                 } else if (dyns[j].d_tag == std.elf.DT_RELRSZ) {
-                    relr_reloc_tbl_size = dyns[j].d_val;
-                    Logger.debug("        => relr reloc table size: 0x{x}", .{relr_reloc_tbl_size});
+                    relr_table.size = dyns[j].d_val;
                 } else if (dyns[j].d_tag == std.elf.DT_RELRENT) {
-                    relr_reloc_tbl_entry_size = dyns[j].d_val;
-                    Logger.debug("        => relr reloc table entry size: 0x{x}", .{relr_reloc_tbl_entry_size});
+                    relr_table.entry_size = dyns[j].d_val;
+                } else if (dyns[j].d_tag == std.elf.DT_REL or dyns[j].d_tag == std.elf.DT_RELSZ) {
+                    if (dyns[j].d_val != 0) return error.UnsupportedRelocationFormat;
                 } else if (dyns[j].d_tag == std.elf.DT_PLTREL) {
                     plt_reloc_type = dyns[j].d_val;
                     Logger.debug("        => plt reloc type: 0x{x}", .{plt_reloc_type});
                 } else if (dyns[j].d_tag == std.elf.DT_PLTRELSZ) {
-                    plt_reloc_tbl_size = dyns[j].d_val;
-                    Logger.debug("        => plt reloc table size: 0x{x}", .{plt_reloc_tbl_size});
+                    plt_table.size = dyns[j].d_val;
                 } else if (dyns[j].d_tag == std.elf.DT_JMPREL) {
-                    plt_reloc_tbl_addr = file_addr + dyns[j].d_val;
-                    Logger.debug("        => plt reloc table addr: 0x{x}", .{plt_reloc_tbl_addr});
+                    plt_table.address = dyns[j].d_val;
+                    Logger.debug("        => plt reloc table vaddr: 0x{x}", .{plt_table.address.?});
                 } else if (dyns[j].d_tag == std.elf.DT_PLTGOT) {
-                    dt_plt_got_addr = file_addr + dyns[j].d_val;
-                    Logger.debug("        => plt got addr: 0x{x}", .{dt_plt_got_addr});
+                    dt_plt_got_addr = dyns[j].d_val;
+                    Logger.debug("        => plt got vaddr: 0x{x}", .{dt_plt_got_addr});
                 } else if (dyns[j].d_tag == std.elf.DT_INIT) {
                     init_addr = dyns[j].d_val;
                     Logger.debug("        => init addr: 0x{x}", .{init_addr});
@@ -1879,109 +2031,16 @@ fn loadDso(o_path: []const u8, root_runpath: ?[]const u8, root_origin_dir: ?[]co
                 }
             }
 
-            // TODO handle old Elf64_Rel relocs
-
-            if (rela_reloc_tbl_addr > 0) {
-                const nb_entries = rela_reloc_tbl_size / rela_reloc_tbl_entry_size;
-                Logger.debug("        => nb rela relocs: {d}", .{nb_entries});
-                for (0..nb_entries) |r| {
-                    const rela_reloc_addr = rela_reloc_tbl_addr + r * rela_reloc_tbl_entry_size;
-                    const rela_reloc: *std.elf.Elf64_Rela = @ptrFromInt(rela_reloc_addr);
-                    // logger.debug("           0x{x}: {d}", .{ rela_reloc_addr - file_addr, rela_reloc.r_type() });
-                    Logger.debug("          - [{d}] rela reloc: {s}, sym: 0x{x}, offset: 0x{x}, addend: 0x{x}", .{
-                        r,
-                        @tagName(@as(std.elf.R_X86_64, @fromBackingInt(@intCast(rela_reloc.r_type())))),
-                        rela_reloc.r_sym(),
-                        rela_reloc.r_offset,
-                        rela_reloc.r_addend,
-                    });
-
-                    const reloc_type: std.elf.R_X86_64 = @fromBackingInt(@intCast(rela_reloc.r_type()));
-                    if (reloc_type == .RELATIVE) {
-                        std.debug.assert(rela_reloc.r_addend != 0);
-                        continue;
-                    }
-
-                    try relocs.append(dll_allocator, .{
-                        .type = reloc_type,
-                        .is_relr = false,
-                        .sym_idx = rela_reloc.r_sym(),
-                        .offset = rela_reloc.r_offset,
-                        .addend = rela_reloc.r_addend,
-                    });
-                }
+            const rela_entries = try rela_table.entries(std.elf.Elf64_Rela, file_bytes, phdrs);
+            if (rela_reloc_nb_entry > rela_entries.len) return error.InvalidRelativeRelocationCount;
+            for (rela_entries[0..rela_reloc_nb_entry]) |entry| {
+                if (entry.r_type() != @backingInt(std.elf.R_X86_64.RELATIVE)) return error.InvalidRelativeRelocationCount;
             }
+            try appendRelaRelocations(&relocs, rela_entries, phdrs, dyn_sym_count);
 
-            if (plt_reloc_tbl_addr > 0) {
-                // TODO entry size might be rel_reloc_tabl_entry_size
-                const entry_size = rela_reloc_tbl_entry_size;
-
-                const nb_entries = plt_reloc_tbl_size / entry_size;
-                Logger.debug("        => nb plt relocs: {d}", .{nb_entries});
-                for (0..nb_entries) |r| {
-                    const plt_reloc_addr = plt_reloc_tbl_addr + r * entry_size;
-
-                    // TODO type might be std.elf.Elf64_Rel
-                    const plt_reloc: *std.elf.Elf64_Rela = @ptrFromInt(plt_reloc_addr);
-                    Logger.debug("          - [{d}] plt reloc: {s}, sym: 0x{x}, offset: 0x{x}, addend: 0x{x}", .{
-                        r,
-                        @tagName(@as(std.elf.R_X86_64, @fromBackingInt(@intCast(plt_reloc.r_type())))),
-                        plt_reloc.r_sym(),
-                        plt_reloc.r_offset,
-                        plt_reloc.r_addend,
-                    });
-
-                    try relocs.append(dll_allocator, .{
-                        .type = @as(std.elf.R_X86_64, @fromBackingInt(@intCast(plt_reloc.r_type()))),
-                        .sym_idx = plt_reloc.r_sym(),
-                        .is_relr = false,
-                        .offset = plt_reloc.r_offset,
-                        .addend = plt_reloc.r_addend,
-                    });
-
-                    if (@as(std.elf.R_X86_64, @fromBackingInt(@intCast(plt_reloc.r_type()))) == .RELATIVE) {
-                        std.debug.assert(plt_reloc.r_addend != 0);
-                    }
-                }
-            }
-
-            if (relr_reloc_tbl_addr > 0) {
-                const nb_entries = relr_reloc_tbl_size / relr_reloc_tbl_entry_size;
-                Logger.debug("        => nb relr relocs: {d}", .{nb_entries});
-
-                var next: std.elf.Elf64_Addr = undefined;
-
-                for (0..nb_entries) |r| {
-                    const relr_reloc_addr = relr_reloc_tbl_addr + r * relr_reloc_tbl_entry_size;
-                    const relr_reloc: *std.elf.Elf64_Relr = @ptrFromInt(relr_reloc_addr);
-
-                    if ((relr_reloc.* & 1) == 0) {
-                        Logger.debug("          - [{d}] relr reloc: {s}, sym: 0x{x}, offset: 0x{x}, addend: 0x{x}", .{
-                            r,
-                            "R_X86_64.RELATIVE",
-                            0,
-                            relr_reloc.*,
-                            0,
-                        });
-                        next = relr_reloc.* + @sizeOf(std.elf.Elf64_Addr);
-                    } else {
-                        for (0..(8 * @sizeOf(std.elf.Elf64_Addr) - 1)) |sr| {
-                            if (((relr_reloc.* >> @as(u6, @intCast(sr + 1))) & 1) != 0) {
-                                Logger.debug("          - [{d} - {d}] relr reloc: {s}, sym: 0x{x}, offset: 0x{x}, addend: 0x{x}", .{
-                                    r,
-                                    sr,
-                                    "R_X86_64.RELATIVE",
-                                    0,
-                                    next + sr * @sizeOf(std.elf.Elf64_Addr),
-                                    0,
-                                });
-                            }
-                        }
-
-                        next += @sizeOf(std.elf.Elf64_Addr) * (8 * @sizeOf(std.elf.Elf64_Addr) - 1);
-                    }
-                }
-            }
+            if ((plt_table.size orelse 0) != 0 and plt_reloc_type != std.elf.DT_RELA) return error.UnsupportedRelocationFormat;
+            try appendRelaRelocations(&relocs, try plt_table.entries(std.elf.Elf64_Rela, file_bytes, phdrs), phdrs, dyn_sym_count);
+            try appendRelrRelocations(&relocs, try relr_table.entries(std.elf.Elf64_Relr, file_bytes, phdrs), phdrs);
         } else {
             Logger.debug("    => TODO: PT type {s}", .{pht_blk: {
                 if (@backingInt(ph.type) <= 8) {
@@ -1992,6 +2051,15 @@ fn loadDso(o_path: []const u8, root_runpath: ?[]const u8, root_origin_dir: ?[]co
                 break :pht_blk try std.fmt.bufPrint(&scratch_buf, "0x{x}", .{@backingInt(ph.type)});
             }});
         }
+    }
+
+    if (init_array_size != 0) {
+        if (init_array_size % @sizeOf(usize) != 0) return error.InvalidInitArraySize;
+        _ = try elfVirtualFileRange(file_bytes, phdrs, init_array_addr, init_array_size);
+    }
+    if (fini_array_size != 0) {
+        if (fini_array_size % @sizeOf(usize) != 0) return error.InvalidFiniArraySize;
+        _ = try elfVirtualFileRange(file_bytes, phdrs, fini_array_addr, fini_array_size);
     }
 
     const do_entry = try dyn_objects.getOrPut(dll_allocator, dyn_object_key);
@@ -2097,15 +2165,7 @@ fn loadDso(o_path: []const u8, root_runpath: ?[]const u8, root_origin_dir: ?[]co
     file_open = false;
     dyn_object.file_handle = -1;
 
-    processRelativeRelocationsFast(
-        dyn_object,
-        rela_reloc_tbl_addr,
-        rela_reloc_tbl_size,
-        rela_reloc_tbl_entry_size,
-        relr_reloc_tbl_addr,
-        relr_reloc_tbl_size,
-        relr_reloc_tbl_entry_size,
-    );
+    processRelativeRelocationsFast(dyn_object);
 
     dyn_objects_sorted_indices.appendAssumeCapacity(dyn_objects.getIndex(dyn_object_key).?);
 
@@ -2355,55 +2415,13 @@ fn mapSegments(dyn_object: *DynObject, file_bytes: []const u8) !void {
     Logger.debug("successfully mapped {d} segments for {s} at base 0x{x}", .{ dyn_object.segments.count(), dyn_object.name, base_addr });
 }
 
-fn processRelativeRelocationsFast(
-    dyn_object: *DynObject,
-    rela_reloc_tbl_addr: usize,
-    rela_reloc_tbl_size: usize,
-    rela_reloc_tbl_entry_size: usize,
-    relr_reloc_tbl_addr: usize,
-    relr_reloc_tbl_size: usize,
-    relr_reloc_tbl_entry_size: usize,
-) void {
+fn processRelativeRelocationsFast(dyn_object: *DynObject) void {
     const base_addr = dyn_object.loaded_at.?;
+    for (dyn_object.relocs.items) |reloc| {
+        if (reloc.type != .RELATIVE) continue;
 
-    if (rela_reloc_tbl_addr > 0) {
-        const nb_entries = rela_reloc_tbl_size / rela_reloc_tbl_entry_size;
-        for (0..nb_entries) |r| {
-            const rela_reloc_addr = rela_reloc_tbl_addr + r * rela_reloc_tbl_entry_size;
-            const rela_reloc: *std.elf.Elf64_Rela = @ptrFromInt(rela_reloc_addr);
-            const reloc_type: std.elf.R_X86_64 = @fromBackingInt(@intCast(rela_reloc.r_type()));
-            if (reloc_type != .RELATIVE) {
-                continue;
-            }
-
-            const ptr: *usize = @ptrFromInt(base_addr + rela_reloc.r_offset);
-            ptr.* = base_addr + @as(usize, @intCast(rela_reloc.r_addend));
-        }
-    }
-
-    if (relr_reloc_tbl_addr > 0) {
-        const nb_entries = relr_reloc_tbl_size / relr_reloc_tbl_entry_size;
-        var next: std.elf.Elf64_Addr = undefined;
-
-        for (0..nb_entries) |r| {
-            const relr_reloc_addr = relr_reloc_tbl_addr + r * relr_reloc_tbl_entry_size;
-            const relr_reloc: *std.elf.Elf64_Relr = @ptrFromInt(relr_reloc_addr);
-
-            if ((relr_reloc.* & 1) == 0) {
-                const ptr: *usize = @ptrFromInt(base_addr + relr_reloc.*);
-                ptr.* = base_addr + ptr.*;
-                next = relr_reloc.* + @sizeOf(std.elf.Elf64_Addr);
-            } else {
-                for (0..(8 * @sizeOf(std.elf.Elf64_Addr) - 1)) |sr| {
-                    if (((relr_reloc.* >> @as(u6, @intCast(sr + 1))) & 1) != 0) {
-                        const ptr: *usize = @ptrFromInt(base_addr + next + sr * @sizeOf(std.elf.Elf64_Addr));
-                        ptr.* = base_addr + ptr.*;
-                    }
-                }
-
-                next += @sizeOf(std.elf.Elf64_Addr) * (8 * @sizeOf(std.elf.Elf64_Addr) - 1);
-            }
-        }
+        const ptr: *align(1) usize = @ptrFromInt(base_addr + reloc.offset);
+        ptr.* = base_addr +% if (reloc.is_relr) ptr.* else @as(usize, @bitCast(reloc.addend));
     }
 }
 
@@ -3373,25 +3391,18 @@ fn processRelocations(dyn_object: *DynObject) !void {
     var reloc_count: usize = 0;
 
     for (dyn_object.relocs.items) |reloc| {
-        const reloc_addr = try vAddressToLoadedAddress(dyn_object, reloc.offset, false);
-        const ptr: *usize = @ptrFromInt(reloc_addr);
+        if (reloc.type == .RELATIVE) continue; // applied by processRelativeRelocationsFast() after mapping
 
-        std.debug.assert(reloc.addend >= 0);
+        const reloc_addr = try vAddressToLoadedAddress(dyn_object, reloc.offset, false);
+        const ptr: *align(1) usize = @ptrFromInt(reloc_addr);
 
         switch (reloc.type) {
-            .RELATIVE => {
-                reloc_count += 1;
-                // R_X86_64_RELATIVE: B + A
-                const value = try vAddressToLoadedAddress(dyn_object, @as(usize, @intCast(reloc.addend)) + if (reloc.addend == 0) ptr.* else 0, true);
-                Logger.debug("  RELATIVE: 0x{x} (0x{x}): 0x{x} -> 0x{x} (addend: 0x{x}, relr: {})", .{ reloc_addr, reloc.offset, ptr.*, value, reloc.addend, reloc.is_relr });
-                ptr.* = value;
-            },
             .@"64" => {
                 reloc_count += 1;
                 // R_X86_64_64: S + A
                 const sym = try resolveSymbol(dyn_object, reloc.sym_idx);
                 const value = r64_blk: {
-                    if (reloc.addend != 0) break :r64_blk sym.address + @as(usize, @intCast(reloc.addend));
+                    if (reloc.addend != 0) break :r64_blk sym.address +% @as(usize, @bitCast(reloc.addend));
                     break :r64_blk if (getSubstituteAddress(sym, dyn_object, true)) |a| a else sym.address;
                 };
                 Logger.debug("  64: 0x{x} (0x{x}): 0x{x} -> 0x{x} (0x{x}, {s}@{s} + 0x{x})", .{ reloc_addr, reloc.offset, ptr.*, value, sym.value, sym.name, sym.version, reloc.addend });
@@ -3418,7 +3429,7 @@ fn processRelocations(dyn_object: *DynObject) !void {
                 // R_X86_64_TPOFF64: S + A (TLS offset)
                 const sym = try resolveSymbol(dyn_object, reloc.sym_idx);
                 const tls_offset = dyn_objects.values()[sym.dyn_object_idx].tls_offset;
-                const value = @as(isize, @intCast(sym.value)) + reloc.addend - @as(isize, @intCast(tls_offset));
+                const value = sym.value +% @as(usize, @bitCast(reloc.addend)) -% tls_offset;
                 Logger.debug("  TPOFF64: 0x{x} (0x{x}): 0x{x} -> 0x{x} (0x{x}, {s}@{s} - [MODULE_TLS_OFFSET]0x{x} + 0x{x})", .{
                     reloc_addr,
                     reloc.offset,
@@ -3436,7 +3447,7 @@ fn processRelocations(dyn_object: *DynObject) !void {
                 reloc_count += 1;
                 // R_X86_64_DTPOFF64: S + A
                 const sym = try resolveSymbol(dyn_object, reloc.sym_idx);
-                const value = @as(isize, @intCast(sym.value)) + reloc.addend;
+                const value = sym.value +% @as(usize, @bitCast(reloc.addend));
                 Logger.debug("  DTPOFF64: 0x{x} (0x{x}): 0x{x} -> 0x{x} (0x{x}, {s}@{s} + 0x{x})", .{
                     reloc_addr,
                     reloc.offset,
@@ -3473,7 +3484,7 @@ fn processRelocations(dyn_object: *DynObject) !void {
                 const sym = try resolveSymbol(dyn_object, reloc.sym_idx);
                 const tls_offset = dyn_objects.values()[sym.dyn_object_idx].tls_offset;
                 const value: TlsDesc = .{
-                    .tls_desc_resolver_arg = @as(isize, @intCast(sym.value)) + reloc.addend - @as(isize, @intCast(tls_offset)),
+                    .tls_desc_resolver_arg = @bitCast(sym.value +% @as(usize, @bitCast(reloc.addend)) -% tls_offset),
                     .tls_desc_resolver = &tlsDescResolver,
                 };
                 Logger.debug("  TLSDESC: 0x{x} (0x{x}): 0x{x} -> 0x{x} (0x{x}, {s}@{s} - [MODULE_TLS_OFFSET]0x{x} + 0x{x})", .{
@@ -3487,7 +3498,7 @@ fn processRelocations(dyn_object: *DynObject) !void {
                     dyn_object.tls_offset,
                     reloc.addend,
                 });
-                const casted_ptr: *TlsDesc = @ptrCast(ptr);
+                const casted_ptr: *align(1) TlsDesc = @ptrCast(ptr);
                 casted_ptr.* = value;
             },
             .IRELATIVE => {
@@ -3587,9 +3598,7 @@ fn processIRelativeRelocations(dyn_object: *DynObject) !void {
 
     for (dyn_object.relocs.items) |reloc| {
         const reloc_addr = try vAddressToLoadedAddress(dyn_object, reloc.offset, false);
-        const ptr: *usize = @ptrFromInt(reloc_addr);
-
-        std.debug.assert(reloc.addend >= 0);
+        const ptr: *align(1) usize = @ptrFromInt(reloc_addr);
 
         switch (reloc.type) {
             .RELATIVE, .@"64", .GLOB_DAT, .JUMP_SLOT, .TPOFF64, .DTPOFF64, .DTPMOD64, .TLSDESC => {},
@@ -4384,24 +4393,10 @@ fn vAddressToLoadedAddress(dyn_object: *DynObject, addr: usize, allow_outside: b
     return segment.loaded_at + addr - segment.mem_offset;
 }
 
-fn vAddressToFileAddress(dyn_object: *DynObject, addr: usize) !usize {
-    var containing_segment: ?*LoadSegment = null;
-    for (dyn_object.segments.values()) |*s| {
-        const segment_start = s.mem_offset;
-        const segment_end = segment_start + s.mem_size;
-        if (addr >= segment_start and addr < segment_end) {
-            containing_segment = s;
-            break;
-        }
-    }
-    if (containing_segment == null) {
-        Logger.err("addr 0x{x} not in any mapped segment", .{addr});
-        return error.AddressNotInMappedSegments;
-    }
-
-    const segment = containing_segment.?;
-
-    return dyn_object.mapped_at + addr - (segment.mem_offset - segment.file_offset);
+fn vAddressToFileAddress(dyn_object: *DynObject, addr: usize, size: usize) !usize {
+    const bytes = @as([*]const u8, @ptrFromInt(dyn_object.mapped_at))[0..dyn_object.mapped_size];
+    const phdrs = try elfProgramHeaders(bytes, dyn_object.eh);
+    return @intFromPtr((try elfVirtualFileRange(bytes, phdrs, addr, size)).ptr);
 }
 
 fn dumpSegments(dyn_obj: *DynObject) !void {
@@ -4465,8 +4460,11 @@ fn callInitFunctions(dyn_obj: *DynObject) !void {
     if (dyn_obj.init_array_addr != 0 and dyn_obj.init_array_size > 0) {
         const num_funcs = dyn_obj.init_array_size / @sizeOf(usize);
         Logger.debug("calling {d} init_array functions for {s} (0x{x})", .{ num_funcs, dyn_obj.name, dyn_obj.init_array_addr });
-        const initial_init_array: [*]const usize = @ptrFromInt(try vAddressToFileAddress(dyn_obj, dyn_obj.init_array_addr));
-        const actual_init_array: [*]const usize = @ptrFromInt(try vAddressToLoadedAddress(dyn_obj, dyn_obj.init_array_addr, false));
+
+        if (dyn_obj.init_array_size % @sizeOf(usize) != 0) return error.InvalidInitArraySize;
+
+        const initial_init_array: [*]align(1) const usize = @ptrFromInt(try vAddressToFileAddress(dyn_obj, dyn_obj.init_array_addr, dyn_obj.init_array_size));
+        const actual_init_array: [*]align(1) const usize = @ptrFromInt(try vAddressToLoadedAddress(dyn_obj, dyn_obj.init_array_addr, false));
 
         for (0..num_funcs) |i| {
             const initial_addr = initial_init_array[i];
@@ -4505,8 +4503,11 @@ fn callFiniFunctions(dyn_obj: *DynObject) !void {
     if (dyn_obj.fini_array_addr != 0 and dyn_obj.fini_array_size > 0) {
         const num_funcs = dyn_obj.fini_array_size / @sizeOf(usize);
         Logger.debug("calling {d} fini_array functions for {s} (0x{x})", .{ num_funcs, dyn_obj.name, dyn_obj.fini_array_addr });
-        const initial_fini_array: [*]const usize = @ptrFromInt(try vAddressToFileAddress(dyn_obj, dyn_obj.fini_array_addr));
-        const actual_fini_array: [*]const usize = @ptrFromInt(try vAddressToLoadedAddress(dyn_obj, dyn_obj.fini_array_addr, false));
+
+        if (dyn_obj.fini_array_size % @sizeOf(usize) != 0) return error.InvalidFiniArraySize;
+
+        const initial_fini_array: [*]align(1) const usize = @ptrFromInt(try vAddressToFileAddress(dyn_obj, dyn_obj.fini_array_addr, dyn_obj.fini_array_size));
+        const actual_fini_array: [*]align(1) const usize = @ptrFromInt(try vAddressToLoadedAddress(dyn_obj, dyn_obj.fini_array_addr, false));
 
         var i: usize = num_funcs;
         while (i > 0) {
@@ -5751,7 +5752,7 @@ fn dlIteratePhdrSubstitute(callback: *const fn (*anyopaque, c_uint, *anyopaque) 
         dl_phdr_info.* = .{
             .addr = dyn_obj.loaded_at.?,
             .name = owned_path_z.ptr,
-            .phdr = @ptrFromInt(dyn_obj.loaded_at.? + dyn_obj.eh.e_phoff),
+            .phdr = @ptrFromInt(dyn_obj.mapped_at + dyn_obj.eh.e_phoff),
             .phnum = dyn_obj.eh.e_phnum,
         };
 
