@@ -25,6 +25,8 @@ pub fn build(b: *std.Build) void {
 
     const check_step = b.step("check", "Check");
 
+    addExecutable(b, &resources_dir.step, check_step, dll_mod, target, optimize, false, "tests", "tests/main.zig");
+
     addExecutable(b, &resources_dir.step, check_step, dll_mod, target, optimize, false, "load_lib", "examples/load_lib.zig");
     addExecutable(b, &resources_dir.step, check_step, dll_mod, target, optimize, false, "printf", "examples/printf.zig");
     addExecutable(b, &resources_dir.step, check_step, dll_mod, target, optimize, false, "printf_musl", "examples/printf_musl.zig");
