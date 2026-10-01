@@ -2514,7 +2514,7 @@ fn computeTcbOffset(dyn_object: *DynObject) void {
 }
 
 // TODO global state
-var current_surplus_size: usize = 0x8000;
+var current_surplus_size: usize = 0x100000;
 var normal_current_tls_area_desc: ?@TypeOf(std.os.linux.tls.area_desc) = null;
 
 fn isLibcName(name: []const u8) bool {
