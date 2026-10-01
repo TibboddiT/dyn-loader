@@ -425,6 +425,7 @@ pub fn deinit() void {
     for (dyn_objects.values()) |*dyn_object| {
         dyn_object.binding_dependencies.deinit(dll_allocator);
         if (dyn_object.phdr_name) |name| dll_allocator.free(name);
+
         if (dyn_object.mapped_at != 0) {
             std.posix.munmap(@as([*]align(std.heap.pageSize()) u8, @ptrFromInt(dyn_object.mapped_at))[0..dyn_object.mapped_size]);
         }
@@ -807,8 +808,10 @@ fn loadWithRootResolveContext(f_path: []const u8, root_runpath: ?[]const u8, roo
         }
 
         const loaded_lib = try loadDepTree(f_path, root_runpath, root_origin_dir);
+
         const owned_cache_key = try dll_allocator.dupe(u8, f_path);
         errdefer dll_allocator.free(owned_cache_key);
+
         try load_request_cache.putNoClobber(dll_allocator, owned_cache_key, loaded_lib.index);
         break :blk loaded_lib;
     };
@@ -831,6 +834,7 @@ fn loadWithRootResolveContext(f_path: []const u8, root_runpath: ?[]const u8, roo
 
     const relocation_order = try dll_allocator.dupe(usize, dyn_objects_sorted_indices.items);
     defer dll_allocator.free(relocation_order);
+
     for (relocation_order) |idx| {
         const dyn_obj = &dyn_objects.values()[idx];
 
@@ -936,8 +940,6 @@ fn loadDepTree(o_path: []const u8, root_runpath: ?[]const u8, root_origin_dir: ?
         const do_count = dyn_objects.count();
 
         for (0..do_count) |dyn_object_idx| {
-            const dyn_object_path = dyn_objects.values()[dyn_object_idx].path;
-
             {
                 const dyn_object = &dyn_objects.values()[dyn_object_idx];
 
@@ -953,6 +955,7 @@ fn loadDepTree(o_path: []const u8, root_runpath: ?[]const u8, root_origin_dir: ?
 
             has_unloaded = true;
 
+            const dyn_object_path = dyn_objects.values()[dyn_object_idx].path;
             const idx = try loadDso(
                 if (dyn_object_idx == lib_idx) o_path else dyn_object_path,
                 if (dyn_object_idx == lib_idx) root_runpath else null,
@@ -1039,21 +1042,6 @@ fn findDynObjectIndexByName(name: []const u8) ?usize {
 
 // TODO mimic path resolution of linux-ld better
 fn resolvePath(requested_path: []const u8, check_mode: bool, requester_name: ?[]const u8, runpath: ?[]const u8, origin_dir: ?[]const u8) ![]const u8 {
-    const lib_dirs = [_][]const u8{
-        "/usr/local/lib/x86_64-linux-gnu",
-        "/lib/x86_64-linux-gnu",
-        "/usr/lib/x86_64-linux-gnu",
-        "/usr/lib/x86_64-linux-gnu64",
-        "/usr/local/lib64",
-        "/lib64",
-        "/usr/lib64",
-        "/usr/local/lib",
-        "/lib",
-        "/usr/lib",
-        "/usr/x86_64-linux-gnu/lib64",
-        "/usr/x86_64-linux-gnu/lib",
-    };
-
     // TODO max path len
     var buf: [std.fs.max_path_bytes]u8 = @splat(0);
 
@@ -1124,6 +1112,21 @@ fn resolvePath(requested_path: []const u8, check_mode: bool, requester_name: ?[]
             }
         }
     }
+
+    const lib_dirs = [_][]const u8{
+        "/usr/local/lib/x86_64-linux-gnu",
+        "/lib/x86_64-linux-gnu",
+        "/usr/lib/x86_64-linux-gnu",
+        "/usr/lib/x86_64-linux-gnu64",
+        "/usr/local/lib64",
+        "/lib64",
+        "/usr/lib64",
+        "/usr/local/lib",
+        "/lib",
+        "/usr/lib",
+        "/usr/x86_64-linux-gnu/lib64",
+        "/usr/x86_64-linux-gnu/lib",
+    };
 
     var path: ?[]const u8 = null;
     for (lib_dirs) |dir| {
@@ -1334,8 +1337,6 @@ fn appendRelrTarget(relocs: *RelocList, phdrs: []align(1) const std.elf.Elf64.Ph
 }
 
 fn loadDso(o_path: []const u8, root_runpath: ?[]const u8, root_origin_dir: ?[]const u8) !usize {
-    var scratch_buf: [1024]u8 = undefined;
-
     const path: []const u8 = if (std.mem.findScalar(u8, o_path, '/') != null) try dll_allocator.dupe(u8, o_path) else try resolvePath(o_path, false, null, root_runpath, root_origin_dir);
     defer dll_allocator.free(path);
 
@@ -1394,6 +1395,7 @@ fn loadDso(o_path: []const u8, root_runpath: ?[]const u8, root_origin_dir: ?[]co
 
     const phdrs = try elfProgramHeaders(file_bytes, eh);
     if (eh.e_phoff % @alignOf(std.elf.Elf64.Phdr) != 0) return error.InvalidProgramHeaderAlignment;
+
     for (phdrs) |ph| {
         if (ph.type == .LOAD) {
             if (ph.filesz > ph.memsz) return error.InvalidLoadSegment;
@@ -1401,6 +1403,7 @@ fn loadDso(o_path: []const u8, root_runpath: ?[]const u8, root_origin_dir: ?[]co
             _ = std.math.add(usize, ph.vaddr, ph.memsz) catch return error.InvalidLoadSegment;
         }
     }
+
     if (eh.e_shentsize != @sizeOf(std.elf.Elf64.Shdr) or eh.e_shstrndx >= eh.e_shnum) return error.InvalidSectionHeaders;
     if (eh.e_shoff % @alignOf(std.elf.Elf64.Shdr) != 0) return error.InvalidSectionHeaders;
     _ = try checkedFileRange(file_bytes, eh.e_shoff, @as(usize, eh.e_shnum) * @sizeOf(std.elf.Elf64.Shdr));
@@ -1416,8 +1419,6 @@ fn loadDso(o_path: []const u8, root_runpath: ?[]const u8, root_origin_dir: ?[]co
     }
 
     Logger.debug("elf type: {s}", .{@tagName(eh.e_type)});
-
-    var i: usize = 0;
 
     Logger.debug("sections headers offset: 0x{x}", .{eh.e_shoff});
     Logger.debug("sections headers string table index: {d}", .{eh.e_shstrndx});
@@ -1437,7 +1438,6 @@ fn loadDso(o_path: []const u8, root_runpath: ?[]const u8, root_origin_dir: ?[]co
 
     var maybe_dyn_symtab_addr: ?usize = null;
     var maybe_dyn_symtab_size: ?usize = null;
-    var dyn_runpath: ?[]const u8 = null;
 
     var segments: LoadSegmentList = .empty;
     var dependencies: std.ArrayList(usize) = .empty;
@@ -1459,9 +1459,10 @@ fn loadDso(o_path: []const u8, root_runpath: ?[]const u8, root_origin_dir: ?[]co
 
     Logger.debug("sections headers:", .{});
 
+    var scratch_buf: [1024]u8 = undefined;
     var sh_addr: usize = file_addr + eh.e_shoff;
 
-    i = 0;
+    var i: usize = 0;
     while (i < eh.e_shnum) : ({
         i += 1;
         sh_addr += eh.e_shentsize;
@@ -1565,6 +1566,7 @@ fn loadDso(o_path: []const u8, root_runpath: ?[]const u8, root_origin_dir: ?[]co
         return error.DynamicStringTableNotFound;
     };
 
+    var dyn_runpath: ?[]const u8 = null;
     var ph_addr: usize = file_addr + eh.e_phoff;
     var dyn_addr: usize = undefined;
     var found_dynamic = false;
@@ -1591,13 +1593,11 @@ fn loadDso(o_path: []const u8, root_runpath: ?[]const u8, root_origin_dir: ?[]co
                 }
             }
 
-            var libName: [*:0]u8 = undefined;
-
             var has_unloaded_deps = false;
             var j: usize = 0;
             while (j < dyns.len) : (j += 1) {
                 if (dyns[j].d_tag == std.elf.DT_NEEDED) {
-                    libName = @ptrFromInt(dyn_strtab_addr + dyns[j].d_val);
+                    const libName: [*:0]u8 = @ptrFromInt(dyn_strtab_addr + dyns[j].d_val);
 
                     Logger.debug("dep tree: found dependency: {s} => {s}", .{ dyn_object_name, libName });
 
@@ -1661,9 +1661,11 @@ fn loadDso(o_path: []const u8, root_runpath: ?[]const u8, root_origin_dir: ?[]co
                 segments.deinit(dll_allocator);
                 relocs.deinit(dll_allocator);
                 dependencies.deinit(dll_allocator);
+
                 std.posix.munmap(file_bytes);
                 f.close(dll_io);
                 file_open = false;
+
                 return dyn_objects.getIndex(dyn_object_key).?;
             }
 
@@ -1725,8 +1727,6 @@ fn loadDso(o_path: []const u8, root_runpath: ?[]const u8, root_origin_dir: ?[]co
 
         const strs: [*]u8 = @ptrFromInt(dyn_strtab_addr);
         const name = std.mem.sliceTo(@as([*:0]const u8, @ptrCast(strs + sym.name)), 0);
-
-        const hidden = sym.other.visibility != .DEFAULT;
 
         var version: []const u8 = "";
         var ver_sym: ?std.elf.Versym = null;
@@ -1795,6 +1795,7 @@ fn loadDso(o_path: []const u8, root_runpath: ?[]const u8, root_origin_dir: ?[]co
             }
         }
 
+        const hidden = sym.other.visibility != .DEFAULT;
         if (Logger.level == .debug) {
             Logger.debug("{s}  - {d}:", .{ dyn_object_name, j });
             Logger.debug("{s}    name: {s}", .{ dyn_object_name, name });
@@ -1936,13 +1937,11 @@ fn loadDso(o_path: []const u8, root_runpath: ?[]const u8, root_origin_dir: ?[]co
             const dyns = try elfDynamicEntries(file_bytes, phdrs, ph.*);
 
             var runpath: [*:0]u8 = undefined;
-
             var rela_reloc_nb_entry: usize = 0;
             var rela_table: RelocationTable = .{};
             var relr_table: RelocationTable = .{};
             var plt_table: RelocationTable = .{ .entry_size = @sizeOf(std.elf.Elf64_Rela) };
             var plt_reloc_type: usize = 0;
-
             var dt_plt_got_addr: usize = 0;
 
             var j: usize = 0;
@@ -2122,11 +2121,13 @@ fn loadDso(o_path: []const u8, root_runpath: ?[]const u8, root_origin_dir: ?[]co
             .tls_slot_align = if (previous_dyn_object) |previous| previous.tls_slot_align else 0,
         };
     }
+
     segments = .empty;
     dependencies = .empty;
     relocs = .empty;
     syms_array = .empty;
     syms = .empty;
+
     var dyn_object_installed = true;
     errdefer if (dyn_object_installed) {
         const current_dyn_object = do_entry.value_ptr;
@@ -2170,6 +2171,7 @@ fn loadDso(o_path: []const u8, root_runpath: ?[]const u8, root_origin_dir: ?[]co
     dyn_objects_sorted_indices.appendAssumeCapacity(dyn_objects.getIndex(dyn_object_key).?);
 
     Logger.info("{s} loaded => {s}", .{ dyn_object_name, dyn_object.path });
+
     if (previous_dyn_object) |previous| {
         var previous_to_free = previous;
         previous_to_free.syms_array.deinit(dll_allocator);
@@ -2186,6 +2188,7 @@ fn loadDso(o_path: []const u8, root_runpath: ?[]const u8, root_origin_dir: ?[]co
         dll_allocator.free(previous_to_free.path);
         if (previous_to_free.runpath) |runpath| dll_allocator.free(runpath);
     }
+
     dyn_object_installed = false;
 
     return dyn_objects.getIndex(dyn_object_key).?;
@@ -2378,7 +2381,6 @@ fn mapSegments(dyn_object: *DynObject, file_bytes: []const u8) !void {
             });
 
             const zero_start = std.mem.alignForward(usize, segment.loaded_at + segment.file_size, std.heap.pageSize());
-            const zero_ptr: [*]align(std.heap.pageSize()) u8 = @ptrFromInt(zero_start);
             const zero_end: usize = std.mem.alignForward(usize, segment.loaded_at + segment.mem_size, std.heap.pageSize());
             const zero_size = zero_end - zero_start;
 
@@ -2391,6 +2393,7 @@ fn mapSegments(dyn_object: *DynObject, file_bytes: []const u8) !void {
             }
 
             if (zero_size > 0) {
+                const zero_ptr: [*]align(std.heap.pageSize()) u8 = @ptrFromInt(zero_start);
                 Logger.debug("  segment {d}: mapping: zeroing from 0x{x} to 0x{x}, size: 0x{x}", .{ s, @intFromPtr(zero_ptr), zero_end, zero_size });
                 _ = try std.posix.mmap(
                     zero_ptr,
@@ -2581,10 +2584,8 @@ fn detectLibC(dyn_object: *DynObject) !void {
         try reprotectSegment(seg_infos.dyn_object, seg_infos.segment_index);
 
         const sym = dyn_object.syms_array.items[issetugid_sym.sym_idx];
-
         const sym_addr = issetugid_sym.address;
         const sym_size = sym.size;
-
         const sym_content: []const u8 = @as([*]const u8, @ptrFromInt(sym_addr))[0..sym_size];
         Logger.debug("libc detection: issetugid content: {x}", .{sym_content});
 
@@ -2721,10 +2722,8 @@ fn detectLibC(dyn_object: *DynObject) !void {
             };
 
             const paf_sym = dyn_object.syms_array.items[pthread_atfork_rsym.sym_idx];
-
             const paf_sym_addr = pthread_atfork_rsym.address;
             const paf_sym_size = paf_sym.size;
-
             const paf_sym_content: []const u8 = @as([*]const u8, @ptrFromInt(paf_sym_addr))[0..paf_sym_size];
             Logger.debug("libc detection: pthread_atfork content: {x}", .{paf_sym_content});
 
@@ -2806,10 +2805,8 @@ fn detectLibC(dyn_object: *DynObject) !void {
             };
 
             const cae_sym = dyn_object.syms_array.items[cxa_atexit_rsym.sym_idx];
-
             const cae_sym_addr = cxa_atexit_rsym.address;
             const cae_sym_size = cae_sym.size;
-
             const cae_sym_content: []const u8 = @as([*]const u8, @ptrFromInt(cae_sym_addr))[0..cae_sym_size];
             Logger.debug("libc detection: __cxa_atexit content: {x}", .{cae_sym_content});
 
@@ -2929,10 +2926,8 @@ fn detectLibC(dyn_object: *DynObject) !void {
 
         if (maybe_ei_rsym) |ei_rsym| {
             const ei_sym = dyn_object.syms_array.items[ei_rsym.sym_idx];
-
             const ei_sym_addr = ei_rsym.address;
             const ei_sym_size = ei_sym.size;
-
             const ei_sym_content: []const u8 = @as([*]const u8, @ptrFromInt(ei_sym_addr))[0..ei_sym_size];
             Logger.debug("libc detection: __libc_early_init content: {x}", .{ei_sym_content});
 
@@ -3026,7 +3021,6 @@ fn mapTlsBlock(dyn_object: *DynObject) !void {
     const current_tls_area_desc = normal_current_tls_area_desc orelse std.os.linux.tls.area_desc;
 
     var new_area_size: usize = 0;
-    const new_block_offset: usize = 0;
     new_area_size += dyn_object.tls_init_mem_size;
     new_area_size = if (new_area_size > 0) std.mem.alignForward(usize, new_area_size, dyn_object.tls_align) else new_area_size;
     new_area_size = if (new_area_size > 0) std.mem.alignForward(usize, new_area_size, current_tls_area_desc.alignment) else new_area_size;
@@ -3058,7 +3052,6 @@ fn mapTlsBlock(dyn_object: *DynObject) !void {
     Logger.debug("tls: size of pthread struct: 0x{x} ({d})", .{ sizeof_pthread, sizeof_pthread });
 
     const old_tp = currentThreadPointer();
-
     const prev_area_addr = old_tp - (new_abi_tcb_offset - prev_block_offset);
 
     Logger.debug("tls: old_tp: 0x{x}, prev area: 0x{x}", .{ old_tp, prev_area_addr });
@@ -3156,6 +3149,7 @@ fn mapTlsBlock(dyn_object: *DynObject) !void {
         if (initial_tls_init_file_size > 0) {
             @memcpy(block[new_abi_tcb_offset - initial_tls_offset ..][0..initial_tls_init_file_size], initial_tls_init_block);
         }
+
         Logger.debug("tls: zeroing initial tbss: from 0x{x} to 0x{x} (size: 0x{x})", .{
             new_abi_tcb_offset - initial_tls_offset + initial_tls_init_file_size,
             new_abi_tcb_offset - initial_tls_offset + initial_tls_init_mem_size,
@@ -3176,6 +3170,7 @@ fn mapTlsBlock(dyn_object: *DynObject) !void {
                 if (do.tls_init_file_size > 0) {
                     @memcpy(block[new_abi_tcb_offset - do.tls_offset ..][0..do.tls_init_file_size], @as([*]u8, @ptrFromInt(try vAddressToLoadedAddress(do, do.tls_init_mem_offset, false))));
                 }
+
                 Logger.debug("tls: zeroing {s} tbss: from 0x{x} to 0x{x} (size: 0x{x})", .{
                     do.name,
                     new_abi_tcb_offset - do.tls_offset + do.tls_init_file_size,
@@ -3197,6 +3192,7 @@ fn mapTlsBlock(dyn_object: *DynObject) !void {
         if (dyn_object.tls_init_file_size > 0) {
             @memcpy(block[0..dyn_object.tls_init_file_size], @as([*]u8, @ptrFromInt(try vAddressToLoadedAddress(dyn_object, dyn_object.tls_init_mem_offset, false))));
         }
+
         Logger.debug("tls: zeroing {s} tbss: from 0x{x} to 0x{x} (size: 0x{x})", .{
             dyn_object.name,
             dyn_object.tls_init_file_size,
@@ -3209,11 +3205,6 @@ fn mapTlsBlock(dyn_object: *DynObject) !void {
 
         break :init_blk block;
     };
-
-    const new_block_init = new_initial_block;
-    const new_block_size = new_block_init.len;
-
-    const new_align_factor = @max(dyn_object.tls_align, current_tls_area_desc.alignment);
 
     // TODO area desc type is not really compliant.
     //
@@ -3232,6 +3223,11 @@ fn mapTlsBlock(dyn_object: *DynObject) !void {
     //-------------^--------------------------------
     //              `-- The TP register points here.
     //
+    const new_block_init = new_initial_block;
+    const new_block_offset: usize = 0;
+    const new_block_size = new_block_init.len;
+    const new_align_factor = @max(dyn_object.tls_align, current_tls_area_desc.alignment);
+
     var new_tls_area_desc: @TypeOf(current_tls_area_desc) = .{
         .size = new_area_size,
         .alignment = new_align_factor,
@@ -4422,8 +4418,7 @@ fn callInitFunctions(dyn_obj: *DynObject) !void {
 
     if (is_libc_so) {
         // TODO use libc_specifics.call_ops
-        var maybe_sym: ?ResolvedSymbol = undefined;
-        maybe_sym = resolveSymbolByName("__libc_early_init") catch null;
+        const maybe_sym = resolveSymbolByName("__libc_early_init") catch null;
         if (maybe_sym) |sym| {
             Logger.debug("libc: found early init: 0x{x}", .{sym.address});
             const early_init: *const fn (bool) callconv(.c) void = @ptrFromInt(sym.address);
@@ -4548,8 +4543,6 @@ fn callFiniFunctions(dyn_obj: *DynObject) !void {
 }
 
 fn getSubstituteAddress(sym: ResolvedSymbol, for_obj: *DynObject, allow_preload_override: bool) ?usize {
-    var addr: ?usize = null;
-
     if (sym.dyn_object_idx == std.math.maxInt(usize)) {
         return null;
     }
@@ -4571,6 +4564,8 @@ fn getSubstituteAddress(sym: ResolvedSymbol, for_obj: *DynObject, allow_preload_
             return psym.address;
         }
     }
+
+    var addr: ?usize = null;
 
     // alloc functions
     // TODO errno handling
@@ -4714,7 +4709,6 @@ fn mallocSubstitute(size: usize) callconv(.c) ?*anyopaque {
     Logger.debug("intercepted call: malloc({d})", .{size});
 
     const result = dll_alloc_allocator.alloc(u8, 16 + size) catch @panic("OOM");
-
     const aligned_result = @as([*]u8, @ptrFromInt(std.mem.alignForward(usize, @intFromPtr(result.ptr), 16)));
 
     extra_allocations.put(dll_allocator, @intFromPtr(aligned_result), .{
@@ -4736,7 +4730,6 @@ fn alignedAllocSubstitute(alignment: usize, size: usize) callconv(.c) ?*anyopaqu
     Logger.debug("intercepted call: aligned_alloc({d}, {d})", .{ alignment, size });
 
     const result = dll_alloc_allocator.alloc(u8, alignment + size) catch @panic("OOM");
-
     const aligned_result = @as([*]u8, @ptrFromInt(std.mem.alignForward(usize, @intFromPtr(result.ptr), alignment)));
 
     extra_allocations.put(dll_allocator, @intFromPtr(aligned_result), .{
@@ -4758,7 +4751,6 @@ fn posixMemalignSubstitute(memptr: **anyopaque, alignment: usize, size: usize) c
     Logger.debug("intercepted call: posix_memalign(0x{x}, {d}, {d})", .{ @intFromPtr(memptr), alignment, size });
 
     const result = dll_alloc_allocator.alloc(u8, alignment + size) catch @panic("OOM");
-
     const aligned_result = @as([*]u8, @ptrFromInt(std.mem.alignForward(usize, @intFromPtr(result.ptr), alignment)));
 
     extra_allocations.put(dll_allocator, @intFromPtr(aligned_result), .{
@@ -4811,7 +4803,6 @@ fn callocSubstitute(n: usize, size: usize) callconv(.c) *anyopaque {
 
     const result = dll_alloc_allocator.alloc(u8, 16 + n * size) catch @panic("OOM");
     @memset(result, 0x0);
-
     const aligned_result = @as([*]u8, @ptrFromInt(std.mem.alignForward(usize, @intFromPtr(result.ptr), 16)));
 
     extra_allocations.put(dll_allocator, @intFromPtr(aligned_result), .{
@@ -4851,7 +4842,6 @@ fn reallocSubstitute(p: ?*anyopaque, size: usize) callconv(.c) *anyopaque {
             }
 
             result = dll_alloc_allocator.realloc(prev_slice, size + 16) catch @panic("OOM");
-
             aligned_result = @as([*]u8, @ptrFromInt(std.mem.alignForward(usize, @intFromPtr(result.ptr), 16)));
 
             _ = extra_allocations.swapRemove(@intFromPtr(p));
@@ -4869,7 +4859,6 @@ fn reallocSubstitute(p: ?*anyopaque, size: usize) callconv(.c) *anyopaque {
         }
     } else {
         result = dll_alloc_allocator.alloc(u8, size + 16) catch @panic("OOM");
-
         aligned_result = @as([*]u8, @ptrFromInt(std.mem.alignForward(usize, @intFromPtr(result.ptr), 16)));
     }
 
@@ -4910,7 +4899,6 @@ fn reallocarraySubstitute(p: ?*anyopaque, n: usize, size: usize) callconv(.c) *a
             }
 
             result = dll_alloc_allocator.realloc(prev_slice, n * size + 16) catch @panic("OOM");
-
             aligned_result = @as([*]u8, @ptrFromInt(std.mem.alignForward(usize, @intFromPtr(result.ptr), 16)));
 
             _ = extra_allocations.swapRemove(@intFromPtr(p));
@@ -4928,7 +4916,6 @@ fn reallocarraySubstitute(p: ?*anyopaque, n: usize, size: usize) callconv(.c) *a
         }
     } else {
         result = dll_alloc_allocator.alloc(u8, n * size + 16) catch @panic("OOM");
-
         aligned_result = @as([*]u8, @ptrFromInt(std.mem.alignForward(usize, @intFromPtr(result.ptr), 16)));
     }
 
@@ -5168,6 +5155,7 @@ fn unloadUnreferencedObjects() !void {
     for (retiring.items) |idx| {
         const dyn_object = &dyn_objects.values()[idx];
         if (!dyn_object.init_called) continue;
+
         dyn_object.init_called = false;
         var finalizing_object = dyn_object.*;
         callFiniFunctions(&finalizing_object) catch |err| {
@@ -5190,8 +5178,10 @@ fn unloadUnreferencedObjects() !void {
 
 fn retireObject(idx: usize) !void {
     const dyn_object = &dyn_objects.values()[idx];
+
     if (dyn_object.phdr_info) |info| CustomSelfInfo.removeExtraElf(dll_allocator, info);
     dyn_object.phdr_info = null;
+
     if (dyn_object.phdr_name) |name| dll_allocator.free(name);
     dyn_object.phdr_name = null;
 
@@ -5225,8 +5215,10 @@ fn retireObject(idx: usize) !void {
     std.posix.munmap(@as([*]align(std.heap.pageSize()) u8, @ptrFromInt(dyn_object.mapped_at))[0..dyn_object.mapped_size]);
     dyn_object.mapped_at = 0;
     dyn_object.mapped_size = 0;
+
     dyn_object.key.retired_slot = idx + 1;
     dyn_objects.setKey(idx, dyn_object.key);
+
     dyn_object.loaded_at = null;
     dyn_object.loaded_size = 0;
     dyn_object.loaded = false;
@@ -5234,12 +5226,15 @@ fn retireObject(idx: usize) !void {
     dyn_object.load_requested = false;
     dyn_object.finalizing = false;
     dyn_object.tls_mapped_at = 0;
+
     dyn_object.syms_array.clearRetainingCapacity();
     for (dyn_object.syms.values()) |*indices| indices.deinit(dll_allocator);
     dyn_object.syms.clearRetainingCapacity();
+
     dyn_object.relocs.clearRetainingCapacity();
     dyn_object.segments.clearRetainingCapacity();
     dyn_object.binding_dependencies.clearRetainingCapacity();
+
     if (dyn_object.tls_capacity != 0) {
         const desc = normal_current_tls_area_desc.?;
         @memset(@as([*]u8, @constCast(desc.block.init.ptr))[desc.abi_tcb.offset - dyn_object.tls_offset ..][0..dyn_object.tls_capacity], 0);
@@ -5797,8 +5792,10 @@ var thread_destructors: std.ArrayList(ThreadDestructor) = .empty;
 
 fn cxaThreadAtExitSubstitute(function: *const fn (?*anyopaque) callconv(.c) void, argument: ?*anyopaque, dso: ?*anyopaque) callconv(.c) c_int {
     const object = findDynObjectForLoadedAddr(@intFromPtr(dso)) orelse findDynObjectForLoadedAddr(@intFromPtr(function)) orelse return -1;
+
     thread_mutex.lock(dll_io) catch @panic("error locking mutex");
     defer thread_mutex.unlock(dll_io);
+
     thread_destructors.append(dll_allocator, .{
         .tp = currentThreadPointer(),
         .object_idx = object.dyn_object_index,
@@ -5806,12 +5803,14 @@ fn cxaThreadAtExitSubstitute(function: *const fn (?*anyopaque) callconv(.c) void
         .argument = argument,
     }) catch return -1;
     dyn_objects.values()[object.dyn_object_index].tls_destructors += 1;
+
     return 0;
 }
 
 fn runThreadDestructors(tp: usize) void {
     while (true) {
         thread_mutex.lock(dll_io) catch @panic("error locking mutex");
+
         var remaining = thread_destructors.items.len;
         const entry = blk: {
             while (remaining != 0) {
@@ -5822,6 +5821,7 @@ fn runThreadDestructors(tp: usize) void {
             return;
         };
         thread_mutex.unlock(dll_io);
+
         entry.function(entry.argument);
         dyn_objects.values()[entry.object_idx].tls_destructors -= 1;
     }
@@ -5843,6 +5843,7 @@ fn threadRoutine(ctx: ThreadRoutineContext) void {
     }
 
     thread_mutex.lock(dll_io) catch @panic("error locking mutex");
+
     const entry = thread_infos.getOrPut(dll_allocator, ctx.idx) catch @panic("OOM");
     if (!entry.found_existing) {
         entry.value_ptr.* = .{ .idx = ctx.idx, .handle = new_tp, .t = ctx.thread, .ret = undefined };
@@ -5851,6 +5852,7 @@ fn threadRoutine(ctx: ThreadRoutineContext) void {
         std.debug.assert(entry.value_ptr.handle == new_tp);
         std.debug.assert(entry.value_ptr.t == ctx.thread);
     }
+
     thread_mutex.unlock(dll_io);
 
     const ret = ctx.f(ctx.arg);
@@ -5869,15 +5871,15 @@ fn pthreadCreateSubstitute(newthread: *c_ulong, attr: ?*const anyopaque, start_r
 
     const page_size = std.heap.pageSize();
     const default_stack_size = std.Thread.SpawnConfig.default_stack_size;
-    var tls_offset: usize = undefined;
 
     var bytes: usize = page_size;
     bytes += @max(page_size, default_stack_size);
     bytes = std.mem.alignForward(usize, bytes, page_size);
     bytes = std.mem.alignForward(usize, bytes, std.os.linux.tls.area_desc.alignment);
-    tls_offset = bytes + std.os.linux.tls.area_desc.abi_tcb.offset;
+    const tls_offset = bytes + std.os.linux.tls.area_desc.abi_tcb.offset;
 
     const thread = dll_allocator.create(std.Thread) catch @panic("OOM");
+
     thread_mutex.lock(dll_io) catch @panic("error locking mutex");
     extra_threads.append(dll_allocator, thread) catch @panic("OOM");
     thread_mutex.unlock(dll_io);
@@ -5940,13 +5942,17 @@ fn pthreadJoinSubstitute(thread_handle: c_ulong, retval: ?**anyopaque) callconv(
         const thread = entry.t;
         const idx = entry.idx;
         thread_mutex.unlock(dll_io);
+
         thread.join();
 
         thread_mutex.lock(dll_io) catch @panic("error locking mutex");
+
         if (retval) |result| result.* = thread_infos.get(idx).?.ret;
         _ = thread_infos.swapRemove(idx);
         if (std.mem.findScalar(*std.Thread, extra_threads.items, thread)) |pos| _ = extra_threads.swapRemove(pos);
+
         thread_mutex.unlock(dll_io);
+
         dll_allocator.destroy(thread);
 
         unloadUnreferencedObjects() catch |err| Logger.warn("pthread_join: deferred unload failed: {}", .{err});
