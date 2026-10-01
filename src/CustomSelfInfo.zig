@@ -2,10 +2,22 @@
 
 // TODO move this to dll global state
 var extra_phdr_infos: std.ArrayList(*std.posix.dl_phdr_info) = .empty;
+var extra_elf_revision: usize = 0;
 
 pub fn addExtraElf(gpa: std.mem.Allocator, dl_phdr_info: *std.posix.dl_phdr_info) !void {
     // TODO thread safety
     try extra_phdr_infos.append(gpa, dl_phdr_info);
+    extra_elf_revision +%= 1;
+}
+
+pub fn removeExtraElf(gpa: std.mem.Allocator, info: *std.posix.dl_phdr_info) void {
+    for (extra_phdr_infos.items, 0..) |entry, i| {
+        if (entry != info) continue;
+        _ = extra_phdr_infos.orderedRemove(i);
+        gpa.destroy(entry);
+        extra_elf_revision +%= 1;
+        return;
+    }
 }
 
 pub fn clearExtraElfs(gpa: std.mem.Allocator) void {
@@ -15,12 +27,14 @@ pub fn clearExtraElfs(gpa: std.mem.Allocator) void {
     }
 
     extra_phdr_infos.clearAndFree(gpa);
+    extra_elf_revision +%= 1;
 }
 
 rwlock: Io.RwLock,
 
 modules: std.ArrayList(Module),
 ranges: std.ArrayList(Module.Range),
+cached_extra_elf_revision: usize = 0,
 
 unwind_cache: if (can_unwind) ?[]Dwarf.SelfUnwinder.CacheEntry else ?noreturn,
 
@@ -234,11 +248,11 @@ pub fn unwindFrame(si: *SelfInfo, io: Io, context: *UnwindContext) Error!usize {
     {
         si.rwlock.lockSharedUncancelable(io);
         defer si.rwlock.unlockShared(io);
-        if (si.unwind_cache) |cache| {
+        if (si.cached_extra_elf_revision == extra_elf_revision) if (si.unwind_cache) |cache| {
             if (Dwarf.SelfUnwinder.CacheEntry.find(cache, context.pc)) |entry| {
                 return context.next(gpa, entry);
             }
-        }
+        };
     }
 
     const module = try si.findModule(gpa, io, context.pc, .exclusive);
@@ -429,11 +443,11 @@ fn findModule(si: *SelfInfo, gpa: Allocator, io: Io, address: usize, lock: enum 
         .shared => si.rwlock.lockSharedUncancelable(io),
         .exclusive => si.rwlock.lockUncancelable(io),
     }
-    for (si.ranges.items) |*range| {
+    if (si.cached_extra_elf_revision == extra_elf_revision) for (si.ranges.items) |*range| {
         if (address >= range.start and address < range.start + range.len) {
             return &si.modules.items[range.module_index];
         }
-    }
+    };
     // The address wasn't in a known range. We will rebuild the module/range lists, since it's possible
     // a new module was loaded. Upgrade to an exclusive lock if necessary.
     switch (lock) {
@@ -467,6 +481,7 @@ fn findModule(si: *SelfInfo, gpa: Allocator, io: Io, address: usize, lock: enum 
         for (extra_phdr_infos.items) |info| {
             try DlIterContext.callback(info, @sizeOf(std.posix.dl_phdr_info), &ctx);
         }
+        si.cached_extra_elf_revision = extra_elf_revision;
     }
     // Downgrade the lock back to shared if necessary.
     switch (lock) {

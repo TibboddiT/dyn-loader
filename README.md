@@ -65,7 +65,7 @@ pub fn main(init: std.process.Init) !void {
 
 ### Current known limitations
 
-- Loading libraries should be done before starting any thread.
+- Initializing the loader and loading libraries should be done before starting any thread.
 - Some (rare) relocation types are still missing.
 - Dirty tricks are used to accommodate patched libc versions from various distros.
 - Some libc functions that need to be implemented in zig are not yet implemented.

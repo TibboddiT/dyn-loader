@@ -158,6 +158,17 @@ const DynObject = struct {
     ref_count: usize,
     loaded_at: ?usize,
     loaded_size: usize,
+    reservation: ?[]align(std.heap.pageSize()) u8 = null,
+    tls_capacity: usize = 0,
+    tls_slot_align: usize = 0,
+    load_requested: bool = true,
+    finalizing: bool = false,
+    pinned: bool = false,
+    tls_destructors: usize = 0,
+    binding_dependencies: std.ArrayList(usize) = .empty,
+    phdr_info: ?*std.posix.dl_phdr_info = null,
+    phdr_name: ?[:0]u8 = null,
+    relocated: bool = false,
 
     fn init(key: DynObjectId, name: []const u8, path: []const u8) DynObject {
         return .{
@@ -208,6 +219,7 @@ const DynObject = struct {
 
 const DynObjectId = struct {
     ino: std.os.linux.ino_t,
+    retired_slot: usize = 0,
 };
 
 const DynObjectList = std.AutoArrayHashMapUnmanaged(DynObjectId, DynObject);
@@ -249,6 +261,7 @@ pub const DynamicLibrary = struct {
 var dyn_objects: DynObjectList = .empty;
 var dyn_objects_sorted_indices: std.ArrayList(usize) = .empty;
 var dyn_objects_init_indices: std.ArrayList(usize) = .empty;
+var dll_deinitializing = false;
 var preload_root_indices: std.ArrayList(usize) = .empty;
 var dl_handles: DlHandleMap = .empty;
 var load_request_cache: std.StringArrayHashMapUnmanaged(usize) = .empty;
@@ -375,9 +388,15 @@ pub fn init(options: InitOptions) !void {
 
 // TODO thread safety
 pub fn deinit() void {
-    if (!dll_initialized) {
+    if (!dll_initialized or dll_deinitializing) {
         return;
     }
+
+    dll_deinitializing = true;
+    defer dll_deinitializing = false;
+
+    runThreadDestructors(currentThreadPointer());
+    for (dyn_objects.values()) |*dyn_object| dyn_object.finalizing = true;
 
     var nb_dyn_objects = dyn_objects_init_indices.items.len;
     while (nb_dyn_objects > 0) {
@@ -393,15 +412,24 @@ pub fn deinit() void {
 
         dyn_object.init_called = false;
 
-        callFiniFunctions(dyn_object) catch |err| {
-            dyn_object.init_called = true;
-            Logger.warn("deinit: unable to close library {s}: {}", .{ dyn_object.name, err });
+        var finalizing_object = dyn_object.*;
+        callFiniFunctions(&finalizing_object) catch |err| {
+            Logger.warn("deinit: unable to close library {s}: {}", .{ finalizing_object.name, err });
         };
 
-        dyn_object.ref_count = 0;
+        dyn_objects.values()[dyn_object_idx].ref_count = 0;
     }
 
+    CustomSelfInfo.clearExtraElfs(dll_allocator);
+
     for (dyn_objects.values()) |*dyn_object| {
+        dyn_object.binding_dependencies.deinit(dll_allocator);
+        if (dyn_object.phdr_name) |name| dll_allocator.free(name);
+        if (dyn_object.mapped_at != 0) {
+            std.posix.munmap(@as([*]align(std.heap.pageSize()) u8, @ptrFromInt(dyn_object.mapped_at))[0..dyn_object.mapped_size]);
+        }
+        if (dyn_object.reservation) |reservation| std.posix.munmap(reservation);
+
         dyn_object.syms_array.deinit(dll_allocator);
 
         for (dyn_object.syms.values()) |*v| {
@@ -471,6 +499,8 @@ pub fn deinit() void {
 
     thread_infos.clearAndFree(dll_allocator);
 
+    thread_destructors.deinit(dll_allocator);
+
     if (libc_specifics != null) {
         libc_specifics.?.write_ops.deinit(dll_allocator);
     }
@@ -486,8 +516,6 @@ pub fn deinit() void {
     }
     extra_allocations.clearAndFree(dll_allocator);
 
-    CustomSelfInfo.clearExtraElfs(dll_allocator);
-
     for (extra_strs_z.items) |e| {
         dll_allocator.free(e);
     }
@@ -495,8 +523,7 @@ pub fn deinit() void {
 
     dll_initialized = false;
 
-    // TODO
-    // - unmap unnecessary maps
+    // TODO restore the TLS initial setup
 }
 
 fn logSummary() void {
@@ -507,7 +534,7 @@ fn logSummary() void {
     var buf: [16]u8 = undefined;
 
     for (dyn_objects.values()) |*dyn_object| {
-        if (dyn_object.loaded) {
+        if (dyn_object.loaded or dyn_object.mapped_at == 0) {
             continue;
         }
 
@@ -767,14 +794,10 @@ pub fn load(f_path: []const u8) !DynamicLibrary {
 }
 
 fn loadWithRootResolveContext(f_path: []const u8, root_runpath: ?[]const u8, root_origin_dir: ?[]const u8) !DynamicLibrary {
-    if (!dll_initialized) {
-        return error.Uninitialized;
-    }
+    if (!dll_initialized) return error.Uninitialized;
+    if (dll_deinitializing) return error.LoaderDeinitializing;
 
-    // TODO
-    // - open flags
-    // - rpath
-    // - LD_* env vars
+    errdefer unloadUnreferencedObjects() catch |err| Logger.warn("load rollback: {}", .{err});
 
     loadPreloads();
 
@@ -790,21 +813,32 @@ fn loadWithRootResolveContext(f_path: []const u8, root_runpath: ?[]const u8, roo
         break :blk loaded_lib;
     };
 
+    for (dyn_objects.values()[lib.index].deps_breadth_first.items) |dep_idx| {
+        if (dyn_objects.values()[dep_idx].finalizing) return error.LibraryFinalizing;
+    }
+
     const root_dyn_object = &dyn_objects.values()[lib.index];
     for (root_dyn_object.deps_breadth_first.items) |dep_idx| {
         const dep_dyn_object = &dyn_objects.values()[dep_idx];
         dep_dyn_object.ref_count += 1;
     }
 
+    errdefer for (dyn_objects.values()[lib.index].deps_breadth_first.items) |dep_idx| {
+        dyn_objects.values()[dep_idx].ref_count -= 1;
+    };
+
     logSummary();
 
-    for (dyn_objects_sorted_indices.items) |idx| {
+    const relocation_order = try dll_allocator.dupe(usize, dyn_objects_sorted_indices.items);
+    defer dll_allocator.free(relocation_order);
+    for (relocation_order) |idx| {
         const dyn_obj = &dyn_objects.values()[idx];
 
-        if (dyn_obj.loaded) {
+        if (dyn_obj.relocated or dyn_obj.mapped_at == 0) {
             continue;
         }
 
+        dyn_obj.pinned = isLibcName(dyn_obj.name) or isLdLinuxName(dyn_obj.name);
         try detectLibC(dyn_obj);
 
         computeTcbOffset(dyn_obj);
@@ -812,16 +846,15 @@ fn loadWithRootResolveContext(f_path: []const u8, root_runpath: ?[]const u8, roo
         try mapTlsBlock(dyn_obj);
         _dl_debug_state();
         try processIRelativeRelocations(dyn_obj);
+        dyn_objects.values()[idx].relocated = true;
     }
 
-    const nb_indices = dyn_objects_sorted_indices.items.len;
+    const initialization_order = try dll_allocator.dupe(usize, dyn_objects_sorted_indices.items);
+    defer dll_allocator.free(initialization_order);
 
-    for (dyn_objects_sorted_indices.items) |idx| {
-        if (nb_indices != dyn_objects_sorted_indices.items.len) {
-            break; // an init function has loaded new libs, so this loop has already ran
-        }
-
+    for (initialization_order) |idx| {
         const dyn_obj = &dyn_objects.values()[idx];
+        if (dyn_obj.mapped_at == 0) continue;
 
         if (!dyn_obj.loaded) {
             try updateSegmentsPermissions(dyn_obj);
@@ -834,10 +867,7 @@ fn loadWithRootResolveContext(f_path: []const u8, root_runpath: ?[]const u8, roo
             errdefer if (!dl_phdr_info_registered) dll_allocator.destroy(dl_phdr_info);
 
             const owned_path_z = try dll_allocator.dupeSentinel(u8, dyn_obj.path, 0);
-            extra_strs_z.append(dll_allocator, owned_path_z) catch |err| {
-                dll_allocator.free(owned_path_z);
-                return err;
-            };
+            errdefer dll_allocator.free(owned_path_z);
 
             dl_phdr_info.* = .{
                 .addr = dyn_obj.loaded_at.?,
@@ -850,18 +880,23 @@ fn loadWithRootResolveContext(f_path: []const u8, root_runpath: ?[]const u8, roo
 
             try CustomSelfInfo.addExtraElf(dll_allocator, dl_phdr_info);
             dl_phdr_info_registered = true;
+            dyn_obj.phdr_info = dl_phdr_info;
+            dyn_obj.phdr_name = owned_path_z;
         }
 
         if (dyn_obj.ref_count == 0 or dyn_obj.init_called) {
             continue;
         }
 
+        if (dyn_obj.current_epoch == std.math.maxInt(u30)) return error.LibraryGenerationExhausted;
+
+        try dyn_objects_init_indices.ensureUnusedCapacity(dll_allocator, 1);
         dyn_obj.current_epoch += 1;
 
         dyn_obj.init_called = true;
-        callInitFunctions(dyn_obj) catch |err| {
-            dyn_obj.init_called = false;
-            dyn_obj.current_epoch -= 1;
+        var initializing_object = dyn_obj.*;
+        callInitFunctions(&initializing_object) catch |err| {
+            dyn_objects.values()[idx].init_called = false;
             return err;
         };
 
@@ -905,6 +940,8 @@ fn loadDepTree(o_path: []const u8, root_runpath: ?[]const u8, root_origin_dir: ?
 
             {
                 const dyn_object = &dyn_objects.values()[dyn_object_idx];
+
+                if (!dyn_object.load_requested) continue;
 
                 Logger.debug("dep tree: {d}: checking {s}", .{ dyn_object_idx, dyn_object.name });
 
@@ -1143,6 +1180,17 @@ fn resolveDynObjectInfosByNameOrPath(nameOrPath: []const u8, requester_name: ?[]
     };
 }
 
+fn reuseRetiredObjectSlot(key: DynObjectId, path: []const u8) void {
+    if (dyn_objects.contains(key)) return;
+    for (dyn_objects.values(), 0..) |*dyn_object, idx| {
+        if (dyn_object.mapped_at == 0 and !dyn_object.finalizing and std.mem.eql(u8, dyn_object.path, path)) {
+            dyn_objects.setKey(idx, key);
+            dyn_object.key = key;
+            return;
+        }
+    }
+}
+
 fn loadDso(o_path: []const u8, root_runpath: ?[]const u8, root_origin_dir: ?[]const u8) !usize {
     var scratch_buf: [1024]u8 = undefined;
 
@@ -1168,6 +1216,13 @@ fn loadDso(o_path: []const u8, root_runpath: ?[]const u8, root_origin_dir: ?[]co
     const size = std.math.cast(usize, stat.size) orelse return error.FileTooBig;
 
     const dyn_object_key: DynObjectId = .{ .ino = stat.inode };
+
+    reuseRetiredObjectSlot(dyn_object_key, path);
+
+    if (dyn_objects.getPtr(dyn_object_key)) |dyn_object| {
+        if (dyn_object.finalizing) return error.LibraryFinalizing;
+        dyn_object.load_requested = true;
+    }
 
     if (dyn_objects.get(dyn_object_key)) |dyn_object| if (dyn_object.mapped_at != 0) {
         f.close(dll_io);
@@ -1229,6 +1284,15 @@ fn loadDso(o_path: []const u8, root_runpath: ?[]const u8, root_origin_dir: ?[]co
     var segments: LoadSegmentList = .empty;
     var dependencies: std.ArrayList(usize) = .empty;
     var relocs: RelocList = .empty;
+
+    {
+        const reusable = dyn_objects.getPtr(dyn_object_key).?;
+        std.mem.swap(LoadSegmentList, &segments, &reusable.segments);
+        std.mem.swap(std.ArrayList(usize), &dependencies, &reusable.dependencies);
+        std.mem.swap(RelocList, &relocs, &reusable.relocs);
+        dependencies.clearRetainingCapacity();
+    }
+
     errdefer {
         relocs.deinit(dll_allocator);
         dependencies.deinit(dll_allocator);
@@ -1381,6 +1445,8 @@ fn loadDso(o_path: []const u8, root_runpath: ?[]const u8, root_origin_dir: ?[]co
 
                     if (findDynObjectIndexByName(dep_name)) |dep_idx| {
                         const dep = &dyn_objects.values()[dep_idx];
+                        if (dep.finalizing) return error.LibraryFinalizing;
+                        dep.load_requested = true;
                         if (dep.mapped_at != 0) {
                             Logger.debug("dep tree: registering dependency: {s} => {s}", .{ dyn_object_name, libName });
                             try dependencies.append(dll_allocator, dep_idx);
@@ -1399,6 +1465,8 @@ fn loadDso(o_path: []const u8, root_runpath: ?[]const u8, root_origin_dir: ?[]co
                     var resolved_dep_path: ?[]const u8 = resolved_dep.path;
                     errdefer if (resolved_dep_path) |p| dll_allocator.free(p);
 
+                    reuseRetiredObjectSlot(resolved_dep.key, resolved_dep.path);
+
                     const maybe_dep = dyn_objects.getPtr(resolved_dep.key);
                     if (maybe_dep == null) {
                         // TODO assert DT_NEEDED is not a path
@@ -1415,6 +1483,8 @@ fn loadDso(o_path: []const u8, root_runpath: ?[]const u8, root_origin_dir: ?[]co
                         resolved_dep_path = null;
 
                         const dep = maybe_dep.?;
+                        if (dep.finalizing) return error.LibraryFinalizing;
+                        dep.load_requested = true;
                         if (dep.mapped_at != 0) {
                             Logger.debug("dep tree: registering dependency: {s} => {s}", .{ dyn_object_name, libName });
                             try dependencies.append(dll_allocator, dyn_objects.getIndex(dep.key).?);
@@ -1427,6 +1497,8 @@ fn loadDso(o_path: []const u8, root_runpath: ?[]const u8, root_origin_dir: ?[]co
             }
 
             if (has_unloaded_deps) {
+                segments.deinit(dll_allocator);
+                relocs.deinit(dll_allocator);
                 dependencies.deinit(dll_allocator);
                 std.posix.munmap(file_bytes);
                 f.close(dll_io);
@@ -1440,6 +1512,13 @@ fn loadDso(o_path: []const u8, root_runpath: ?[]const u8, root_origin_dir: ?[]co
 
     var syms_array: std.ArrayList(DynSym) = .empty;
     var syms: DynSymList = .empty;
+
+    {
+        const reusable = dyn_objects.getPtr(dyn_object_key).?;
+        std.mem.swap(std.ArrayList(DynSym), &syms_array, &reusable.syms_array);
+        std.mem.swap(DynSymList, &syms, &reusable.syms);
+    }
+
     errdefer {
         syms_array.deinit(dll_allocator);
 
@@ -1943,7 +2022,7 @@ fn loadDso(o_path: []const u8, root_runpath: ?[]const u8, root_origin_dir: ?[]co
             .tls_init_mem_size = tls_init_mem_size,
             .tls_align = tls_align,
             .tls_mapped_at = 0,
-            .tls_offset = 0,
+            .tls_offset = if (previous_dyn_object) |previous| previous.tls_offset else 0,
             .eh = eh,
             .eh_init_file_offset = eh_init_file_offset,
             .eh_init_file_size = eh_init_file_size,
@@ -1966,10 +2045,13 @@ fn loadDso(o_path: []const u8, root_runpath: ?[]const u8, root_origin_dir: ?[]co
             .fini_array_size = fini_array_size,
             .loaded = false,
             .init_called = false,
-            .current_epoch = 0,
+            .current_epoch = if (previous_dyn_object) |previous| previous.current_epoch else 0,
             .ref_count = 0,
             .loaded_at = null,
             .loaded_size = 0,
+            .reservation = if (previous_dyn_object) |previous| previous.reservation else null,
+            .tls_capacity = if (previous_dyn_object) |previous| previous.tls_capacity else 0,
+            .tls_slot_align = if (previous_dyn_object) |previous| previous.tls_slot_align else 0,
         };
     }
     segments = .empty;
@@ -2039,6 +2121,7 @@ fn loadDso(o_path: []const u8, root_runpath: ?[]const u8, root_origin_dir: ?[]co
         previous_to_free.dependencies.deinit(dll_allocator);
         previous_to_free.deps_breadth_first.deinit(dll_allocator);
         previous_to_free.segments.deinit(dll_allocator);
+        previous_to_free.binding_dependencies.deinit(dll_allocator);
         dll_allocator.free(previous_to_free.name);
         dll_allocator.free(previous_to_free.path);
         if (previous_to_free.runpath) |runpath| dll_allocator.free(runpath);
@@ -2059,6 +2142,7 @@ fn collectDepsBreadthFirst(dyn_object: *DynObject) !void {
         if (std.mem.findScalar(usize, dyn_object.deps_breadth_first.items, dep_idx)) |_| {} else try dyn_object.deps_breadth_first.append(dll_allocator, dep_idx);
         const dep = &dyn_objects.values()[dep_idx];
         for (dep.dependencies.items) |sdep_idx| {
+            if (std.mem.findScalar(usize, dyn_object.deps_breadth_first.items, sdep_idx)) |_| continue;
             if (std.mem.findScalar(usize, queue.items, sdep_idx)) |_| continue;
             try queue.append(dll_allocator, sdep_idx);
         }
@@ -2131,7 +2215,13 @@ fn mapSegments(dyn_object: *DynObject, file_bytes: []const u8) !void {
 
     Logger.debug("mapping segments: from file, library loaded size: 0x{x} (0x{x} to 0x{x})", .{ total_mem_size, 0, mem_end });
 
-    const mapped_space = std.posix.mmap(
+    const previous_reservation = dyn_object.reservation;
+    const reusable_reservation = if (previous_reservation) |reservation| blk: {
+        const aligned_base = std.mem.alignForward(usize, @intFromPtr(reservation.ptr), max_align);
+        break :blk aligned_base + total_mem_size <= @intFromPtr(reservation.ptr) + reservation.len;
+    } else false;
+
+    const mapped_space = if (reusable_reservation) previous_reservation.? else std.posix.mmap(
         null,
         total_mem_size + max_align,
         .{},
@@ -2144,7 +2234,7 @@ fn mapSegments(dyn_object: *DynObject, file_bytes: []const u8) !void {
     };
     var mapped_space_owned = true;
     errdefer if (mapped_space_owned) {
-        std.posix.munmap(mapped_space);
+        if (!reusable_reservation) std.posix.munmap(mapped_space);
         dyn_object.loaded_at = null;
         dyn_object.loaded_size = 0;
     };
@@ -2258,8 +2348,11 @@ fn mapSegments(dyn_object: *DynObject, file_bytes: []const u8) !void {
         }
     }
 
-    Logger.debug("successfully mapped {d} segments for {s} at base 0x{x}", .{ dyn_object.segments.count(), dyn_object.name, base_addr });
+    if (!reusable_reservation) if (previous_reservation) |reservation| std.posix.munmap(reservation);
+    dyn_object.reservation = mapped_space;
     mapped_space_owned = false;
+
+    Logger.debug("successfully mapped {d} segments for {s} at base 0x{x}", .{ dyn_object.segments.count(), dyn_object.name, base_addr });
 }
 
 fn processRelativeRelocationsFast(
@@ -2382,6 +2475,12 @@ var initial_tls_init_block: []const u8 = undefined;
 
 fn computeTcbOffset(dyn_object: *DynObject) void {
     Logger.debug("computing tcb offset of library {s}", .{dyn_object.name});
+
+    if (dyn_object.tls_capacity >= dyn_object.tls_init_mem_size and
+        dyn_object.tls_slot_align >= dyn_object.tls_align and
+        dyn_object.tls_capacity != 0) return;
+
+    dyn_object.tls_capacity = 0;
 
     const current_tls_area_desc = normal_current_tls_area_desc orelse std.os.linux.tls.area_desc;
 
@@ -2894,8 +2993,17 @@ fn detectLibC(dyn_object: *DynObject) !void {
     return error.UnableToDetectLibc;
 }
 
+// TODO global state
+var loader_thread_pointer: usize = 0;
+
 fn mapTlsBlock(dyn_object: *DynObject) !void {
     Logger.debug("mapping tls block of library {s}", .{dyn_object.name});
+
+    if (dyn_object.tls_capacity != 0) {
+        try resetTlsSlot(dyn_object);
+        return;
+    }
+    if (dyn_object.tls_init_mem_size == 0 and normal_current_tls_area_desc != null) return;
 
     const current_tls_area_desc = normal_current_tls_area_desc orelse std.os.linux.tls.area_desc;
 
@@ -2931,9 +3039,7 @@ fn mapTlsBlock(dyn_object: *DynObject) !void {
     };
     Logger.debug("tls: size of pthread struct: 0x{x} ({d})", .{ sizeof_pthread, sizeof_pthread });
 
-    var old_tp: usize = undefined;
-    const e_get_fs = std.os.linux.syscall2(.arch_prctl, std.os.linux.ARCH.GET_FS, @intFromPtr(&old_tp));
-    std.debug.assert(e_get_fs == 0);
+    const old_tp = currentThreadPointer();
 
     const prev_area_addr = old_tp - (new_abi_tcb_offset - prev_block_offset);
 
@@ -3021,6 +3127,8 @@ fn mapTlsBlock(dyn_object: *DynObject) !void {
     const new_initial_block = init_blk: {
         const block = try dll_allocator.alloc(u8, new_abi_tcb_offset);
         errdefer dll_allocator.free(block);
+
+        @memset(block, 0);
 
         Logger.debug("tls: copying initial tdata: from 0x{x} to 0x{x} (size: 0x{x})", .{
             new_abi_tcb_offset - initial_tls_offset,
@@ -3155,6 +3263,7 @@ fn mapTlsBlock(dyn_object: *DynObject) !void {
 
         const e_set_fs = std.os.linux.syscall2(.arch_prctl, std.os.linux.ARCH.SET_FS, new_tp);
         std.debug.assert(e_set_fs == 0);
+        if (loader_thread_pointer == 0) loader_thread_pointer = new_tp;
 
         if (libc_specifics != null) {
             try applyLibcWriteOps(new_tp, false);
@@ -3167,6 +3276,45 @@ fn mapTlsBlock(dyn_object: *DynObject) !void {
     } else {
         Logger.debug("tls: {s}: no change to TLS area", .{dyn_object.name});
     }
+
+    dyn_object.tls_capacity = dyn_object.tls_init_mem_size;
+    dyn_object.tls_slot_align = dyn_object.tls_align;
+
+    if (dyn_object.tls_capacity != 0) try resetTlsSlot(dyn_object);
+}
+
+fn resetTlsSlot(dyn_object: *DynObject) !void {
+    const desc = normal_current_tls_area_desc.?;
+    const template = @as([*]u8, @constCast(desc.block.init.ptr))[desc.abi_tcb.offset - dyn_object.tls_offset ..][0..dyn_object.tls_capacity];
+    @memset(template, 0);
+
+    if (dyn_object.tls_init_file_size != 0) {
+        const source: [*]const u8 = @ptrFromInt(try vAddressToLoadedAddress(dyn_object, dyn_object.tls_init_mem_offset, false));
+        @memcpy(template[0..dyn_object.tls_init_file_size], source[0..dyn_object.tls_init_file_size]);
+    }
+
+    const tp = currentThreadPointer();
+    @memcpy(@as([*]u8, @ptrFromInt(tp - dyn_object.tls_offset))[0..template.len], template);
+    dyn_object.tls_mapped_at = tp - dyn_object.tls_offset;
+
+    thread_mutex.lock(dll_io) catch @panic("error locking mutex");
+    defer thread_mutex.unlock(dll_io);
+
+    for (thread_infos.values()) |entry| {
+        if (entry.handle == tp) continue;
+        @memcpy(@as([*]u8, @ptrFromInt(entry.handle - dyn_object.tls_offset))[0..template.len], template);
+    }
+
+    if (loader_thread_pointer != 0 and loader_thread_pointer != tp) {
+        @memcpy(@as([*]u8, @ptrFromInt(loader_thread_pointer - dyn_object.tls_offset))[0..template.len], template);
+    }
+}
+
+fn currentThreadPointer() usize {
+    var tp: usize = undefined;
+    const result = std.os.linux.syscall2(.arch_prctl, std.os.linux.ARCH.GET_FS, @intFromPtr(&tp));
+    std.debug.assert(result == 0);
+    return tp;
 }
 
 fn applyLibcWriteOps(thread_pointer: usize, only_tp_relative: bool) !void {
@@ -3452,6 +3600,7 @@ fn processIRelativeRelocations(dyn_object: *DynObject) !void {
                 Logger.debug("  IRELATIVE: calling resolver at 0x{x} (0x{x})", .{ resolver_addr, reloc.addend });
                 const value = resolver();
                 Logger.debug("  IRELATIVE: 0x{x} (0x{x}): 0x{x} -> 0x{x}", .{ reloc_addr, reloc.offset, ptr.*, value });
+                try recordBindingDependency(dyn_object, value);
                 ptr.* = value;
                 if (ifunc_resolved_addrs.get(resolver_addr)) |res_val| {
                     std.debug.assert(res_val == value);
@@ -3521,7 +3670,7 @@ fn getResolvedSymbolByName(maybe_dyn_object: ?*DynObject, sym_name: []const u8, 
         for (preload_root_indices.items) |preload_idx| {
             const dep_object = &dyn_objects.values()[preload_idx];
 
-            if (dep_object.ref_count == 0) {
+            if (dep_object.mapped_at == 0) {
                 continue;
             }
 
@@ -3582,7 +3731,7 @@ fn getResolvedSymbolByName(maybe_dyn_object: ?*DynObject, sym_name: []const u8, 
                 continue;
             }
 
-            if (dep_object.ref_count == 0) {
+            if (dep_object.mapped_at == 0) {
                 continue;
             }
 
@@ -3643,7 +3792,7 @@ fn getResolvedSymbolByName(maybe_dyn_object: ?*DynObject, sym_name: []const u8, 
         for (dyn_objects_sorted_indices.items) |dep_idx| {
             const dep_object = &dyn_objects.values()[dep_idx];
 
-            if (dep_object.ref_count == 0) {
+            if (dep_object.mapped_at == 0) {
                 continue;
             }
 
@@ -3720,7 +3869,7 @@ fn getResolvedSymbolByNameAndVersion(maybe_dyn_object: ?*DynObject, sym_name: []
         for (preload_root_indices.items) |preload_idx| {
             const dep_object = &dyn_objects.values()[preload_idx];
 
-            if (dep_object.ref_count == 0) {
+            if (dep_object.mapped_at == 0) {
                 continue;
             }
 
@@ -3781,7 +3930,7 @@ fn getResolvedSymbolByNameAndVersion(maybe_dyn_object: ?*DynObject, sym_name: []
                 continue;
             }
 
-            if (dep_object.ref_count == 0) {
+            if (dep_object.mapped_at == 0) {
                 continue;
             }
 
@@ -3842,7 +3991,7 @@ fn getResolvedSymbolByNameAndVersion(maybe_dyn_object: ?*DynObject, sym_name: []
         for (dyn_objects_sorted_indices.items) |dep_idx| {
             const dep_object = &dyn_objects.values()[dep_idx];
 
-            if (dep_object.ref_count == 0) {
+            if (dep_object.mapped_at == 0) {
                 continue;
             }
 
@@ -3911,6 +4060,23 @@ fn getResolvedSymbolByNameAndVersion(maybe_dyn_object: ?*DynObject, sym_name: []
 
 // TODO rules for symbol resolution should be rigorously implemented
 fn resolveSymbol(dyn_object: *DynObject, sym_idx: usize) !ResolvedSymbol {
+    const sym = try resolveSymbolInner(dyn_object, sym_idx);
+    try recordBindingDependency(dyn_object, sym.address);
+    return sym;
+}
+
+fn recordBindingDependency(dyn_object: *DynObject, address: usize) !void {
+    // IFUNCs can return address belonging to an object outside DT_NEEDED.
+    if (findDynObjectForLoadedAddr(address)) |target| {
+        if (target.dyn_object_index != dyn_objects.getIndex(dyn_object.key).? and
+            std.mem.findScalar(usize, dyn_object.binding_dependencies.items, target.dyn_object_index) == null)
+        {
+            try dyn_object.binding_dependencies.append(dll_allocator, target.dyn_object_index);
+        }
+    }
+}
+
+fn resolveSymbolInner(dyn_object: *DynObject, sym_idx: usize) !ResolvedSymbol {
     if (sym_idx >= dyn_object.syms_array.items.len) {
         return error.InvalidSymbolIndex;
     }
@@ -4397,6 +4563,9 @@ fn getSubstituteAddress(sym: ResolvedSymbol, for_obj: *DynObject, allow_preload_
     if (allow_preload_override and !for_obj_is_preload_root) {
         const preload_sym = getResolvedSymbolByName(null, sym.name, false, true, false) catch null;
         if (preload_sym) |psym| {
+            if (std.mem.findScalar(usize, for_obj.binding_dependencies.items, psym.dyn_object_idx) == null) {
+                for_obj.binding_dependencies.append(dll_allocator, psym.dyn_object_idx) catch @panic("OOM");
+            }
             Logger.info("substitutes: preload override for {s}: 0x{x} => 0x{x}", .{ sym.name, sym.address, psym.address });
             return psym.address;
         }
@@ -4433,7 +4602,9 @@ fn getSubstituteAddress(sym: ResolvedSymbol, for_obj: *DynObject, allow_preload_
     }
 
     // dl functions
-    if (std.mem.eql(u8, sym.name, "dlopen")) {
+    if (std.mem.eql(u8, sym.name, "__cxa_thread_atexit_impl") or std.mem.eql(u8, sym.name, "__cxa_thread_atexit")) {
+        addr = @intFromPtr(&cxaThreadAtExitSubstitute);
+    } else if (std.mem.eql(u8, sym.name, "dlopen")) {
         addr = @intFromPtr(&dlopenSubstitute);
     } else if (std.mem.eql(u8, sym.name, "dlclose")) {
         addr = @intFromPtr(&dlcloseSubstitute);
@@ -4933,66 +5104,156 @@ fn dlcloseSubstitute(lib: *anyopaque) callconv(.c) c_int {
         dep_dyn_object.ref_count -= 1;
     }
 
-    var nb_initialized = dyn_objects_init_indices.items.len;
-    while (nb_initialized > 0) {
-        nb_initialized -= 1;
-
-        const dep_idx = dyn_objects_init_indices.items[nb_initialized];
-        if (std.mem.findScalar(usize, dyn_object.deps_breadth_first.items, dep_idx) == null) {
-            continue;
-        }
-        const dep_dyn_object = &dyn_objects.values()[dep_idx];
-
-        if (dep_dyn_object.ref_count != 0 or !dep_dyn_object.init_called) {
-            continue;
-        }
-
-        dep_dyn_object.init_called = false;
-
-        callFiniFunctions(dep_dyn_object) catch |err| {
-            dep_dyn_object.init_called = true;
-
-            if (last_dl_error != null) {
-                dll_allocator.free(last_dl_error.?);
-            }
-            last_dl_error = std.fmt.allocPrintSentinel(dll_allocator, "unable to close library {s}: {}", .{ dep_dyn_object.name, err }, 0) catch @panic("OOM");
-            dlerror_cleared = false;
-
-            Logger.warn("dlclose(0x{x} [{s}]) failed: {}", .{ handle_raw, dep_dyn_object.name, err });
-
-            return 1;
-        };
-    }
-
-    Logger.info("intercepted call: success: dlclose(0x{x} [{s}]) = 0", .{ handle_raw, dyn_object.name });
-
-    const metadata_after = dl_handles.getPtr(handle_raw) orelse {
-        if (last_dl_error != null) {
-            dll_allocator.free(last_dl_error.?);
-        }
-        last_dl_error = std.fmt.allocPrintSentinel(dll_allocator, "invalid library handle 0x{x}", .{handle_raw}, 0) catch @panic("OOM");
+    metadata.open_count -= 1;
+    unloadUnreferencedObjects() catch |err| {
+        if (last_dl_error) |message| dll_allocator.free(message);
+        last_dl_error = std.fmt.allocPrintSentinel(dll_allocator, "unable to close library handle 0x{x}: {}", .{ handle_raw, err }, 0) catch @panic("OOM");
         dlerror_cleared = false;
-
-        Logger.warn("dlclose(0x{x}) failed: invalid library handle", .{handle_raw});
-
         return 1;
     };
 
-    if (metadata_after.open_count == 0) {
-        if (last_dl_error != null) {
-            dll_allocator.free(last_dl_error.?);
-        }
-        last_dl_error = std.fmt.allocPrintSentinel(dll_allocator, "library handle 0x{x} is already closed", .{handle_raw}, 0) catch @panic("OOM");
-        dlerror_cleared = false;
-
-        Logger.warn("dlclose(0x{x}) failed: already closed", .{handle_raw});
-
-        return 1;
-    }
-
-    metadata_after.open_count -= 1;
+    Logger.info("intercepted call: success: dlclose(0x{x}) = 0", .{handle_raw});
 
     return 0;
+}
+
+fn unloadUnreferencedObjects() !void {
+    const keep = try dll_allocator.alloc(bool, dyn_objects.count());
+    defer dll_allocator.free(keep);
+
+    for (dyn_objects.values(), keep) |dyn_object, *live| {
+        live.* = dyn_object.ref_count != 0 or dyn_object.pinned or dyn_object.finalizing or dyn_object.tls_destructors != 0;
+    }
+
+    var changed = true;
+    while (changed) {
+        changed = false;
+        for (dyn_objects.values(), keep) |dyn_object, live| {
+            if (!live) continue;
+            for (dyn_object.dependencies.items) |idx| {
+                if (!keep[idx]) {
+                    keep[idx] = true;
+                    changed = true;
+                }
+            }
+            for (dyn_object.binding_dependencies.items) |idx| {
+                if (!keep[idx]) {
+                    keep[idx] = true;
+                    changed = true;
+                }
+            }
+        }
+    }
+
+    var retiring: std.ArrayList(usize) = .empty;
+    defer retiring.deinit(dll_allocator);
+
+    try retiring.ensureTotalCapacity(dll_allocator, dyn_objects.count());
+
+    var remaining = dyn_objects_init_indices.items.len;
+    while (remaining != 0) {
+        remaining -= 1;
+        const idx = dyn_objects_init_indices.items[remaining];
+        if (!keep[idx]) retiring.appendAssumeCapacity(idx);
+    }
+
+    for (dyn_objects_sorted_indices.items) |idx| {
+        if (!keep[idx] and std.mem.findScalar(usize, retiring.items, idx) == null) retiring.appendAssumeCapacity(idx);
+    }
+
+    for (retiring.items) |idx| dyn_objects.values()[idx].finalizing = true;
+
+    var fini_error: ?anyerror = null;
+    for (retiring.items) |idx| {
+        const dyn_object = &dyn_objects.values()[idx];
+        if (!dyn_object.init_called) continue;
+        dyn_object.init_called = false;
+        var finalizing_object = dyn_object.*;
+        callFiniFunctions(&finalizing_object) catch |err| {
+            fini_error = err;
+        };
+    }
+
+    for (retiring.items) |idx| try retireObject(idx);
+
+    for (dyn_objects.values(), 0..) |*dyn_object, idx| {
+        if (dyn_object.mapped_at == 0) {
+            dyn_object.load_requested = false;
+            dyn_object.key.retired_slot = idx + 1;
+            dyn_objects.setKey(idx, dyn_object.key);
+        }
+    }
+
+    if (fini_error) |err| return err;
+}
+
+fn retireObject(idx: usize) !void {
+    const dyn_object = &dyn_objects.values()[idx];
+    if (dyn_object.phdr_info) |info| CustomSelfInfo.removeExtraElf(dll_allocator, info);
+    dyn_object.phdr_info = null;
+    if (dyn_object.phdr_name) |name| dll_allocator.free(name);
+    dyn_object.phdr_name = null;
+
+    const base = dyn_object.loaded_at.?;
+    const end = base + dyn_object.loaded_size;
+    invalidateAddressCache(&ifunc_resolved_addrs, base, end);
+    invalidateAddressCache(&irel_resolved_targets, base, end);
+
+    var i: usize = 0;
+    while (i < load_request_cache.count()) {
+        if (load_request_cache.values()[i] == idx) {
+            const key = load_request_cache.keys()[i];
+            load_request_cache.swapRemoveAt(i);
+            dll_allocator.free(key);
+        } else i += 1;
+    }
+
+    i = 0;
+    while (i < dl_handles.count()) {
+        if (dl_handles.values()[i].dyn_object_idx == idx) {
+            dl_handles.swapRemoveAt(i);
+        } else i += 1;
+    }
+
+    if (std.mem.findScalar(usize, dyn_objects_init_indices.items, idx)) |pos| _ = dyn_objects_init_indices.orderedRemove(pos);
+    if (std.mem.findScalar(usize, dyn_objects_sorted_indices.items, idx)) |pos| _ = dyn_objects_sorted_indices.orderedRemove(pos);
+
+    const reservation = dyn_object.reservation.?;
+    _ = try std.posix.mmap(reservation.ptr, reservation.len, .{}, .{ .TYPE = .PRIVATE, .ANONYMOUS = true, .FIXED = true }, -1, 0);
+
+    std.posix.munmap(@as([*]align(std.heap.pageSize()) u8, @ptrFromInt(dyn_object.mapped_at))[0..dyn_object.mapped_size]);
+    dyn_object.mapped_at = 0;
+    dyn_object.mapped_size = 0;
+    dyn_object.key.retired_slot = idx + 1;
+    dyn_objects.setKey(idx, dyn_object.key);
+    dyn_object.loaded_at = null;
+    dyn_object.loaded_size = 0;
+    dyn_object.loaded = false;
+    dyn_object.relocated = false;
+    dyn_object.load_requested = false;
+    dyn_object.finalizing = false;
+    dyn_object.tls_mapped_at = 0;
+    dyn_object.syms_array.clearRetainingCapacity();
+    for (dyn_object.syms.values()) |*indices| indices.deinit(dll_allocator);
+    dyn_object.syms.clearRetainingCapacity();
+    dyn_object.relocs.clearRetainingCapacity();
+    dyn_object.segments.clearRetainingCapacity();
+    dyn_object.binding_dependencies.clearRetainingCapacity();
+    if (dyn_object.tls_capacity != 0) {
+        const desc = normal_current_tls_area_desc.?;
+        @memset(@as([*]u8, @constCast(desc.block.init.ptr))[desc.abi_tcb.offset - dyn_object.tls_offset ..][0..dyn_object.tls_capacity], 0);
+    }
+}
+
+fn invalidateAddressCache(cache: *std.AutoArrayHashMapUnmanaged(usize, usize), base: usize, end: usize) void {
+    var i: usize = 0;
+    while (i < cache.count()) {
+        const key = cache.keys()[i];
+        const value = cache.values()[i];
+        if ((key >= base and key < end) or (value >= base and value < end)) {
+            cache.swapRemoveAt(i);
+        } else i += 1;
+    }
 }
 
 fn dlsymSubstitute(lib_handle: ?*anyopaque, sym_name: [*:0]const u8) callconv(.c) ?*anyopaque {
@@ -5514,10 +5775,6 @@ const ThreadInfos = struct {
 };
 const ThreadInfosMap = std.AutoArrayHashMapUnmanaged(usize, ThreadInfos);
 
-// TODO global state
-var thread_infos: ThreadInfosMap = .empty;
-var currentIdx: usize = 1;
-
 const ThreadRoutineContext = struct {
     idx: usize,
     thread: *std.Thread,
@@ -5525,10 +5782,52 @@ const ThreadRoutineContext = struct {
     arg: ?*anyopaque,
 };
 
+const ThreadDestructor = struct {
+    tp: usize,
+    object_idx: usize,
+    function: *const fn (?*anyopaque) callconv(.c) void,
+    argument: ?*anyopaque,
+};
+
+// TODO global state
+var thread_infos: ThreadInfosMap = .empty;
+var thread_current_idx: usize = 1;
+var thread_destructors: std.ArrayList(ThreadDestructor) = .empty;
+
+fn cxaThreadAtExitSubstitute(function: *const fn (?*anyopaque) callconv(.c) void, argument: ?*anyopaque, dso: ?*anyopaque) callconv(.c) c_int {
+    const object = findDynObjectForLoadedAddr(@intFromPtr(dso)) orelse findDynObjectForLoadedAddr(@intFromPtr(function)) orelse return -1;
+    thread_mutex.lock(dll_io) catch @panic("error locking mutex");
+    defer thread_mutex.unlock(dll_io);
+    thread_destructors.append(dll_allocator, .{
+        .tp = currentThreadPointer(),
+        .object_idx = object.dyn_object_index,
+        .function = function,
+        .argument = argument,
+    }) catch return -1;
+    dyn_objects.values()[object.dyn_object_index].tls_destructors += 1;
+    return 0;
+}
+
+fn runThreadDestructors(tp: usize) void {
+    while (true) {
+        thread_mutex.lock(dll_io) catch @panic("error locking mutex");
+        var remaining = thread_destructors.items.len;
+        const entry = blk: {
+            while (remaining != 0) {
+                remaining -= 1;
+                if (thread_destructors.items[remaining].tp == tp) break :blk thread_destructors.orderedRemove(remaining);
+            }
+            thread_mutex.unlock(dll_io);
+            return;
+        };
+        thread_mutex.unlock(dll_io);
+        entry.function(entry.argument);
+        dyn_objects.values()[entry.object_idx].tls_destructors -= 1;
+    }
+}
+
 fn threadRoutine(ctx: ThreadRoutineContext) void {
-    var new_tp: usize = undefined;
-    const e_get_fs = std.os.linux.syscall2(.arch_prctl, std.os.linux.ARCH.GET_FS, @intFromPtr(&new_tp));
-    std.debug.assert(e_get_fs == 0);
+    const new_tp = currentThreadPointer();
 
     Logger.info("new thread spawned: {d} [0x{x}]", .{ ctx.idx, new_tp });
 
@@ -5543,17 +5842,25 @@ fn threadRoutine(ctx: ThreadRoutineContext) void {
     }
 
     thread_mutex.lock(dll_io) catch @panic("error locking mutex");
-    thread_infos.putNoClobber(dll_allocator, ctx.idx, .{ .idx = ctx.idx, .handle = new_tp, .t = ctx.thread, .ret = undefined }) catch @panic("OOM");
+    const entry = thread_infos.getOrPut(dll_allocator, ctx.idx) catch @panic("OOM");
+    if (!entry.found_existing) {
+        entry.value_ptr.* = .{ .idx = ctx.idx, .handle = new_tp, .t = ctx.thread, .ret = undefined };
+    } else {
+        std.debug.assert(entry.value_ptr.idx == ctx.idx);
+        std.debug.assert(entry.value_ptr.handle == new_tp);
+        std.debug.assert(entry.value_ptr.t == ctx.thread);
+    }
     thread_mutex.unlock(dll_io);
 
     const ret = ctx.f(ctx.arg);
+    runThreadDestructors(new_tp);
 
     thread_mutex.lock(dll_io) catch @panic("error locking mutex");
-    var r = thread_infos.getOrPut(dll_allocator, ctx.idx) catch @panic("OOM");
-    r.value_ptr.ret = ret;
+    const entry_after = thread_infos.getPtr(ctx.idx).?;
+    entry_after.ret = ret;
     thread_mutex.unlock(dll_io);
 
-    Logger.info("thread {d} completed: 0x{x}", .{ ctx.idx, @intFromPtr(r.value_ptr.ret) });
+    Logger.info("thread {d} completed: 0x{x}", .{ ctx.idx, @intFromPtr(ret) });
 }
 
 fn pthreadCreateSubstitute(newthread: *c_ulong, attr: ?*const anyopaque, start_routine: *const fn (?*anyopaque) callconv(.c) *anyopaque, arg: ?*anyopaque) callconv(.c) c_int {
@@ -5574,7 +5881,7 @@ fn pthreadCreateSubstitute(newthread: *c_ulong, attr: ?*const anyopaque, start_r
     extra_threads.append(dll_allocator, thread) catch @panic("OOM");
     thread_mutex.unlock(dll_io);
 
-    const idx = @atomicRmw(usize, &currentIdx, .Add, 1, .seq_cst);
+    const idx = @atomicRmw(usize, &thread_current_idx, .Add, 1, .seq_cst);
     thread.* = std.Thread.spawn(.{}, threadRoutine, .{ThreadRoutineContext{ .idx = idx, .thread = thread, .f = start_routine, .arg = arg }}) catch |err| {
         Logger.warn("pthread_create(0x{x}, 0x{x}, 0x{x}, 0x{x}) failed: {}", .{ @intFromPtr(newthread), @intFromPtr(attr), @intFromPtr(start_routine), @intFromPtr(arg), err });
         return 1;
@@ -5582,6 +5889,19 @@ fn pthreadCreateSubstitute(newthread: *c_ulong, attr: ?*const anyopaque, start_r
 
     const newthread_handle: *c_ulong = @ptrCast(@alignCast(newthread));
     newthread_handle.* = @intFromPtr(thread.impl.thread.mapped.ptr) + tls_offset;
+
+    thread_mutex.lock(dll_io) catch @panic("error locking mutex");
+
+    const entry = thread_infos.getOrPut(dll_allocator, idx) catch @panic("OOM");
+    if (!entry.found_existing) {
+        entry.value_ptr.* = .{ .idx = idx, .handle = newthread_handle.*, .t = thread, .ret = undefined };
+    } else {
+        std.debug.assert(entry.value_ptr.idx == idx);
+        std.debug.assert(entry.value_ptr.handle == newthread_handle.*);
+        std.debug.assert(entry.value_ptr.t == thread);
+    }
+
+    thread_mutex.unlock(dll_io);
 
     Logger.info("intercepted call: success: pthread_create(0x{x}, 0x{x}, 0x{x}, 0x{x}) = 0", .{ @intFromPtr(newthread), @intFromPtr(attr), @intFromPtr(start_routine), @intFromPtr(arg) });
 
@@ -5616,27 +5936,19 @@ fn pthreadJoinSubstitute(thread_handle: c_ulong, retval: ?**anyopaque) callconv(
             continue;
         }
 
+        const thread = entry.t;
+        const idx = entry.idx;
         thread_mutex.unlock(dll_io);
+        thread.join();
 
-        // TODO bad things can happen here...
-        // `entry` might have become an invalid pointer
+        thread_mutex.lock(dll_io) catch @panic("error locking mutex");
+        if (retval) |result| result.* = thread_infos.get(idx).?.ret;
+        _ = thread_infos.swapRemove(idx);
+        if (std.mem.findScalar(*std.Thread, extra_threads.items, thread)) |pos| _ = extra_threads.swapRemove(pos);
+        thread_mutex.unlock(dll_io);
+        dll_allocator.destroy(thread);
 
-        entry.t.join();
-
-        if (retval != null) {
-            thread_mutex.lock(dll_io) catch @panic("error locking mutex");
-
-            for (thread_infos.values()) |*n_entry| {
-                if (n_entry.handle != thread_handle) {
-                    continue;
-                }
-
-                retval.?.* = n_entry.ret;
-                break;
-            }
-
-            thread_mutex.unlock(dll_io);
-        }
+        unloadUnreferencedObjects() catch |err| Logger.warn("pthread_join: deferred unload failed: {}", .{err});
 
         Logger.info("intercepted call: success: pthread_join(0x{x}, 0x{x})", .{ thread_handle, @intFromPtr(retval) });
 
@@ -5676,9 +5988,7 @@ fn tlsGetAddressSubstitute(tls_index: *TlsIndex) callconv(.c) ?*anyopaque {
 
     const dyn_object_idx = tls_index.ti_module - 1;
 
-    var tp: usize = undefined;
-    const e_get_fs = std.os.linux.syscall2(.arch_prctl, std.os.linux.ARCH.GET_FS, @intFromPtr(&tp));
-    std.debug.assert(e_get_fs == 0);
+    const tp = currentThreadPointer();
 
     const dyn_object = &dyn_objects.values()[dyn_object_idx];
     const addr = tp - dyn_object.tls_offset + tls_index.ti_offset;
