@@ -68,6 +68,11 @@ pub fn main(init: std.process.Init) !void {
 
     const lib_x11 = try dll.load("libX11.so.6");
 
+    // Workaround: nvidia's vulkan driver registers X display cleanup callbacks in libXext,
+    // so keep it loaded until dll.deinit().
+    // See https://forums.developer.nvidia.com/t/vulkan-xlib-issue/230914
+    _ = try dll.load("libXext.so.6");
+
     const xOpenDisplay: *Xlib.XOpenDisplay = @ptrFromInt((try lib_x11.getSymbol("XOpenDisplay")).addr);
     const xDefaultScreen: *Xlib.XDefaultScreen = @ptrFromInt((try lib_x11.getSymbol("XDefaultScreen")).addr);
     const xRootWindow: *Xlib.XRootWindow = @ptrFromInt((try lib_x11.getSymbol("XRootWindow")).addr);
