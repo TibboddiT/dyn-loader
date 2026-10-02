@@ -158,17 +158,17 @@ const DynObject = struct {
     ref_count: usize,
     loaded_at: ?usize,
     loaded_size: usize,
-    reservation: ?[]align(std.heap.pageSize()) u8 = null,
-    tls_capacity: usize = 0,
-    tls_slot_align: usize = 0,
-    load_requested: bool = true,
-    finalizing: bool = false,
-    pinned: bool = false,
-    tls_destructors: usize = 0,
-    binding_dependencies: std.ArrayList(usize) = .empty,
-    phdr_info: ?*std.posix.dl_phdr_info = null,
-    phdr_name: ?[:0]u8 = null,
-    relocated: bool = false,
+    reservation: ?[]align(std.heap.pageSize()) u8,
+    tls_capacity: usize,
+    tls_slot_align: usize,
+    load_requested: bool,
+    finalizing: bool,
+    pinned: bool,
+    tls_destructors: usize,
+    binding_dependencies: std.ArrayList(usize),
+    phdr_info: ?*std.posix.dl_phdr_info,
+    phdr_name: ?[:0]u8,
+    relocated: bool,
 
     fn init(key: DynObjectId, name: []const u8, path: []const u8) DynObject {
         return .{
@@ -213,6 +213,17 @@ const DynObject = struct {
             .ref_count = 0,
             .loaded_at = null,
             .loaded_size = 0,
+            .reservation = null,
+            .tls_capacity = 0,
+            .tls_slot_align = 0,
+            .load_requested = true,
+            .finalizing = false,
+            .pinned = false,
+            .tls_destructors = 0,
+            .binding_dependencies = .empty,
+            .phdr_info = null,
+            .phdr_name = null,
+            .relocated = false,
         };
     }
 };
@@ -2119,6 +2130,14 @@ fn loadDso(o_path: []const u8, root_runpath: ?[]const u8, root_origin_dir: ?[]co
             .reservation = if (previous_dyn_object) |previous| previous.reservation else null,
             .tls_capacity = if (previous_dyn_object) |previous| previous.tls_capacity else 0,
             .tls_slot_align = if (previous_dyn_object) |previous| previous.tls_slot_align else 0,
+            .load_requested = true,
+            .finalizing = false,
+            .pinned = false,
+            .tls_destructors = 0,
+            .binding_dependencies = .empty,
+            .phdr_info = null,
+            .phdr_name = null,
+            .relocated = false,
         };
     }
 
