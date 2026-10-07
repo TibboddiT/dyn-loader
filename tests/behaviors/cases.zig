@@ -1,5 +1,9 @@
-const runner = @import("runner.zig");
-const LibraryState = @import("../library_out_params.zig").LibraryState;
+const runner = @import("lifecycle_runner");
+const LibraryState = @import("regression_abi").LibraryState;
+
+const host_tls_migration = @import("specifics/host_tls_migration.zig");
+const failure_recovery = @import("specifics/failure_recovery.zig");
+const tls_surplus = @import("specifics/tls_surplus.zig");
 
 const bridge_symbols: runner.BridgeSymbols = .{
     .open = "openProbe",
@@ -13,13 +17,6 @@ const reload_symbols: runner.ReloadSymbols = .{
     .read_state = "readState",
     .mutate = "mutate",
     .set_tls = "setTls",
-};
-
-const tls_destructor_symbols: runner.TlsDestructorSymbols = .{
-    .read_state = reload_symbols.read_state,
-    .mutate = reload_symbols.mutate,
-    .set_tls = reload_symbols.set_tls,
-    .register_tls_destructor = "registerTlsCallback",
 };
 
 const dependency_symbols: runner.DependencySymbols = .{
@@ -44,68 +41,96 @@ const mutated_state: LibraryState = .{
 
 pub const cases: []const runner.Case = &.{
     .{
-        .name = "selfhost-reload",
+        .name = "reallocarray-failure",
         .bridge = "bridge.so",
         .bridge_symbols = bridge_symbols,
         .library = "target.so",
-        .behavior = .{ .reload_cycles = .{
-            .symbols = reload_symbols,
-            .cycles = 16,
-            .expected_initial = initial_state,
-            .expected_mutated = mutated_state,
-            .worker_tls_value = 77,
-        } },
+        .behavior = .{ .specific = .{ .run = &failure_recovery.runReallocarray } },
     },
     .{
-        .name = "llvm-reload",
+        .name = "tls-surplus-rejection",
         .bridge = "bridge.so",
         .bridge_symbols = bridge_symbols,
-        .library = "target_llvm.so",
-        .behavior = .{ .reload_cycles = .{
-            .symbols = reload_symbols,
-            .cycles = 16,
-            .expected_initial = initial_state,
-            .expected_mutated = mutated_state,
-            .worker_tls_value = 77,
-        } },
+        .library = "target_excess_tls.so",
+        .requires = .{ .tls_size_greater_than = 1024 * 1024 },
+        .behavior = .{ .specific = .{ .run = &tls_surplus.run } },
     },
     .{
-        .name = "pending-tls-destructor",
+        .name = "failure-recovery",
         .bridge = "bridge.so",
         .bridge_symbols = bridge_symbols,
         .library = "target.so",
-        .behavior = .{ .pending_tls_destructor = .{
-            .symbols = tls_destructor_symbols,
-            .expected_initial = initial_state,
-            .expected_mutated = mutated_state,
-            .worker_tls_value = 77,
-            .expected_tls_destructor = .{ .destructor_count = 1, .tls_value = 77 },
-        } },
+        .behavior = .{ .specific = .{ .run = &failure_recovery.run } },
+    },
+    .{
+        .name = "host-tls-migration",
+        .bridge = "bridge.so",
+        .bridge_symbols = bridge_symbols,
+        .library = "target.so",
+        .behavior = .{
+            .specific = .{
+                .run = &host_tls_migration.run,
+            },
+        },
+    },
+    .{
+        .name = "reload",
+        .bridge = "bridge.so",
+        .bridge_symbols = bridge_symbols,
+        .library = "target.so",
+        .behavior = .{
+            .reload_cycles = .{
+                .symbols = reload_symbols,
+                .cycles = 16,
+                .expected_initial = initial_state,
+                .expected_mutated = mutated_state,
+                .worker_tls_value = 77,
+            },
+        },
+    },
+    .{
+        .name = "reload-optimized",
+        .bridge = "bridge.so",
+        .bridge_symbols = bridge_symbols,
+        .library = "target_optimized.so",
+        .behavior = .{
+            .reload_cycles = .{
+                .symbols = reload_symbols,
+                .cycles = 16,
+                .expected_initial = initial_state,
+                .expected_mutated = mutated_state,
+                .worker_tls_value = 77,
+            },
+        },
     },
     .{
         .name = "shared-dependency",
         .bridge = "bridge.so",
         .bridge_symbols = bridge_symbols,
         .library = "target.so",
-        .behavior = .{ .dependency_lifetime = .{
-            .consumer = "dependency.so",
-            .symbols = dependency_symbols,
-            .expected_initial = initial_state,
-            .expected_mutated = mutated_state,
-        } },
+        .behavior = .{
+            .dependency_lifetime = .{
+                .consumer = "dependency.so",
+                .symbols = dependency_symbols,
+                .expected_initial = initial_state,
+                .expected_mutated = mutated_state,
+            },
+        },
     },
     .{
-        .name = "zig-debug-large-tls",
+        .name = "large-tls-reload",
         .bridge = "bridge.so",
         .bridge_symbols = bridge_symbols,
-        .library = "target_zig_debug.so",
+        .library = "target_large_tls.so",
         .requires = .{ .tls_size_greater_than = 32 * 1024 },
-        .behavior = .{ .reload_cycles = .{
-            .symbols = reload_symbols,
-            .cycles = 16,
-            .expected_initial = initial_state,
-            .expected_mutated = mutated_state,
-            .worker_tls_value = 77,
-        } },
+        .behavior = .{
+            .reload_cycles = .{
+                .symbols = reload_symbols,
+                .cycles = 16,
+                .expected_initial = initial_state,
+                .expected_mutated = mutated_state,
+                .worker_tls_value = 77,
+            },
+        },
     },
 };

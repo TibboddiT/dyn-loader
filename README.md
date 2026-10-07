@@ -136,3 +136,9 @@ The following example will only work on glibc-based systems (because it uses lib
 ```
 zig build run-raylib
 ```
+
+### Test matrix
+
+```
+zig build run-tests_matrix -- --help
+```

@@ -11,8 +11,3 @@ pub const FinalizationEvents = extern struct {
     zeroed_global: u32 = 0,
     tls_value: u32 = 0,
 };
-
-pub const TlsDestructorEvents = extern struct {
-    destructor_count: u32 = 0,
-    tls_value: u32 = 0,
-};

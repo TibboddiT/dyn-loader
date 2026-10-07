@@ -1,0 +1,111 @@
+{
+  "schema_version": 1,
+  "platform": "linux/amd64",
+  "fixture_cflags": ["-std=c11", "-O0", "-g", "-fPIC", "-fno-builtin", "-D_GNU_SOURCE", "-Wall", "-Wextra", "-Werror"],
+  "runtimes": [
+    {
+      "id": "debian11-glibc231",
+      "distribution": "Debian 11 (bullseye)",
+      "libc_family": "glibc",
+      "libc_version": "2.31",
+      "package_version": "2.31-13+deb11u14",
+      "image": "debian@sha256:e5b6442dd2e9684cf5e87d8338b5968f3b348636fc0be6d7850a381e3731a2bd",
+      "discovery_tag": "debian:bullseye-slim",
+      "libc_path": "/lib/x86_64-linux-gnu/libc.so.6",
+      "loader_path": "/lib64/ld-linux-x86-64.so.2",
+      "sdk_recipe": "debian",
+      "sdk_args": {"SUITE": "bullseye", "SNAPSHOT": "20261007T000000Z"}
+    },
+    {
+      "id": "debian12-glibc236",
+      "distribution": "Debian 12 (bookworm)",
+      "libc_family": "glibc",
+      "libc_version": "2.36",
+      "package_version": "2.36-9+deb12u14",
+      "image": "debian@sha256:7c7b2c966bc9ee8cedfeef67e0e279108992c77681fa595db4a9d65c06ccc587",
+      "discovery_tag": "debian:bookworm-slim",
+      "libc_path": "/lib/x86_64-linux-gnu/libc.so.6",
+      "loader_path": "/lib64/ld-linux-x86-64.so.2",
+      "sdk_recipe": "debian",
+      "sdk_args": {"SUITE": "bookworm", "SNAPSHOT": "20261007T000000Z"}
+    },
+    {
+      "id": "debian-testing-glibc243",
+      "distribution": "Debian testing (forky), 2026-10-07",
+      "libc_family": "glibc",
+      "libc_version": "2.43",
+      "package_version": "2.43-6",
+      "image": "debian@sha256:52429161d87100e54fbc5bda4cd4d6a1c4477cad8c08d056a76b41c0be9e6000",
+      "discovery_tag": "debian:testing-slim",
+      "libc_path": "/lib/x86_64-linux-gnu/libc.so.6",
+      "loader_path": "/lib64/ld-linux-x86-64.so.2",
+      "sdk_recipe": "debian",
+      "sdk_args": {"SUITE": "forky", "SNAPSHOT": "20261007T000000Z"}
+    },
+    {
+      "id": "arch-glibc244",
+      "distribution": "Arch Linux, 2026-10-07",
+      "libc_family": "glibc",
+      "libc_version": "2.44",
+      "package_version": "2.44+r50+g1848099f063e-1",
+      "image": "archlinux@sha256:4e77cf2ea5f410e6f8be5abf93ccf17ce2436e87a138c167208356711a405dbd",
+      "discovery_tag": "archlinux:base",
+      "libc_path": "/usr/lib/libc.so.6",
+      "loader_path": "/usr/lib/ld-linux-x86-64.so.2",
+      "sdk_recipe": "arch",
+      "sdk_args": {"SNAPSHOT": "2026/10/06"}
+    },
+    {
+      "id": "alpine310-musl1122",
+      "distribution": "Alpine 3.10.9 (original musl __libc layout)",
+      "libc_family": "musl",
+      "libc_version": "1.1.22",
+      "package_version": "1.1.22-r4",
+      "image": "alpine@sha256:451eee8bedcb2f029756dc3e9d73bab0e7943c1ac55cff3a4861c52a0fdd3e98",
+      "discovery_tag": "alpine:3.10",
+      "libc_path": "/lib/ld-musl-x86_64.so.1",
+      "loader_path": "/lib/ld-musl-x86_64.so.1",
+      "sdk_recipe": "alpine",
+      "sdk_args": {}
+    },
+    {
+      "id": "chimera-musl126",
+      "distribution": "Chimera Linux, musl with mimalloc",
+      "libc_family": "musl",
+      "libc_version": "1.2.6",
+      "package_version": "1.2.6-r2",
+      "image": "chimeralinux/chimera@sha256:29102d7e12a1f464707d7aba19ce53e652d277861838ed4129178d0655444b1a",
+      "discovery_tag": "chimeralinux/chimera:latest",
+      "libc_path": "/usr/lib/libc.so",
+      "loader_path": "/usr/lib/ld-musl-x86_64.so.1",
+      "sdk_recipe": "chimera",
+      "sdk_args": {"LLVM_PACKAGE_VERSION": "22.1.8-r0"}
+    },
+    {
+      "id": "nixos-glibc239",
+      "distribution": "NixOS/nixpkgs userspace from nix:2.24.11's pinned snapshot",
+      "libc_family": "glibc",
+      "libc_version": "2.39",
+      "package_version": "2.39",
+      "image": "nixos/nix@sha256:4bfe741027f0bfbef745862cbf3b5f424ee99801c04138146c0000a28759636d",
+      "discovery_tag": "nixos/nix:2.24.11",
+      "libc_path": "/nix/store/87848rvrg5c7jmplpi0iapvbxyj9kfid-glibc-2.39-52/lib/libc.so.6",
+      "loader_path": "/nix/store/87848rvrg5c7jmplpi0iapvbxyj9kfid-glibc-2.39-52/lib/ld-linux-x86-64.so.2",
+      "sdk_recipe": "nixos",
+      "sdk_args": {}
+    },
+    {
+      "id": "alpine322-musl125",
+      "distribution": "Alpine 3.22.6",
+      "libc_family": "musl",
+      "libc_version": "1.2.5",
+      "package_version": "1.2.5-r12",
+      "image": "alpine@sha256:5291449c3df73caf6ed85e649dec1b9e818b39a5d8c871e97afc13e9cd5e8fa8",
+      "discovery_tag": "alpine:3.22",
+      "libc_path": "/lib/ld-musl-x86_64.so.1",
+      "loader_path": "/lib/ld-musl-x86_64.so.1",
+      "sdk_recipe": "alpine",
+      "sdk_args": {}
+    }
+  ]
+}
