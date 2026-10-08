@@ -5072,14 +5072,12 @@ fn getSubstituteAddress(sym: ResolvedSymbol, for_obj: *DynObject, allow_preload_
         addr = @intFromPtr(&posixMemalignSubstitute);
     } else if (std.mem.eql(u8, sym.name, "memalign")) {
         addr = @intFromPtr(&alignedAllocSubstitute);
-    } else if (std.mem.eql(u8, sym.name, "valloc")) {
+    } else if (std.mem.eql(u8, sym.name, "valloc") or
+        std.mem.eql(u8, sym.name, "pvalloc") or
+        std.mem.eql(u8, sym.name, "malloc_usable_size"))
+    {
         if (isLibcName(for_obj.name)) {
-            Logger.warn("substitutes: {s}: dangerous unsubstituted valloc function [{s}] {s} at 0x{x}", .{ for_obj.name, dyn_object.name, sym.name, sym.address });
-        }
-        addr = @intFromPtr(&unsubstitutedTrap);
-    } else if (std.mem.eql(u8, sym.name, "palloc")) {
-        if (isLibcName(for_obj.name)) {
-            Logger.warn("substitutes: {s}: dangerous unsubstituted palloc function [{s}] {s} at 0x{x}", .{ for_obj.name, dyn_object.name, sym.name, sym.address });
+            Logger.warn("substitutes: {s}: dangerous unsubstituted allocator function [{s}] {s} at 0x{x}", .{ for_obj.name, dyn_object.name, sym.name, sym.address });
         }
         addr = @intFromPtr(&unsubstitutedTrap);
     }
