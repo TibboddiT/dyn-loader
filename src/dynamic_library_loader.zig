@@ -5029,6 +5029,112 @@ fn callFiniFunctions(dyn_obj: *DynObject) !void {
     }
 }
 
+const substitutes = std.StaticStringMap(*const anyopaque).initComptime([_]struct { []const u8, *const anyopaque }{
+    // Allocation
+    .{ "malloc", @ptrCast(&mallocSubstitute) },
+    .{ "free", @ptrCast(&freeSubstitute) },
+    .{ "calloc", @ptrCast(&callocSubstitute) },
+    .{ "realloc", @ptrCast(&reallocSubstitute) },
+    .{ "reallocarray", @ptrCast(&reallocarraySubstitute) },
+    .{ "aligned_alloc", @ptrCast(&alignedAllocSubstitute) },
+    .{ "posix_memalign", @ptrCast(&posixMemalignSubstitute) },
+    .{ "memalign", @ptrCast(&alignedAllocSubstitute) },
+    .{ "cfree", @ptrCast(&unsubstitutedTrap) },
+    .{ "valloc", @ptrCast(&unsubstitutedTrap) },
+    .{ "pvalloc", @ptrCast(&unsubstitutedTrap) },
+    .{ "malloc_usable_size", @ptrCast(&unsubstitutedTrap) },
+
+    // Dynamic loading and TLS
+    .{ "dlopen", @ptrCast(&dlopenSubstitute) },
+    .{ "dlclose", @ptrCast(&dlcloseSubstitute) },
+    .{ "dlsym", @ptrCast(&dlsymSubstitute) },
+    .{ "dladdr", @ptrCast(&dladdrSubstitute) },
+    .{ "dlerror", @ptrCast(&dlerrorSubstitute) },
+    .{ "dlvsym", @ptrCast(&dlvsymSubstitute) },
+    .{ "dladdr1", @ptrCast(&dladdr1Substitute) },
+    .{ "dlinfo", @ptrCast(&dlinfoSubstitute) },
+    .{ "dlmopen", @ptrCast(&dlmopenSubstitute) },
+    .{ "_dl_get_tls_static_info", @ptrCast(&dlGetTlsStaticInfoSubstitute) },
+    .{ "_dl_find_object", @ptrCast(&dlFindObjectSubstitute) },
+    .{ "_dl_find_dso_for_object", @ptrCast(&dlFindDsoForObjectSubstitute) },
+    .{ "dl_iterate_phdr", @ptrCast(&dlIteratePhdrSubstitute) },
+    .{ "__tls_get_addr", @ptrCast(&tlsGetAddressSubstitute) },
+    .{ "__cxa_thread_atexit_impl", @ptrCast(&cxaThreadAtExitSubstitute) },
+    .{ "__cxa_thread_atexit", @ptrCast(&cxaThreadAtExitSubstitute) },
+
+    // Threads
+    .{ "pthread_create", @ptrCast(&pthreadCreateSubstitute) },
+    .{ "pthread_exit", @ptrCast(&pthreadExitSubstitute) },
+    .{ "pthread_cancel", @ptrCast(&pthreadCancelSubstitute) },
+    .{ "pthread_detach", @ptrCast(&pthreadDetachSubstitute) },
+    .{ "pthread_join", @ptrCast(&pthreadJoinSubstitute) },
+    .{ "pthread_kill", @ptrCast(&pthreadKillSubstitute) },
+    .{ "pthread_tryjoin_np", @ptrCast(&unsubstitutedTrap) },
+    .{ "pthread_timedjoin_np", @ptrCast(&unsubstitutedTrap) },
+
+    // C11 threads
+    .{ "thrd_create", @ptrCast(&unsubstitutedTrap) },
+    .{ "thrd_join", @ptrCast(&unsubstitutedTrap) },
+    .{ "thrd_exit", @ptrCast(&unsubstitutedTrap) },
+    .{ "thrd_detach", @ptrCast(&unsubstitutedTrap) },
+
+    // Async I/O
+    .{ "aio_read", @ptrCast(&unsubstitutedTrap) },
+    .{ "aio_write", @ptrCast(&unsubstitutedTrap) },
+    .{ "aio_fsync", @ptrCast(&unsubstitutedTrap) },
+    .{ "aio_error", @ptrCast(&unsubstitutedTrap) },
+    .{ "aio_return", @ptrCast(&unsubstitutedTrap) },
+    .{ "aio_suspend", @ptrCast(&unsubstitutedTrap) },
+    .{ "aio_cancel", @ptrCast(&unsubstitutedTrap) },
+    .{ "lio_listio", @ptrCast(&unsubstitutedTrap) },
+    .{ "aio_read64", @ptrCast(&unsubstitutedTrap) },
+    .{ "aio_write64", @ptrCast(&unsubstitutedTrap) },
+    .{ "aio_fsync64", @ptrCast(&unsubstitutedTrap) },
+    .{ "aio_error64", @ptrCast(&unsubstitutedTrap) },
+    .{ "aio_return64", @ptrCast(&unsubstitutedTrap) },
+    .{ "aio_suspend64", @ptrCast(&unsubstitutedTrap) },
+    .{ "aio_cancel64", @ptrCast(&unsubstitutedTrap) },
+    .{ "lio_listio64", @ptrCast(&unsubstitutedTrap) },
+    .{ "aio_init", @ptrCast(&unsubstitutedTrap) },
+
+    // Others
+    .{ "mq_notify", @ptrCast(&mqNotifySubstitute) },
+    .{ "getaddrinfo_a", @ptrCast(&unsubstitutedTrap) },
+});
+
+fn selectSubstituteAddress(sym: ResolvedSymbol) ?usize {
+    if (substitutes.get(sym.name)) |replacement| {
+        return @intFromPtr(replacement);
+    }
+
+    // Special case for `timer_create`
+    if (std.mem.eql(u8, sym.name, "timer_create")) {
+        inline for (.{ "GLIBC_2.2.5", "GLIBC_2.3.3", "GLIBC_2.34" }) |version| {
+            if (std.mem.eql(u8, sym.version, version)) {
+                return @intFromPtr(&TimerCreateSubstitute(version).call);
+            }
+        }
+        return @intFromPtr(&TimerCreateSubstitute(null).call);
+    }
+
+    // libc things
+    const dyn_object = &dyn_objects.values()[sym.dyn_object_idx];
+    if (isLibcName(dyn_object.name) and
+        (std.mem.eql(u8, sym.name, "backtrace") or
+            std.mem.eql(u8, sym.name, "backtrace_symbols") or
+            std.mem.eql(u8, sym.name, "backtrace_symbols_fd")))
+    {
+        return @intFromPtr(&unsubstitutedTrap);
+    }
+
+    // Trap remaining `dl` family functions
+    if (std.mem.startsWith(u8, sym.name, "dl") or std.mem.startsWith(u8, sym.name, "_dl")) {
+        return @intFromPtr(&unsubstitutedTrap);
+    }
+
+    return null;
+}
+
 fn getSubstituteAddress(sym: ResolvedSymbol, for_obj: *DynObject, allow_preload_override: bool) ?usize {
     if (sym.dyn_object_idx == std.math.maxInt(usize)) {
         return null;
@@ -5052,119 +5158,67 @@ fn getSubstituteAddress(sym: ResolvedSymbol, for_obj: *DynObject, allow_preload_
         }
     }
 
-    var addr: ?usize = null;
+    const address = selectSubstituteAddress(sym) orelse return null;
 
-    // alloc functions
-    // TODO errno handling
-    if (std.mem.eql(u8, sym.name, "malloc")) {
-        addr = @intFromPtr(&mallocSubstitute);
-    } else if (std.mem.eql(u8, sym.name, "free")) {
-        addr = @intFromPtr(&freeSubstitute);
-    } else if (std.mem.eql(u8, sym.name, "calloc")) {
-        addr = @intFromPtr(&callocSubstitute);
-    } else if (std.mem.eql(u8, sym.name, "realloc")) {
-        addr = @intFromPtr(&reallocSubstitute);
-    } else if (std.mem.eql(u8, sym.name, "reallocarray")) {
-        addr = @intFromPtr(&reallocarraySubstitute);
-    } else if (std.mem.eql(u8, sym.name, "aligned_alloc")) {
-        addr = @intFromPtr(&alignedAllocSubstitute);
-    } else if (std.mem.eql(u8, sym.name, "posix_memalign")) {
-        addr = @intFromPtr(&posixMemalignSubstitute);
-    } else if (std.mem.eql(u8, sym.name, "memalign")) {
-        addr = @intFromPtr(&alignedAllocSubstitute);
-    } else if (std.mem.eql(u8, sym.name, "valloc") or
-        std.mem.eql(u8, sym.name, "pvalloc") or
-        std.mem.eql(u8, sym.name, "malloc_usable_size"))
-    {
-        if (isLibcName(for_obj.name)) {
-            Logger.warn("substitutes: {s}: dangerous unsubstituted allocator function [{s}] {s} at 0x{x}", .{ for_obj.name, dyn_object.name, sym.name, sym.address });
-        }
-        addr = @intFromPtr(&unsubstitutedTrap);
+    if (address == @intFromPtr(&unsubstitutedTrap)) {
+        Logger.warn("substitutes: {s}: installing trap for [{s}] {s} at 0x{x}", .{ for_obj.name, dyn_object.name, sym.name, sym.address });
     }
 
-    // dl functions
-    if (std.mem.eql(u8, sym.name, "__cxa_thread_atexit_impl") or std.mem.eql(u8, sym.name, "__cxa_thread_atexit")) {
-        addr = @intFromPtr(&cxaThreadAtExitSubstitute);
-    } else if (std.mem.eql(u8, sym.name, "dlopen")) {
-        addr = @intFromPtr(&dlopenSubstitute);
-    } else if (std.mem.eql(u8, sym.name, "dlclose")) {
-        addr = @intFromPtr(&dlcloseSubstitute);
-    } else if (std.mem.eql(u8, sym.name, "dlsym")) {
-        addr = @intFromPtr(&dlsymSubstitute);
-    } else if (std.mem.eql(u8, sym.name, "dladdr")) {
-        addr = @intFromPtr(&dladdrSubstitute);
-    } else if (std.mem.eql(u8, sym.name, "dlerror")) {
-        addr = @intFromPtr(&dlerrorSubstitute);
-    } else if (std.mem.eql(u8, sym.name, "dlvsym")) {
-        addr = @intFromPtr(&dlvsymSubstitute);
-    } else if (std.mem.eql(u8, sym.name, "dladdr1")) {
-        addr = @intFromPtr(&dladdr1Substitute);
-    } else if (std.mem.eql(u8, sym.name, "dlinfo")) {
-        addr = @intFromPtr(&dlinfoSubstitute);
-    } else if (std.mem.eql(u8, sym.name, "dlmopen")) {
-        addr = @intFromPtr(&dlmopenSubstitute);
-    } else if (std.mem.eql(u8, sym.name, "_dl_get_tls_static_info")) {
-        addr = @intFromPtr(&dlGetTlsStaticInfoSubstitute);
-    } else if (std.mem.eql(u8, sym.name, "_dl_find_object")) {
-        addr = @intFromPtr(&dlFindObjectSubstitute);
-    } else if (std.mem.eql(u8, sym.name, "_dl_find_dso_for_object")) {
-        addr = @intFromPtr(&dlFindDsoForObjectSubstitute);
-    } else if (std.mem.eql(u8, sym.name, "dl_iterate_phdr")) {
-        addr = @intFromPtr(&dlIteratePhdrSubstitute);
-    } else if (std.mem.startsWith(u8, sym.name, "dl") or std.mem.startsWith(u8, sym.name, "_dl")) {
-        if (isLibcName(for_obj.name)) {
-            Logger.warn("substitutes: {s}: dangerous unsubstituted dl function [{s}] {s} at 0x{x}", .{ for_obj.name, dyn_object.name, sym.name, sym.address });
-        }
-        addr = @intFromPtr(&unsubstitutedTrap);
-    }
-
-    // pthreads functions
-    if (std.mem.eql(u8, sym.name, "pthread_create")) {
-        addr = @intFromPtr(&pthreadCreateSubstitute);
-    } else if (std.mem.eql(u8, sym.name, "pthread_exit")) {
-        addr = @intFromPtr(&pthreadExitSubstitute);
-    } else if (std.mem.eql(u8, sym.name, "pthread_cancel")) {
-        addr = @intFromPtr(&pthreadCancelSubstitute);
-    } else if (std.mem.eql(u8, sym.name, "pthread_detach")) {
-        addr = @intFromPtr(&pthreadDetachSubstitute);
-    } else if (std.mem.eql(u8, sym.name, "pthread_join")) {
-        addr = @intFromPtr(&pthreadJoinSubstitute);
-    } else if (std.mem.eql(u8, sym.name, "pthread_kill")) {
-        addr = @intFromPtr(&pthreadKillSubstitute);
-    }
-    // TODO substitution not really needed, but keep it in mind
-    // else if (std.mem.eql(u8, sym.name, "pthread_once")) {
-    //     addr = @intFromPtr(&pthreadOnceSubstitute);
-    // }
-    // TODO check if those functions really needs to be subsituted, it seems they only acts on the pthread struct
-    // else if (std.mem.eql(u8, sym.name, "pthread_key_create")) {
-    //     Logger.warn("substitutes: {s}: dangerous unsubstituted pthread function [{s}] {s} as 0x{x}", .{ for_obj.name, dyn_object.name, sym.name, sym.address });
-    //     addr = @intFromPtr(&unsubstitutedTrap);
-    // } else if (std.mem.eql(u8, sym.name, "pthread_key_delete")) {
-    //     Logger.warn("substitutes: {s}: dangerous unsubstituted pthread function [{s}] {s} as 0x{x}", .{ for_obj.name, dyn_object.name, sym.name, sym.address });
-    //     addr = @intFromPtr(&unsubstitutedTrap);
-    // } else if (std.mem.eql(u8, sym.name, "pthread_setspecific")) {
-    //     Logger.warn("substitutes: {s}: dangerous unsubstituted pthread function [{s}] {s} as 0x{x}", .{ for_obj.name, dyn_object.name, sym.name, sym.address });
-    //     addr = @intFromPtr(&unsubstitutedTrap);
-    // } else if (std.mem.eql(u8, sym.name, "pthread_getspecific")) {
-    //     Logger.warn("substitutes: {s}: dangerous unsubstituted pthread function [{s}] {s} as 0x{x}", .{ for_obj.name, dyn_object.name, sym.name, sym.address });
-    //     addr = @intFromPtr(&unsubstitutedTrap);
-    // }
-
-    // special functions
-    if (std.mem.eql(u8, sym.name, "__tls_get_addr")) {
-        addr = @intFromPtr(&tlsGetAddressSubstitute);
-    }
-
-    if (addr != null) {
-        Logger.debug("substitutes: {s}: found for {s}: 0x{x} => 0x{x}", .{ dyn_object.name, sym.name, sym.address, addr.? });
-    }
-
-    return addr;
+    Logger.debug("substitutes: {s}: found for {s}: 0x{x} => 0x{x}", .{ dyn_object.name, sym.name, sym.address, address });
+    return address;
 }
 
 fn unsubstitutedTrap() void {
     @panic("unsupported call to a dangerous function");
+}
+
+// Common libc sigevent prefix
+const NotificationEvent = extern struct {
+    sigev_value: std.os.linux.sigval,
+    sigev_signo: c_int,
+    sigev_notify: c_int,
+};
+
+const sigev_thread: c_int = 2;
+
+fn nativeNotificationAddress(name: []const u8, version: ?[]const u8) usize {
+    const symbol = if (version) |requested_version|
+        getResolvedSymbolByNameAndVersion(null, name, requested_version, false, false, false) catch @panic("native notification function unavailable")
+    else
+        getResolvedSymbolByName(null, name, false, false, false) catch @panic("native notification function unavailable");
+
+    const dyn_object = &dyn_objects.values()[symbol.dyn_object_idx];
+
+    return vAddressToLoadedAddress(dyn_object, symbol.value, false) catch @panic("native notification function is not mapped");
+}
+
+fn TimerCreateSubstitute(comptime version: ?[]const u8) type {
+    return struct {
+        fn call(clock: c_int, event: ?*const NotificationEvent, timer_id: *anyopaque) callconv(.c) c_int {
+            if (event) |notification| {
+                if (notification.sigev_notify == sigev_thread) {
+                    @panic("unsupported timer_create notification: SIGEV_THREAD");
+                }
+            }
+
+            const NativeTimerCreate = *const fn (c_int, ?*const NotificationEvent, *anyopaque) callconv(.c) c_int;
+            const native: NativeTimerCreate = @ptrFromInt(nativeNotificationAddress("timer_create", version));
+
+            return native(clock, event, timer_id);
+        }
+    };
+}
+
+fn mqNotifySubstitute(queue: c_int, event: ?*const NotificationEvent) callconv(.c) c_int {
+    if (event) |notification| {
+        if (notification.sigev_notify == sigev_thread) {
+            @panic("unsupported mq_notify notification: SIGEV_THREAD");
+        }
+    }
+
+    const NativeMqNotify = *const fn (c_int, ?*const NotificationEvent) callconv(.c) c_int;
+    const native: NativeMqNotify = @ptrFromInt(nativeNotificationAddress("mq_notify", null));
+    return native(queue, event);
 }
 
 const ExtraAlloc = struct {
