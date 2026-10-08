@@ -2540,11 +2540,10 @@ var current_surplus_size: usize = 0x100000;
 var normal_current_tls_area_desc: ?@TypeOf(std.os.linux.tls.area_desc) = null;
 
 fn isLibcName(name: []const u8) bool {
-    if (std.mem.startsWith(u8, name, "libc.so")) {
-        return true;
-    }
-
-    return false;
+    // alpine use architecture-qualified libc name
+    return std.mem.startsWith(u8, name, "libc.so") or
+        std.mem.eql(u8, name, "libc.musl-x86_64.so.1") or
+        std.mem.eql(u8, name, "ld-musl-x86_64.so.1");
 }
 
 fn detectLibC(dyn_object: *DynObject) !void {
@@ -4765,6 +4764,10 @@ fn alignedAllocSubstitute(alignment: usize, size: usize) callconv(.c) ?*anyopaqu
 }
 
 fn posixMemalignSubstitute(memptr: **anyopaque, alignment: usize, size: usize) callconv(.c) c_int {
+    if (alignment == 0 or !std.math.isPowerOfTwo(alignment) or alignment % @sizeOf(*anyopaque) != 0) {
+        return @backingInt(std.os.linux.E.INVAL);
+    }
+
     alloc_mutex.lock(dll_io) catch @panic("error locking mutex");
 
     Logger.debug("intercepted call: posix_memalign(0x{x}, {d}, {d})", .{ @intFromPtr(memptr), alignment, size });
@@ -4815,24 +4818,35 @@ fn freeSubstitute(p: ?*anyopaque) callconv(.c) void {
     alloc_mutex.unlock(dll_io);
 }
 
-fn callocSubstitute(n: usize, size: usize) callconv(.c) *anyopaque {
+fn allocationFailure() ?*anyopaque {
+    const sym = getResolvedSymbolByName(null, "__errno_location", false, false, false) catch @panic("libc errno accessor unavailable");
+    const errno_location: *const fn () callconv(.c) *c_int = @ptrFromInt(sym.address);
+    errno_location().* = @backingInt(std.os.linux.E.NOMEM);
+    return null;
+}
+
+fn callocSubstitute(n: usize, size: usize) callconv(.c) ?*anyopaque {
     alloc_mutex.lock(dll_io) catch @panic("error locking mutex");
+    defer alloc_mutex.unlock(dll_io);
 
     Logger.debug("intercepted call: calloc({d}, {d})", .{ n, size });
 
-    const result = dll_alloc_allocator.alloc(u8, 16 + n * size) catch @panic("OOM");
+    const requested_size = std.math.mul(usize, n, size) catch return allocationFailure();
+    const allocation_size = std.math.add(usize, 16, requested_size) catch return allocationFailure();
+    const result = dll_alloc_allocator.alloc(u8, allocation_size) catch return allocationFailure();
     @memset(result, 0x0);
     const aligned_result = @as([*]u8, @ptrFromInt(std.mem.alignForward(usize, @intFromPtr(result.ptr), 16)));
 
     extra_allocations.put(dll_allocator, @intFromPtr(aligned_result), .{
         .addr = @intFromPtr(result.ptr),
-        .size = 16 + n * size,
-        .r_size = n * size,
-    }) catch @panic("OOM");
+        .size = allocation_size,
+        .r_size = requested_size,
+    }) catch {
+        dll_alloc_allocator.free(result);
+        return allocationFailure();
+    };
 
     Logger.info("intercepted call: success: calloc({d}, {d}) = 0x{x}", .{ n, size, @intFromPtr(aligned_result) });
-
-    alloc_mutex.unlock(dll_io);
 
     return aligned_result;
 }
