@@ -2546,482 +2546,943 @@ fn isLibcName(name: []const u8) bool {
         std.mem.eql(u8, name, "ld-musl-x86_64.so.1");
 }
 
-fn detectLibC(dyn_object: *DynObject) !void {
-    if (!isLibcName(dyn_object.name)) {
-        return;
+const CodeView = struct {
+    bytes: []const u8,
+    address: usize,
+
+    fn slice(code: CodeView, offset: usize, size: usize) !CodeView {
+        if (offset > code.bytes.len or size > code.bytes.len - offset) return error.TruncatedCodePattern;
+
+        const virtual_address = std.math.add(usize, code.address, offset) catch return error.InvalidCodeAddress;
+        return .{
+            .bytes = code.bytes[offset..][0..size],
+            .address = virtual_address,
+        };
     }
 
-    std.debug.assert(libc_specifics == null);
+    fn readI32(code: CodeView, offset: usize) !i32 {
+        const operand = try code.slice(offset, 4);
+        return std.mem.readInt(i32, operand.bytes[0..4], .little);
+    }
 
-    Logger.debug("libc detection: {s} is detected as libc", .{dyn_object.path});
+    fn relativeTarget(code: CodeView, operand_offset: usize) !usize {
+        const operand = try code.slice(operand_offset, 4);
+        const next_instruction_address = std.math.add(usize, operand.address, 4) catch return error.InvalidCodeAddress;
+        const displacement = try code.readI32(operand_offset);
 
-    const maybe_issetugid_sym = getResolvedSymbolByName(dyn_object, "issetugid", false, false, true) catch |err| switch (err) {
-        error.UnresolvedSymbol => null,
-        else => |e| return e,
-    };
+        return addDisplacement(next_instruction_address, displacement);
+    }
 
-    const maybe_rtld_global_ro_sym = getResolvedSymbolByName(dyn_object, "_rtld_global_ro", false, false, true) catch |err| switch (err) {
-        error.UnresolvedSymbol => null,
-        else => |e| return e,
-    };
+    fn addDisplacement(address: usize, displacement: i32) !usize {
+        // Widen before negating so the minimum i32 displacement is representable.
+        const signed_displacement: i64 = displacement;
+        if (signed_displacement < 0) {
+            return std.math.sub(usize, address, @intCast(-signed_displacement)) catch error.InvalidCodeAddress;
+        }
 
-    std.debug.assert(maybe_issetugid_sym == null or maybe_rtld_global_ro_sym == null);
+        return std.math.add(usize, address, @intCast(signed_displacement)) catch error.InvalidCodeAddress;
+    }
 
-    if (maybe_issetugid_sym) |issetugid_sym| {
-        // musl
-        Logger.debug("libc detection: {s} is detected as musl, searching __libc symbol", .{dyn_object.path});
+    // Only the gap is variable. Callers supply complete known opcode sequences
+    // around operands rather than searching for individual call-opcode bytes.
+    fn findUnique(code: CodeView, prefix: []const u8, gap_bytes: usize, suffix: []const u8) !?usize {
+        const suffix_offset = std.math.add(usize, prefix.len, gap_bytes) catch return error.TruncatedCodePattern;
+        const pattern_size = std.math.add(usize, suffix_offset, suffix.len) catch return error.TruncatedCodePattern;
+        if (pattern_size == 0 or pattern_size > code.bytes.len) return null;
 
-        // TODO detect version
+        var match_offset: ?usize = null;
+        for (0..code.bytes.len - pattern_size + 1) |offset| {
+            const candidate = code.bytes[offset..][0..pattern_size];
+            if (!std.mem.eql(u8, candidate[0..prefix.len], prefix)) continue;
+            if (!std.mem.eql(u8, candidate[suffix_offset..], suffix)) continue;
 
-        std.debug.assert(dyn_objects.values()[issetugid_sym.dyn_object_idx].mapped_at == dyn_object.mapped_at);
+            if (match_offset != null) return error.AmbiguousCodePattern;
+            match_offset = offset;
+        }
 
-        // write address of substitutes at the end of the dyn object mapped memory
+        return match_offset;
+    }
+};
 
-        const extra_addr = dyn_object.loaded_at.? + dyn_object.loaded_size - 0x1000;
+fn objectCode(dyn_object: *const DynObject, virtual_address: usize, size_bytes: usize) !CodeView {
+    for (dyn_object.segments.values()) |segment| {
+        if (!segment.flags_first.read or !segment.flags_first.exec) continue;
+        if (virtual_address < segment.mem_offset) continue;
 
-        Logger.debug("libc detection: using extra segment at 0x{x}", .{extra_addr});
+        const segment_offset = virtual_address - segment.mem_offset;
+        if (segment_offset > segment.mem_size or size_bytes > segment.mem_size - segment_offset) continue;
 
-        const malloc_substitute_ptr: [*]u8 = @ptrFromInt(extra_addr + 0x0);
-        const calloc_substitute_ptr: [*]u8 = @ptrFromInt(extra_addr + 0x10);
+        const mapped_address = std.math.add(usize, segment.loaded_at, segment_offset) catch return error.InvalidCodeAddress;
+        const mapped_bytes: [*]const u8 = @ptrFromInt(mapped_address);
+        return .{
+            .address = virtual_address,
+            .bytes = mapped_bytes[0..size_bytes],
+        };
+    }
 
-        const seg_infos = try findDynObjectSegmentForLoadedAddr(extra_addr);
-        try unprotectSegment(seg_infos.dyn_object, seg_infos.segment_index);
+    return error.InvalidCodeAddress;
+}
 
-        malloc_substitute_ptr[0] = 0x48;
-        malloc_substitute_ptr[1] = 0xb8;
-        std.mem.writeInt(usize, malloc_substitute_ptr[2..10], @intFromPtr(&mallocSubstitute), .little);
-        malloc_substitute_ptr[10] = 0xff;
-        malloc_substitute_ptr[11] = 0xe0;
+fn symbolCode(dyn_object: *DynObject, name: []const u8) !CodeView {
+    const resolved = try getResolvedSymbolByName(dyn_object, name, false, false, true);
+    if (&dyn_objects.values()[resolved.dyn_object_idx] != dyn_object) return error.InvalidCodeAddress;
 
-        calloc_substitute_ptr[0] = 0x48;
-        calloc_substitute_ptr[1] = 0xb8;
-        std.mem.writeInt(usize, calloc_substitute_ptr[2..10], @intFromPtr(&callocSubstitute), .little);
-        calloc_substitute_ptr[10] = 0xff;
-        calloc_substitute_ptr[11] = 0xe0;
+    const symbol = dyn_object.syms_array.items[resolved.sym_idx];
+    return objectCode(dyn_object, symbol.value, symbol.size);
+}
 
-        try reprotectSegment(seg_infos.dyn_object, seg_infos.segment_index);
+fn findPltSlot(dyn_object: *const DynObject, target_address: usize, symbol_name: []const u8) !?usize {
+    const code = try objectCode(dyn_object, target_address, 6);
+    if (!std.mem.eql(u8, code.bytes[0..2], "\xff\x25")) return null; // jmp [rip + disp32]
 
-        const sym = dyn_object.syms_array.items[issetugid_sym.sym_idx];
-        const sym_addr = issetugid_sym.address;
-        const sym_size = sym.size;
-        const sym_content: []const u8 = @as([*]const u8, @ptrFromInt(sym_addr))[0..sym_size];
-        Logger.debug("libc detection: issetugid content: {x}", .{sym_content});
+    const slot_address = try code.relativeTarget(2);
+    for (dyn_object.relocs.items) |reloc| {
+        if (reloc.offset != slot_address) continue;
 
-        for (sym_content[2..], 2..) |b, i| {
-            if (b == 0x05 and i + 4 < sym_content.len) {
-                var offset: usize = 0;
-                // TODO assume LE
-                offset = sym_content[i + 4];
-                offset = (offset << 8) + sym_content[i + 3];
-                offset = (offset << 8) + sym_content[i + 2];
-                offset = (offset << 8) + sym_content[i + 1];
+        if (reloc.type != .JUMP_SLOT) return error.UnexpectedPltRelocation;
 
-                Logger.debug("libc detection: __libc: before 0x05: 0x{x}", .{sym_content[i - 1]});
-                const f_off: usize = switch (sym_content[i - 1]) {
-                    0x8d => 0,
-                    0xbe => 2,
-                    else => continue,
-                };
+        const symbol = dyn_object.syms_array.items[reloc.sym_idx];
+        if (!std.mem.eql(u8, symbol.name, symbol_name)) {
+            return error.UnexpectedPltRelocation;
+        }
 
-                const r_offset = i + 4 + 1 + offset - f_off;
-                const libc_addr = sym_addr + r_offset;
+        return slot_address;
+    }
 
-                Logger.debug("libc detection: __libc: offset: 0x{x}, addr: 0x{x} (0x{x})", .{ offset, libc_addr, sym.value + r_offset });
+    return error.MissingPltRelocation;
+}
 
-                const maybe_libc = resolveSymbolByName("__libc") catch null;
-                if (maybe_libc) |libc| {
-                    Logger.debug("libc detection: __libc: real addr: 0x{x}", .{libc.address});
+fn resolveEntryJump(dyn_object: *const DynObject, entry_address: usize) !usize {
+    const entry = try objectCode(dyn_object, entry_address, 5);
+    if (entry.bytes[0] == 0xe9) return entry.relativeTarget(1); // jmp rel32
+
+    const frame_pointer_wrapper =
+        "\x55" ++ // push rbp
+        "\x48\x89\xe5" ++ // mov rbp,rsp
+        "\x5d" ++ // pop rbp
+        "\xe9"; // jmp rel32
+
+    const wrapper = try objectCode(dyn_object, entry_address, frame_pointer_wrapper.len + 4);
+    if (std.mem.startsWith(u8, wrapper.bytes, frame_pointer_wrapper)) {
+        return wrapper.relativeTarget(frame_pointer_wrapper.len);
+    }
+
+    return error.UnrecognizedEntryJump;
+}
+
+const CallBinding = union(enum) {
+    relocated: struct {
+        slot_address: usize,
+    },
+    internal: struct {
+        target_address: usize,
+    },
+};
+
+const CallProbe = struct {
+    edi_value: i32,
+    esi_value: ?i32 = null,
+};
+
+fn hasPointerResultCheck(bytes: []const u8) bool {
+    if (std.mem.startsWith(u8, bytes, "\x48\x85\xc0")) return true; // test rax,rax
+    if (bytes.len < 3) return false;
+
+    // mov saved_register,rax
+    const rex = bytes[0];
+    const opcode = bytes[1];
+    const modrm = bytes[2];
+
+    if ((rex & 0xfe) != 0x48 or opcode != 0x89) return false;
+    if ((modrm & 0xf8) != 0xc0) return false;
+
+    const destination_index = modrm & 0b111;
+    const destination_extension = (rex & 0b0001) << 3;
+    const saved_register = destination_index | destination_extension;
+
+    if (saved_register == 0 or saved_register == 4) return false; // rax or rsp
+
+    var following_bytes = bytes[3..];
+    if (std.mem.startsWith(u8, following_bytes, "\x83\xc8\xff")) { // or eax,-1
+        following_bytes = following_bytes[3..];
+    }
+    if (std.mem.startsWith(u8, following_bytes, "\xb8\xff\xff\xff\xff")) { // mov eax,-1
+        following_bytes = following_bytes[5..];
+    }
+
+    // test saved_register,saved_register
+    const register_index = saved_register & 0b111;
+    const source_field = register_index << 3;
+    const destination_field = register_index;
+    const test_modrm = 0b11000000 | source_field | destination_field;
+    const test_rex: u8 = if (saved_register < 8) 0x48 else 0x4d;
+    const test_pointer = [_]u8{ test_rex, 0x85, test_modrm };
+
+    return std.mem.startsWith(u8, following_bytes, &test_pointer);
+}
+
+fn findCheckedCallOperand(code: CodeView, probe: CallProbe) !usize {
+    const instruction_limit = 16;
+    const search_span_bytes = 64;
+    var call_operand_offset: ?usize = null;
+
+    for (0..code.bytes.len) |anchor_offset| {
+        if (code.bytes.len - anchor_offset < 5) break;
+
+        const opcode = code.bytes[anchor_offset];
+        const edi_anchor = opcode == 0xbf and try code.readI32(anchor_offset + 1) == probe.edi_value;
+        const esi_anchor = if (probe.esi_value) |expected_value|
+            opcode == 0xbe and try code.readI32(anchor_offset + 1) == expected_value
+        else
+            false;
+
+        if (!edi_anchor and !esi_anchor) continue;
+
+        var edi_value_ready = false;
+        var esi_value_ready = probe.esi_value == null;
+        var cursor = anchor_offset;
+
+        for (0..instruction_limit) |_| {
+            if (cursor >= code.bytes.len or cursor - anchor_offset >= search_span_bytes) break;
+
+            const bytes = code.bytes[cursor..];
+
+            if (bytes[0] == 0xe8) {
+                if (bytes.len < 5 or !edi_value_ready or !esi_value_ready) break;
+                if (!hasPointerResultCheck(bytes[5..])) break;
+
+                const operand_offset = cursor + 1;
+                if (call_operand_offset) |previous_offset| {
+                    if (previous_offset != operand_offset) return error.AmbiguousCodePattern;
                 }
 
-                libc_specifics = .{
-                    .kind = .musl,
-                    .write_ops = .empty,
-                };
-
-                const progname_sym = try resolveSymbolByName("program_invocation_name");
-                const progname_loc = progname_sym.address;
-                Logger.debug("libc detection: program_name: addr: 0x{x} (0x{x})", .{ progname_loc, progname_sym.value });
-                const argv: [*c]const [*c]const u8 = @ptrCast(dll_args.vector);
-
-                const environ_sym = try resolveSymbolByName("environ");
-                const environ_loc = environ_sym.address;
-                Logger.debug("libc detection: environ: addr: 0x{x} (0x{x})", .{ environ_loc, environ_sym.value });
-                const environ: [*c]const [*c]const u8 = @ptrCast(dll_environ.block.slice);
-
-                // TODO validate these offsets
-                //
-                // - these offsets work from musl 1.2.1, with:
-                //
-                // struct __libc {
-                //     char can_do_threads;
-                //     char threaded;
-                //     char secure;
-                //     volatile signed char need_locks;
-                //     int threads_minus_1;
-                //     size_t *auxv;
-                //     struct tls_module *tls_head;
-                //     size_t tls_size, tls_align, tls_cnt;
-                //     size_t page_size;
-                //     struct __locale_struct global_locale;
-                // };
-                //
-                // before that, it was:
-                //
-                // struct __libc {
-                //     int can_do_threads;
-                //     int threaded;
-                //     int secure;
-                //     volatile int threads_minus_1;
-                //     size_t *auxv;
-                //     struct tls_module *tls_head;
-                //     size_t tls_size, tls_align, tls_cnt;
-                //     size_t page_size;
-                //     struct __locale_struct global_locale;
-                // };
-
-                try libc_specifics.?.write_ops.appendSlice(dll_allocator, &.{
-                    .{
-                        .addr = libc_addr + 8,
-                        .relative_to = .zero,
-                        .value = .auxv,
-                    },
-                    .{
-                        .addr = libc_addr + 24,
-                        .relative_to = .zero,
-                        .value = .tls_size,
-                    },
-                    .{
-                        .addr = libc_addr + 32,
-                        .relative_to = .zero,
-                        .value = .tls_align,
-                    },
-                    .{
-                        .addr = libc_addr + 48,
-                        .relative_to = .zero,
-                        .value = .page_size,
-                    },
-                    .{
-                        .addr = progname_loc,
-                        .relative_to = .zero,
-                        .value = .{ .addr = @intFromPtr(argv[0]) },
-                    },
-                    .{
-                        .addr = environ_loc,
-                        .relative_to = .zero,
-                        .value = .{ .addr = @intFromPtr(environ) },
-                    },
-                    .{
-                        .addr = 0,
-                        .relative_to = .tp,
-                        .value = .tp,
-                    },
-                    .{
-                        .addr = 48,
-                        .relative_to = .tp,
-                        .value = .tid,
-                    },
-                    .{
-                        .addr = 136,
-                        .relative_to = .tp,
-                        .value = .self,
-                    },
-                });
-
+                call_operand_offset = operand_offset;
                 break;
             }
-        }
 
-        // TODO factorize, and use libc_specifics.write_ops
-        {
-            // patch direct calls to __libc_malloc
-            const pthread_atfork_rsym = getResolvedSymbolByName(dyn_object, "pthread_atfork", false, false, true) catch |err| switch (err) {
-                error.UnresolvedSymbol => return error.RequiredPatchedSymbolNotFound,
-                else => |e| return e,
-            };
+            // mov r32,imm32
+            if (bytes.len >= 5 and bytes[0] >= 0xb8 and bytes[0] <= 0xbf) {
+                if (bytes[0] == 0xbf) {
+                    edi_value_ready = try code.readI32(cursor + 1) == probe.edi_value;
+                }
+                if (bytes[0] == 0xbe) {
+                    if (probe.esi_value) |expected_value| {
+                        esi_value_ready = try code.readI32(cursor + 1) == expected_value;
+                    }
+                }
+                cursor += 5;
+                continue;
+            }
 
-            const paf_sym = dyn_object.syms_array.items[pthread_atfork_rsym.sym_idx];
-            const paf_sym_addr = pthread_atfork_rsym.address;
-            const paf_sym_size = paf_sym.size;
-            const paf_sym_content: []const u8 = @as([*]const u8, @ptrFromInt(paf_sym_addr))[0..paf_sym_size];
-            Logger.debug("libc detection: pthread_atfork content: {x}", .{paf_sym_content});
+            const is_push = bytes[0] >= 0x50 and bytes[0] <= 0x57;
+            if (is_push or bytes[0] == 0x90) {
+                cursor += 1;
+                continue;
+            }
+            if (bytes.len >= 2 and bytes[0] == 0x41 and bytes[1] >= 0x50 and bytes[1] <= 0x57) {
+                cursor += 2; // push r8..r15
+                continue;
+            }
 
-            const start = std.mem.find(u8, paf_sym_content, &.{ 0xbf, 0x28, 0x00, 0x00, 0x00 }).?;
-            const pat_start = std.mem.find(u8, paf_sym_content[start + 5 ..], &.{0xe8}).?;
-            std.debug.assert(std.mem.eql(u8, paf_sym_content[start + 5 + pat_start + 5 ..][0..3], &.{ 0x48, 0x85, 0xc0 }));
+            // mov r64,r64
+            if (bytes.len >= 3) {
+                const rex = bytes[0];
+                const modrm = bytes[2];
+                const is_register_move = (rex & 0xfa) == 0x48 and bytes[1] == 0x89 and modrm >= 0xc0;
+                if (is_register_move) {
+                    const destination_index = modrm & 0b111;
+                    const destination_extension = (rex & 0b0001) << 3;
+                    const destination_register = destination_index | destination_extension;
 
-            const offset = std.mem.readInt(i32, paf_sym_content[start + 5 + pat_start + 1 ..][0..4], .little);
-
-            const from_addr = @intFromPtr(paf_sym_content.ptr) + start + 5 + pat_start + 1 + 4;
-            const libc_malloc_addr: usize = if (offset < 0) from_addr - @as(usize, @intCast(-offset)) else from_addr + @as(usize, @intCast(offset));
-
-            const from_offset = paf_sym.value + start + 5 + pat_start + 1 + 4;
-            const libc_malloc_offset: usize = if (offset < 0) from_offset - @as(usize, @intCast(-offset)) else from_offset + @as(usize, @intCast(offset));
-
-            Logger.debug("libc detection: __libc_malloc: at 0x{x} [0x{x}] (0x{x} [0x{x}] + 0x{x})", .{ libc_malloc_addr, libc_malloc_offset, from_addr, from_offset, offset });
-
-            for (dyn_object.segments.values()) |*s| {
-                if (!s.flags_first.exec) {
+                    if (destination_register == 7) {
+                        edi_value_ready = false;
+                    }
+                    if (destination_register == 6 and probe.esi_value != null) {
+                        esi_value_ready = false;
+                    }
+                    cursor += 3;
                     continue;
                 }
-
-                const s_data = @as([*]const u8, @ptrFromInt(s.loaded_at))[0..s.mem_size];
-                var curr_offset: usize = 0;
-                while (curr_offset < s.mem_size - 5) {
-                    if (s_data[curr_offset] == 0xe8) {
-                        const c_offset = std.mem.readInt(i32, s_data[curr_offset + 1 ..][0..4], .little);
-                        const c_from_addr = s.loaded_at + curr_offset + 1 + 4;
-                        const c_target_addr = if (c_offset < 0) c_from_addr - @as(usize, @intCast(-c_offset)) else c_from_addr + @as(usize, @intCast(c_offset));
-                        const c_from_offset = s.mem_offset + curr_offset + 1 + 4;
-
-                        if (c_offset < 0 and -c_offset <= c_from_offset or c_offset > 0) {
-                            const c_target_offset = if (c_offset < 0) c_from_offset - @as(usize, @intCast(-c_offset)) else c_from_offset + @as(usize, @intCast(c_offset));
-                            if (c_target_offset == libc_malloc_offset) {
-                                if (std.mem.find(u8, s_data[curr_offset + 1 + 4 ..][0..32], &.{ 0x48, 0x85, 0xc0 }) != null or
-                                    std.mem.find(u8, s_data[curr_offset + 1 + 4 ..][0..48], &.{ 0x48, 0x89 }) != null or
-                                    std.mem.find(u8, s_data[curr_offset + 1 + 4 ..][0..48], &.{ 0x49, 0x89 }) != null)
-                                {
-                                    const offset_to_substitute: i32 = @intCast(@intFromPtr(malloc_substitute_ptr) - c_from_addr);
-
-                                    Logger.debug("libc detection: __libc_malloc: found call at 0x{x} [0x{x}] => to 0x{x} [0x{x}], next byte: 0x{x} | dist to substitute: 0x{x}", .{
-                                        curr_offset + s.loaded_at,
-                                        curr_offset + s.mem_offset,
-                                        c_target_addr,
-                                        c_target_offset,
-                                        s_data[curr_offset + 1 + 4],
-                                        offset_to_substitute,
-                                    });
-
-                                    const si = try findDynObjectSegmentForLoadedAddr(curr_offset + s.loaded_at);
-                                    try unprotectSegment(si.dyn_object, si.segment_index);
-
-                                    const to_patch_ptr: [*]u8 = @ptrFromInt(curr_offset + s.loaded_at + 1);
-                                    std.mem.writeInt(i32, to_patch_ptr[0..4], offset_to_substitute, .little);
-
-                                    try reprotectSegment(si.dyn_object, si.segment_index);
-                                } else {
-                                    Logger.warn("libc detection: __libc_malloc: found potential call at 0x{x} [0x{x}] => to 0x{x} [0x{x}], but will not patch because following bytes are sus", .{
-                                        curr_offset + s.loaded_at,
-                                        curr_offset + s.mem_offset,
-                                        c_target_addr,
-                                        c_target_offset,
-                                    });
-                                }
-                            }
-                        }
-                    }
-
-                    curr_offset += 1;
-                }
             }
-        }
 
-        {
-            // patch direct calls to __libc_calloc
-            const cxa_atexit_rsym = getResolvedSymbolByName(dyn_object, "__cxa_atexit", false, false, true) catch |err| switch (err) {
-                error.UnresolvedSymbol => return error.RequiredPatchedSymbolNotFound,
-                else => |e| return e,
-            };
-
-            const cae_sym = dyn_object.syms_array.items[cxa_atexit_rsym.sym_idx];
-            const cae_sym_addr = cxa_atexit_rsym.address;
-            const cae_sym_size = cae_sym.size;
-            const cae_sym_content: []const u8 = @as([*]const u8, @ptrFromInt(cae_sym_addr))[0..cae_sym_size];
-            Logger.debug("libc detection: __cxa_atexit content: {x}", .{cae_sym_content});
-
-            const start = std.mem.find(u8, cae_sym_content, &.{ 0xbf, 0x08, 0x02, 0x00, 0x00 }).?;
-            const pat_start = std.mem.find(u8, cae_sym_content[start + 5 ..], &.{0xe8}).?;
-            std.debug.assert(cae_sym_content[start + 5 + pat_start + 5] == 0x48);
-
-            const offset = std.mem.readInt(i32, cae_sym_content[start + 5 + pat_start + 1 ..][0..4], .little);
-
-            const from_addr = @intFromPtr(cae_sym_content.ptr) + start + 5 + pat_start + 1 + 4;
-            const libc_calloc_addr: usize = if (offset < 0) from_addr - @as(usize, @intCast(-offset)) else from_addr + @as(usize, @intCast(offset));
-
-            const from_offset = cae_sym.value + start + 5 + pat_start + 1 + 4;
-            const libc_calloc_offset: usize = if (offset < 0) from_offset - @as(usize, @intCast(-offset)) else from_offset + @as(usize, @intCast(offset));
-
-            Logger.debug("libc detection: __libc_calloc: at 0x{x} [0x{x}] (0x{x} [0x{x}] + 0x{x})", .{ libc_calloc_addr, libc_calloc_offset, from_addr, from_offset, offset });
-
-            for (dyn_object.segments.values()) |*s| {
-                if (!s.flags_first.exec) {
-                    continue;
-                }
-
-                const s_data = @as([*]const u8, @ptrFromInt(s.loaded_at))[0..s.mem_size];
-                var curr_offset: usize = 0;
-                while (curr_offset < s.mem_size - 5) {
-                    if (s_data[curr_offset] == 0xe8) {
-                        const c_offset = std.mem.readInt(i32, s_data[curr_offset + 1 ..][0..4], .little);
-                        const c_from_addr = s.loaded_at + curr_offset + 1 + 4;
-                        const c_target_addr = if (c_offset < 0) c_from_addr - @as(usize, @intCast(-c_offset)) else c_from_addr + @as(usize, @intCast(c_offset));
-                        const c_from_offset = s.mem_offset + curr_offset + 1 + 4;
-
-                        if (c_offset < 0 and -c_offset <= c_from_offset or c_offset > 0) {
-                            const c_target_offset = if (c_offset < 0) c_from_offset - @as(usize, @intCast(-c_offset)) else c_from_offset + @as(usize, @intCast(c_offset));
-                            if (c_target_offset == libc_calloc_offset) {
-                                if (std.mem.find(u8, s_data[curr_offset + 1 + 4 ..][0..32], &.{ 0x48, 0x85, 0xc0 }) != null or
-                                    std.mem.find(u8, s_data[curr_offset + 1 + 4 ..][0..48], &.{ 0x48, 0x89 }) != null or
-                                    std.mem.find(u8, s_data[curr_offset + 1 + 4 ..][0..48], &.{ 0x49, 0x89 }) != null)
-                                {
-                                    const offset_to_substitute: i32 = @intCast(@intFromPtr(calloc_substitute_ptr) - c_from_addr);
-
-                                    Logger.debug("libc detection: __libc_calloc: found call at 0x{x} [0x{x}] => to 0x{x} [0x{x}], next byte: 0x{x} | dist to substitute: 0x{x}", .{
-                                        curr_offset + s.loaded_at,
-                                        curr_offset + s.mem_offset,
-                                        c_target_addr,
-                                        c_target_offset,
-                                        s_data[curr_offset + 1 + 4],
-                                        offset_to_substitute,
-                                    });
-
-                                    const si = try findDynObjectSegmentForLoadedAddr(curr_offset + s.loaded_at);
-                                    try unprotectSegment(si.dyn_object, si.segment_index);
-
-                                    const to_patch_ptr: [*]u8 = @ptrFromInt(curr_offset + s.loaded_at + 1);
-                                    std.mem.writeInt(i32, to_patch_ptr[0..4], offset_to_substitute, .little);
-
-                                    try reprotectSegment(si.dyn_object, si.segment_index);
-                                } else {
-                                    Logger.warn("libc detection: __libc_calloc: found potential call at 0x{x} [0x{x}] => to 0x{x} [0x{x}], but will not patch because following bytes are sus", .{
-                                        curr_offset + s.loaded_at,
-                                        curr_offset + s.mem_offset,
-                                        c_target_addr,
-                                        c_target_offset,
-                                    });
-                                }
-                            }
-                        }
-                    }
-
-                    curr_offset += 1;
-                }
+            if (bytes.len >= 4 and std.mem.startsWith(u8, bytes, "\x48\x83\xec")) {
+                cursor += 4; // sub rsp,imm8
+                continue;
             }
-        }
+            if (bytes.len >= 7 and std.mem.startsWith(u8, bytes, "\x48\x81\xec")) {
+                cursor += 7; // sub rsp,imm32
+                continue;
+            }
 
-        return;
+            break;
+        }
     }
 
-    if (maybe_rtld_global_ro_sym) |rtld_global_ro_sym| {
-        // glibc
-        Logger.debug("libc detection: {s} is detected as glibc, using _rtld_global_ro symbol", .{dyn_object.path});
+    return call_operand_offset orelse error.UnrecognizedCheckedCall;
+}
 
-        // TODO detect version
+fn detectMuslAllocatorCall(dyn_object: *DynObject, name: []const u8) !CallBinding {
+    const is_malloc = std.mem.eql(u8, name, "malloc");
+    const probe_name = if (is_malloc) "pthread_atfork" else "__cxa_atexit";
+    const probe = try symbolCode(dyn_object, probe_name);
+    const arguments: CallProbe = if (is_malloc) .{ .edi_value = 40 } else .{ .edi_value = 520, .esi_value = 1 };
+    const call_operand_offset = try findCheckedCallOperand(probe, arguments);
+    const target_address = try probe.relativeTarget(call_operand_offset);
 
-        const rtld_addr = rtld_global_ro_sym.address;
+    if (try findPltSlot(dyn_object, target_address, name)) |slot_address| {
+        return .{ .relocated = .{ .slot_address = slot_address } };
+    }
 
-        libc_specifics = .{
-            .kind = .glibc,
-            .write_ops = .empty,
+    const public_code = try symbolCode(dyn_object, name);
+    if (is_malloc) {
+        const internal_implementation = try resolveEntryJump(dyn_object, target_address);
+        const public_implementation = try resolveEntryJump(dyn_object, public_code.address);
+
+        if (internal_implementation != public_implementation) return error.UnrecognizedAllocatorTarget;
+
+        // To be sure that the jump destination is in an RW segment
+        _ = try objectCode(dyn_object, internal_implementation, 1);
+
+        return .{ .internal = .{ .target_address = target_address } };
+    }
+
+    // Chimera's public calloc tail-calls its internal allocator after restoring rsi and the saved registers.
+    const calloc_tail_call =
+        "\x4c\x89\xf6" ++ // mov rsi,r14
+        "\x5b" ++ // pop rbx
+        "\x41\x5e" ++ // pop r14
+        "\x5d" ++ // pop rbp
+        "\xe9"; // jmp rel32
+
+    if (try public_code.findUnique(calloc_tail_call, 4, "")) |tail_call_offset| {
+        const jump_operand_offset = tail_call_offset + calloc_tail_call.len;
+        const tail_call_target = try public_code.relativeTarget(jump_operand_offset);
+
+        if (target_address != tail_call_target) return error.UnrecognizedAllocatorTarget;
+    } else {
+        // GCC builds separate public/internal calloc. Check the shared
+        // overflow-check/multiplication sequence.
+        const allocation_prefix =
+            "\x41\x54" ++ // push r12
+            "\x49\x89\xf4" ++ // mov r12,rsi
+            "\x55" ++ // push rbp
+            "\x53" ++ // push rbx
+            "\x48\x85\xf6" ++ // test rsi,rsi
+            "\x74\x08" ++ // je past overflow check
+            "\x48\x89\xf0" ++ // mov rax,rsi
+            "\x48\xf7\xe7" ++ // mul rdi
+            "\x70\x3f" ++ // jo allocation failure
+            "\x4c\x0f\xaf\xe7" ++ // imul r12,rdi
+            "\x4c\x89\xe7" ++ // mov rdi,r12
+            "\xe8"; // call rel32
+        const result_check =
+            "\x48\x89\xc3" ++ // mov rbx,rax
+            "\x48\x85\xc0"; // test rax,rax
+
+        const sequence_size = allocation_prefix.len + 4 + result_check.len;
+        const internal_code = try objectCode(dyn_object, target_address, sequence_size);
+
+        const public_match = try public_code.findUnique(allocation_prefix, 4, result_check);
+        if (public_match != 0) return error.UnrecognizedAllocatorTarget;
+
+        const internal_match = try internal_code.findUnique(allocation_prefix, 4, result_check);
+        if (internal_match != 0) return error.UnrecognizedAllocatorTarget;
+
+        const public_malloc_target = try public_code.relativeTarget(allocation_prefix.len);
+        const malloc_slot = try findPltSlot(dyn_object, public_malloc_target, "malloc");
+        if (malloc_slot == null) return error.UnrecognizedAllocatorTarget;
+
+        const malloc_code = try symbolCode(dyn_object, "malloc");
+        const internal_malloc_target = try internal_code.relativeTarget(allocation_prefix.len);
+        const internal_implementation = try resolveEntryJump(dyn_object, internal_malloc_target);
+        const public_implementation = try resolveEntryJump(dyn_object, malloc_code.address);
+
+        if (internal_implementation != public_implementation) return error.UnrecognizedAllocatorTarget;
+
+        _ = try objectCode(dyn_object, internal_implementation, 1);
+    }
+
+    return .{ .internal = .{ .target_address = target_address } };
+}
+
+const GlibcTlsOffsets = struct {
+    tls_size_offset: u32,
+    tls_align_offset: u32,
+};
+
+fn detectGlibcTlsOffsets(code: CodeView) !GlibcTlsOffsets {
+    const division_patterns = [_][]const u8{
+        "\x49\xf7\xf0", // div r8
+        "\x48\xf7\xf6", // div rsi
+    };
+    var division_offset: ?usize = null;
+    for (division_patterns) |pattern| {
+        if (try code.findUnique(pattern, 0, "")) |offset| {
+            if (division_offset != null) return error.AmbiguousCodePattern;
+            division_offset = offset;
+        }
+    }
+
+    const search_end = division_offset orelse return error.UnableToDetectGlibcRtldGlobalFieldOffset;
+    const search_start = search_end -| 64;
+    const loads = try code.slice(search_start, search_end - search_start);
+
+    const LoadPattern = struct {
+        prefix: []const u8,
+        suffix: []const u8,
+        layout: enum { scalar, vector },
+    };
+    const load_patterns = [_]LoadPattern{
+        .{
+            .prefix = "\x4c\x8b\x80", // mov r8,[rax + align_offset]
+            .suffix = "\x48\x8b\x88", // mov rcx,[rax + size_offset]
+            .layout = .scalar,
+        },
+        .{
+            .prefix = "\x48\x8b\xb0", // mov rsi,[rax + align_offset]
+            .suffix = "\x48\x8b\x88", // mov rcx,[rax + size_offset]
+            .layout = .scalar,
+        },
+        .{
+            .prefix = "\xf3\x0f\x6f\x80", // movdqu xmm0,[rax + size_offset]
+            .suffix = "\x48\x8b\x70\x18", // mov rsi,[rax + 24]
+            .layout = .vector,
+        },
+    };
+
+    var result: ?GlibcTlsOffsets = null;
+    for (load_patterns) |pattern| {
+        const match_offset = (try loads.findUnique(pattern.prefix, 4, pattern.suffix)) orelse continue;
+        if (result != null) return error.AmbiguousCodePattern;
+
+        const first_operand_offset = match_offset + pattern.prefix.len;
+        const first_field_offset = try loads.readI32(first_operand_offset);
+        var size_offset: i32 = undefined;
+        var alignment_offset: i32 = undefined;
+
+        switch (pattern.layout) {
+            .scalar => {
+                const second_operand_offset = first_operand_offset + 4 + pattern.suffix.len;
+                size_offset = try loads.readI32(second_operand_offset);
+                alignment_offset = first_field_offset;
+            },
+            .vector => {
+                size_offset = first_field_offset;
+                alignment_offset = std.math.add(i32, first_field_offset, 8) catch return error.InvalidCodeAddress;
+            },
+        }
+
+        if (size_offset < 0 or alignment_offset < 0 or
+            @mod(size_offset, 8) != 0 or @mod(alignment_offset, 8) != 0 or
+            size_offset == alignment_offset)
+        {
+            return error.UnableToDetectGlibcRtldGlobalFieldOffset;
+        }
+
+        result = .{
+            .tls_size_offset = @intCast(size_offset),
+            .tls_align_offset = @intCast(alignment_offset),
+        };
+    }
+
+    return result orelse error.UnableToDetectGlibcRtldGlobalFieldOffset;
+}
+
+const MuslLayout = struct {
+    mapped_address: usize,
+    auxv_offset: usize,
+    tls_size_offset: usize,
+    tls_align_offset: usize,
+    page_size_offset: usize,
+};
+
+const LibcLayout = union(enum) {
+    musl: MuslLayout,
+    glibc: struct {
+        rtld_mapped_address: usize,
+        tls_offsets: ?GlibcTlsOffsets,
+    },
+};
+
+fn findLibcSymbol(dyn_object: *DynObject, name: []const u8) !?ResolvedSymbol {
+    return getResolvedSymbolByName(dyn_object, name, false, false, true) catch |err| switch (err) {
+        error.UnresolvedSymbol => null,
+        else => return err,
+    };
+}
+
+fn mappedDataAddress(dyn_object: *const DynObject, virtual_address: usize, size_bytes: usize) !usize {
+    for (dyn_object.segments.values()) |segment| {
+        if (!segment.flags_first.read or segment.flags_first.exec) continue;
+        if (virtual_address < segment.mem_offset) continue;
+
+        const offset = virtual_address - segment.mem_offset;
+        if (offset > segment.mem_size or size_bytes > segment.mem_size - offset) continue;
+
+        return std.math.add(usize, segment.loaded_at, offset) catch error.InvalidLibcDataAddress;
+    }
+
+    return error.InvalidLibcDataAddress;
+}
+
+fn detectMuslLayout(dyn_object: *DynObject) !MuslLayout {
+    const code = try symbolCode(dyn_object, "issetugid");
+
+    const Pattern = struct {
+        prefix: []const u8,
+        suffix: []const u8,
+        layout: enum { int_flags, byte_flags },
+    };
+
+    const patterns = [_]Pattern{
+        .{
+            .prefix = "\x8b\x05", // mov eax,[rip + disp32]
+            .suffix = "\xc3", // ret
+            .layout = .int_flags,
+        },
+        .{
+            .prefix = "\x0f\xbe\x05", // movsx eax,byte [rip + disp32]
+            .suffix = "\xc3", // ret
+            .layout = .byte_flags,
+        },
+        .{
+            .prefix = "\x55" ++ // push rbp
+                "\x48\x89\xe5" ++ // mov rbp,rsp
+                "\x0f\xbe\x05", // movsx eax,byte [rip + disp32]
+            .suffix = "\x5d\xc3", // pop rbp; ret
+            .layout = .byte_flags,
+        },
+    };
+
+    var detected: ?MuslLayout = null;
+    for (patterns) |pattern| {
+        const match_offset = (try code.findUnique(pattern.prefix, 4, pattern.suffix)) orelse continue;
+        if (match_offset != 0 or pattern.prefix.len + 4 + pattern.suffix.len != code.bytes.len) continue;
+        if (detected != null) return error.AmbiguousCodePattern;
+
+        const secure_address = try code.relativeTarget(pattern.prefix.len);
+        const secure_offset: usize = switch (pattern.layout) {
+            .int_flags => 8,
+            .byte_flags => 2,
         };
 
-        try libc_specifics.?.write_ops.appendSlice(dll_allocator, &.{
-            .{
-                .addr = rtld_addr + 104, // TODO we should check this offset stability
-                .relative_to = .zero,
-                .value = .auxv,
-            },
-            .{
-                .addr = 0,
-                .relative_to = .tp,
-                .value = .tp,
-            },
-            .{
-                .addr = 16,
-                .relative_to = .tp,
-                .value = .tp,
-            },
-            .{
-                .addr = 720, // TODO we should check this offset stability
-                .relative_to = .tp,
-                .value = .tid,
-            },
-        });
+        const virtual_address = std.math.sub(usize, secure_address, secure_offset) catch return error.InvalidLibcDataAddress;
 
-        const maybe_ei_rsym = getResolvedSymbolByName(dyn_object, "__libc_early_init", false, false, true) catch |err| switch (err) {
-            error.UnresolvedSymbol => null,
-            else => |e| return e,
+        var layout: MuslLayout = switch (pattern.layout) {
+            .int_flags => .{
+                .mapped_address = 0,
+                .auxv_offset = 16,
+                .tls_size_offset = 32,
+                .tls_align_offset = 40,
+                .page_size_offset = 56,
+            },
+            .byte_flags => .{
+                .mapped_address = 0,
+                .auxv_offset = 8,
+                .tls_size_offset = 24,
+                .tls_align_offset = 32,
+                .page_size_offset = 48,
+            },
         };
 
-        if (maybe_ei_rsym) |ei_rsym| {
-            const ei_sym = dyn_object.syms_array.items[ei_rsym.sym_idx];
-            const ei_sym_addr = ei_rsym.address;
-            const ei_sym_size = ei_sym.size;
-            const ei_sym_content: []const u8 = @as([*]const u8, @ptrFromInt(ei_sym_addr))[0..ei_sym_size];
-            Logger.debug("libc detection: __libc_early_init content: {x}", .{ei_sym_content});
+        layout.mapped_address = try mappedDataAddress(dyn_object, virtual_address, layout.page_size_offset + @sizeOf(usize));
 
-            const div_offset = do_blk: {
-                if (std.mem.find(u8, ei_sym_content, &.{ 0x49, 0xf7, 0xf0 })) |do| break :do_blk do;
-                if (std.mem.find(u8, ei_sym_content, &.{ 0x48, 0xf7, 0xf6 })) |do| break :do_blk do;
-                return error.UnableToDetectGlibcRtldGlobalFieldOffset;
-            };
+        if (try findLibcSymbol(dyn_object, "__libc")) |symbol| {
+            if (symbol.address != layout.mapped_address) return error.InconsistentMuslLayout;
+        }
 
-            const search_start_offset = @max(div_offset, 64) - 64;
+        detected = layout;
+    }
 
-            const TlsOffsets = struct {
-                tls_size_offset: u32,
-                tls_align_offset: u32,
-            };
+    return detected orelse error.UnrecognizedMuslLayout;
+}
 
-            const tls_offsets: TlsOffsets = to_blk: {
-                const search_content = ei_sym_content[search_start_offset..div_offset];
+fn detectLibcLayout(dyn_object: *DynObject) !LibcLayout {
+    const musl_marker = try findLibcSymbol(dyn_object, "issetugid");
+    const glibc_marker = try findLibcSymbol(dyn_object, "_rtld_global_ro");
 
-                if (std.mem.find(u8, search_content, &.{ 0x4c, 0x8b, 0x80 })) |use_offset| {
-                    break :to_blk .{
-                        .tls_size_offset = std.mem.readInt(u32, ei_sym_content[search_start_offset + use_offset + 10 ..][0..4], .little),
-                        .tls_align_offset = std.mem.readInt(u32, ei_sym_content[search_start_offset + use_offset + 3 ..][0..4], .little),
-                    };
-                }
+    if (musl_marker != null and glibc_marker != null) return error.AmbiguousLibc;
 
-                if (std.mem.find(u8, search_content, &.{ 0x48, 0x8b, 0xb0 })) |use_offset| {
-                    break :to_blk .{
-                        .tls_size_offset = std.mem.readInt(u32, ei_sym_content[search_start_offset + use_offset + 10 ..][0..4], .little),
-                        .tls_align_offset = std.mem.readInt(u32, ei_sym_content[search_start_offset + use_offset + 3 ..][0..4], .little),
-                    };
-                }
+    if (musl_marker != null) {
+        return .{ .musl = try detectMuslLayout(dyn_object) };
+    }
 
-                if (std.mem.find(u8, search_content, &.{ 0xf3, 0x0f, 0x6f, 0x80 })) |use_offset| {
-                    const tls_size_offset = std.mem.readInt(u32, ei_sym_content[search_start_offset + use_offset + 4 ..][0..4], .little);
-                    break :to_blk .{
-                        .tls_size_offset = tls_size_offset,
-                        .tls_align_offset = tls_size_offset + 8,
-                    };
-                }
+    if (glibc_marker) |marker| {
+        var tls_offsets: ?GlibcTlsOffsets = null;
+        if (try findLibcSymbol(dyn_object, "__libc_early_init")) |_| {
+            const code = try symbolCode(dyn_object, "__libc_early_init");
+            tls_offsets = try detectGlibcTlsOffsets(code);
+        }
 
-                return error.UnableToDetectGlibcRtldGlobalFieldOffset;
-            };
+        return .{ .glibc = .{
+            .rtld_mapped_address = marker.address,
+            .tls_offsets = tls_offsets,
+        } };
+    }
 
-            Logger.debug("libc detection: __libc_early_init div offset: 0x{x}, search offset: 0x{x}", .{ div_offset, search_start_offset });
+    return error.UnableToDetectLibc;
+}
 
-            const tls_size_offset = tls_offsets.tls_size_offset;
-            const tls_align_offset = tls_offsets.tls_align_offset;
+fn getLibcSpecifics(layout: LibcLayout) !LibcSpecifics {
+    var specifics: LibcSpecifics = .{
+        .kind = switch (layout) {
+            .musl => .musl,
+            .glibc => .glibc,
+        },
+        .write_ops = .empty,
+    };
+    errdefer specifics.write_ops.deinit(dll_allocator);
 
-            Logger.debug("libc detection: tls_size field offset: {d}, tls_align field offset: {d}", .{ tls_size_offset, tls_align_offset });
+    switch (layout) {
+        .musl => |musl| {
+            const program_name = try resolveSymbolByName("program_invocation_name");
+            const environment = try resolveSymbolByName("environ");
+            const argv: [*c]const [*c]const u8 = @ptrCast(dll_args.vector);
 
-            try libc_specifics.?.write_ops.appendSlice(dll_allocator, &.{
+            try specifics.write_ops.appendSlice(dll_allocator, &.{
                 .{
-                    .addr = rtld_addr + 104,
+                    .addr = musl.mapped_address + musl.auxv_offset,
                     .relative_to = .zero,
                     .value = .auxv,
                 },
                 .{
-                    .addr = rtld_addr + tls_size_offset,
+                    .addr = musl.mapped_address + musl.tls_size_offset,
                     .relative_to = .zero,
                     .value = .tls_size,
                 },
                 .{
-                    .addr = rtld_addr + tls_align_offset,
+                    .addr = musl.mapped_address + musl.tls_align_offset,
                     .relative_to = .zero,
                     .value = .tls_align,
                 },
+                .{
+                    .addr = musl.mapped_address + musl.page_size_offset,
+                    .relative_to = .zero,
+                    .value = .page_size,
+                },
+                .{
+                    .addr = program_name.address,
+                    .relative_to = .zero,
+                    .value = .{ .addr = @intFromPtr(argv[0]) },
+                },
+                .{
+                    .addr = environment.address,
+                    .relative_to = .zero,
+                    .value = .{ .addr = @intFromPtr(dll_environ.block.slice.ptr) },
+                },
             });
-        } else {
-            Logger.debug("libc detection: no __libc_early_init symbol found, maybe an old glibc version", .{});
-        }
 
-        return;
+            try specifics.write_ops.appendSlice(dll_allocator, &.{
+                .{
+                    .addr = 0,
+                    .relative_to = .tp,
+                    .value = .tp,
+                },
+                .{
+                    .addr = 48,
+                    .relative_to = .tp,
+                    .value = .tid,
+                },
+                .{
+                    .addr = 136,
+                    .relative_to = .tp,
+                    .value = .self,
+                },
+            });
+        },
+        .glibc => |glibc| {
+            const auxv_address = std.math.add(usize, glibc.rtld_mapped_address, 104) catch return error.InvalidLibcDataAddress;
+            try specifics.write_ops.append(dll_allocator, .{
+                .addr = auxv_address,
+                .relative_to = .zero,
+                .value = .auxv,
+            });
+
+            if (glibc.tls_offsets) |offsets| {
+                const size_address = std.math.add(usize, glibc.rtld_mapped_address, offsets.tls_size_offset) catch return error.InvalidLibcDataAddress;
+                const align_address = std.math.add(usize, glibc.rtld_mapped_address, offsets.tls_align_offset) catch return error.InvalidLibcDataAddress;
+
+                try specifics.write_ops.appendSlice(dll_allocator, &.{
+                    .{
+                        .addr = size_address,
+                        .relative_to = .zero,
+                        .value = .tls_size,
+                    },
+                    .{
+                        .addr = align_address,
+                        .relative_to = .zero,
+                        .value = .tls_align,
+                    },
+                });
+            }
+
+            // TODO detect the fixed glibc auxv and thread-field offsets too.
+            try specifics.write_ops.appendSlice(dll_allocator, &.{
+                .{
+                    .addr = 0,
+                    .relative_to = .tp,
+                    .value = .tp,
+                },
+                .{
+                    .addr = 16,
+                    .relative_to = .tp,
+                    .value = .tp,
+                },
+                .{
+                    .addr = 720,
+                    .relative_to = .tp,
+                    .value = .tid,
+                },
+            });
+        },
     }
 
-    return error.UnableToDetectLibc;
+    for (specifics.write_ops.items) |op| {
+        switch (op.relative_to) {
+            .tp => {},
+            .zero => {
+                const location = try findDynObjectSegmentForLoadedAddr(op.addr);
+                const segment = location.dyn_object.segments.values()[location.segment_index];
+                const offset = op.addr - segment.loaded_at;
+
+                if (!segment.flags_first.read or segment.flags_first.exec or offset > segment.mem_size or @sizeOf(usize) > segment.mem_size - offset) {
+                    return error.InvalidLibcDataAddress;
+                }
+            },
+        }
+    }
+
+    return specifics;
+}
+
+const LibcCodePatch = struct {
+    address: usize,
+    segment_index: usize,
+    size: usize,
+    original: [12]u8,
+    replacement: [12]u8,
+};
+
+fn appendLibcCodePatch(dyn_object: *DynObject, patches: *std.ArrayList(LibcCodePatch), address: usize, replacement: []const u8) !void {
+    std.debug.assert(replacement.len > 0 and replacement.len <= 12);
+
+    const location = try findDynObjectSegmentForLoadedAddr(address);
+    if (location.dyn_object != dyn_object) return error.InvalidCodeAddress;
+
+    const segment = dyn_object.segments.values()[location.segment_index];
+    const offset = address - segment.loaded_at;
+
+    if (!segment.flags_first.read or !segment.flags_first.exec or offset > segment.mem_size or replacement.len > segment.mem_size - offset) {
+        return error.InvalidCodeAddress;
+    }
+
+    const end_address = std.math.add(usize, address, replacement.len) catch return error.InvalidCodeAddress;
+    for (patches.items) |patch| {
+        if (address < patch.address + patch.size and patch.address < end_address) return error.OverlappingLibcPatches;
+    }
+
+    var patch: LibcCodePatch = .{
+        .address = address,
+        .segment_index = location.segment_index,
+        .size = replacement.len,
+        .original = @splat(0),
+        .replacement = @splat(0),
+    };
+
+    const original: [*]const u8 = @ptrFromInt(address);
+
+    @memcpy(patch.original[0..patch.size], original[0..patch.size]);
+    @memcpy(patch.replacement[0..patch.size], replacement);
+
+    try patches.append(dll_allocator, patch);
+}
+
+fn hasPointerResultUse(bytes: []const u8) bool {
+    const instruction_limit = 8;
+    const search_span_bytes = 64;
+    var cursor: usize = 0;
+
+    for (0..instruction_limit) |_| {
+        if (cursor >= bytes.len or cursor >= search_span_bytes) return false;
+
+        const remaining = bytes[cursor..];
+
+        if (hasPointerResultCheck(remaining)) return true;
+        if (remaining.len < 3) return false;
+
+        const rex = remaining[0];
+        const opcode = remaining[1];
+        const modrm = remaining[2];
+
+        if (rex < 0x40 or rex > 0x4f) return false;
+        if (opcode != 0x89 and opcode != 0x8b and opcode != 0x8d) return false;
+        if (opcode != 0x8d and rex & 8 == 0) return false;
+
+        const mode: u2 = @intCast(modrm >> 6);
+        const rm_index = modrm & 0b111;
+        const register_index = (modrm >> 3) & 0b111;
+        const register_extension = (rex & 0b0100) << 1;
+        const register_operand = register_index | register_extension;
+        var instruction_size: usize = 3;
+        var displacement_size: usize = switch (mode) {
+            0 => if (rm_index == 5) 4 else 0, // RIP-relative or no displacement
+            1 => 1, // disp8
+            2 => 4, // disp32
+            3 => 0, // register operand
+        };
+
+        if (mode != 3 and rm_index == 4) {
+            if (remaining.len < 4) return false;
+
+            const base_index = remaining[3] & 0b111;
+            instruction_size += 1;
+            if (mode == 0 and base_index == 5) {
+                displacement_size = 4;
+            }
+        }
+
+        instruction_size += displacement_size;
+        if (remaining.len < instruction_size) return false;
+
+        if (opcode == 0x89) {
+            if (register_operand == 0) return true;
+
+            const destination_extension = (rex & 0b0001) << 3;
+            const destination_register = rm_index | destination_extension;
+
+            if (mode == 3 and destination_register == 0) return false;
+        } else {
+            if (register_operand == 0 or (opcode == 0x8d and mode == 3)) return false;
+        }
+
+        cursor += instruction_size;
+    }
+
+    return false;
+}
+
+/// Prepares a trampoline and patches direct call rel32 with pointer-result uses.
+fn preparePatches(dyn_object: *DynObject, patches: *std.ArrayList(LibcCodePatch), target_virtual_address: usize, substitute_address: usize, trampoline_offset: usize) !void {
+    const loaded_address = dyn_object.loaded_at orelse return error.InvalidCodeAddress;
+    const extra_offset = std.math.sub(usize, dyn_object.loaded_size, 0x1000) catch return error.InvalidCodeAddress;
+    const extra_address = std.math.add(usize, loaded_address, extra_offset) catch return error.InvalidCodeAddress;
+    const trampoline_address = std.math.add(usize, extra_address, trampoline_offset) catch return error.InvalidCodeAddress;
+
+    const extra_location = try findDynObjectSegmentForLoadedAddr(trampoline_address);
+    const extra_segment = extra_location.dyn_object.segments.values()[extra_location.segment_index];
+
+    if (extra_segment.file_size != 0 or extra_segment.mem_size != 0x1000) return error.InvalidCodeAddress;
+
+    var trampoline = ("\x48\xb8" ++ // mov rax,imm64
+        "\x00\x00\x00\x00\x00\x00\x00\x00" ++ // substitute address
+        "\xff\xe0").*; // jmp rax
+    std.mem.writeInt(usize, trampoline[2..10], substitute_address, .little);
+    try appendLibcCodePatch(dyn_object, patches, trampoline_address, &trampoline);
+
+    var call_count: usize = 0;
+    for (dyn_object.segments.values()) |segment| {
+        if (!segment.flags_first.read or !segment.flags_first.exec or segment.mem_size < 5) continue;
+
+        const code = try objectCode(dyn_object, segment.mem_offset, segment.mem_size);
+
+        for (0..code.bytes.len - 4) |offset| {
+            if (code.bytes[offset] != 0xe8) continue;
+
+            const candidate_target = code.relativeTarget(offset + 1) catch continue;
+            if (candidate_target != target_virtual_address) continue;
+            if (!hasPointerResultUse(code.bytes[offset + 5 ..])) return error.UnrecognizedCallSite;
+
+            const operand_address = std.math.add(usize, segment.loaded_at, offset + 1) catch return error.InvalidCodeAddress;
+            const next_address = std.math.add(usize, operand_address, 4) catch return error.InvalidCodeAddress;
+            const distance = @as(i128, trampoline_address) - @as(i128, next_address);
+            const displacement = std.math.cast(i32, distance) orelse return error.TrampolineOutOfRange;
+
+            var replacement: [4]u8 = undefined;
+            std.mem.writeInt(i32, &replacement, displacement, .little);
+
+            try appendLibcCodePatch(dyn_object, patches, operand_address, &replacement);
+
+            call_count += 1;
+        }
+    }
+
+    if (call_count == 0) return error.MissingCallSites;
+}
+
+fn applyLibcCodePatches(dyn_object: *DynObject, patches: []const LibcCodePatch) !void {
+    var applied_count: usize = 0;
+
+    errdefer {
+        while (applied_count > 0) {
+            applied_count -= 1;
+            const patch = patches[applied_count];
+            unprotectSegment(dyn_object, patch.segment_index) catch |err| {
+                Logger.err("libc patch rollback: {t}", .{err});
+                continue;
+            };
+
+            const destination: [*]u8 = @ptrFromInt(patch.address);
+            @memcpy(destination[0..patch.size], patch.original[0..patch.size]);
+            reprotectSegment(dyn_object, patch.segment_index) catch |err| {
+                Logger.err("libc patch protection rollback: {t}", .{err});
+            };
+        }
+    }
+
+    for (patches) |patch| {
+        try unprotectSegment(dyn_object, patch.segment_index);
+
+        const destination: [*]u8 = @ptrFromInt(patch.address);
+        @memcpy(destination[0..patch.size], patch.replacement[0..patch.size]);
+
+        applied_count += 1;
+
+        try reprotectSegment(dyn_object, patch.segment_index);
+    }
+}
+
+fn detectLibC(dyn_object: *DynObject) !void {
+    if (!isLibcName(dyn_object.name)) return;
+    std.debug.assert(libc_specifics == null);
+
+    // Detect libc
+    const layout = try detectLibcLayout(dyn_object);
+
+    // Prepare specifics
+    var specifics = try getLibcSpecifics(layout);
+    errdefer specifics.write_ops.deinit(dll_allocator);
+
+    // Prepare allocator patches
+    var patches: std.ArrayList(LibcCodePatch) = .empty;
+    defer patches.deinit(dll_allocator);
+
+    switch (layout) {
+        .musl => {
+            const malloc_call = try detectMuslAllocatorCall(dyn_object, "malloc");
+            const calloc_call = try detectMuslAllocatorCall(dyn_object, "calloc");
+
+            switch (malloc_call) {
+                .relocated => {},
+                .internal => |binding| {
+                    try preparePatches(dyn_object, &patches, binding.target_address, @intFromPtr(&mallocSubstitute), 0);
+                },
+            }
+
+            switch (calloc_call) {
+                .relocated => {},
+                .internal => |binding| {
+                    try preparePatches(dyn_object, &patches, binding.target_address, @intFromPtr(&callocSubstitute), 16);
+                },
+            }
+        },
+        .glibc => {},
+    }
+
+    // Apply patches
+    try applyLibcCodePatches(dyn_object, patches.items);
+
+    // Save specifics
+    libc_specifics = specifics;
 }
 
 // TODO global state
