@@ -3349,6 +3349,14 @@ fn currentThreadPointer() usize {
     return tp;
 }
 
+fn staticTlsSize() usize {
+    return normal_current_tls_area_desc.?.size + current_surplus_size;
+}
+
+fn staticTlsAlignment() usize {
+    return normal_current_tls_area_desc.?.alignment;
+}
+
 fn applyLibcWriteOps(thread_pointer: usize, only_tp_relative: bool) !void {
     Logger.debug("libc: setting details for libc: {t}", .{libc_specifics.?.kind});
 
@@ -3362,8 +3370,8 @@ fn applyLibcWriteOps(thread_pointer: usize, only_tp_relative: bool) !void {
             .auxv => @intFromPtr(std.os.linux.elf_aux_maybe.?),
             .page_size => std.heap.pageSize(),
             .tid => std.Thread.getCurrentId(),
-            .tls_size => normal_current_tls_area_desc.?.size + current_surplus_size,
-            .tls_align => normal_current_tls_area_desc.?.alignment,
+            .tls_size => staticTlsSize(),
+            .tls_align => staticTlsAlignment(),
             .tls_count => 1, // TODO,
             .tp => thread_pointer,
             .self => addr,
@@ -4636,6 +4644,8 @@ fn getSubstituteAddress(sym: ResolvedSymbol, for_obj: *DynObject, allow_preload_
         addr = @intFromPtr(&dlinfoSubstitute);
     } else if (std.mem.eql(u8, sym.name, "dlmopen")) {
         addr = @intFromPtr(&dlmopenSubstitute);
+    } else if (std.mem.eql(u8, sym.name, "_dl_get_tls_static_info")) {
+        addr = @intFromPtr(&dlGetTlsStaticInfoSubstitute);
     } else if (std.mem.eql(u8, sym.name, "_dl_find_object")) {
         addr = @intFromPtr(&dlFindObjectSubstitute);
     } else if (std.mem.eql(u8, sym.name, "_dl_find_dso_for_object")) {
@@ -5794,6 +5804,13 @@ fn dlIteratePhdrSubstitute(callback: *const fn (*anyopaque, c_uint, *anyopaque) 
     Logger.info("intercepted call: success: dl_iterate_phdr(callback: 0x{x}, data: 0x{x})", .{ @intFromPtr(callback), @intFromPtr(data) });
 
     return 0;
+}
+
+// In glibc < 2.34 libpthread asks the loader for these values during initialization.
+// Newer glibc initialization reads the patched TLS fields.
+fn dlGetTlsStaticInfoSubstitute(size: *usize, alignment: *usize) callconv(.c) void {
+    size.* = staticTlsSize();
+    alignment.* = staticTlsAlignment();
 }
 
 const ThreadInfos = struct {
