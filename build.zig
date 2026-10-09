@@ -90,7 +90,7 @@ fn addExample(
     run_cmd.step.dependOn(&install.step);
     run_cmd.addPassthruArgs();
 
-    const run_step = b.step(b.fmt("run-{s}", .{name}), b.fmt("Run {s}", .{name}));
+    const run_step = b.step(b.fmt("run-{s}", .{name}), b.fmt("Run {s} example", .{name}));
     run_step.dependOn(&run_cmd.step);
 
     const check_name = b.fmt("check-{s}", .{name});
