@@ -362,7 +362,7 @@ const LibcSpecifics = struct {
     kind: enum { custom, glibc, musl },
     write_ops: std.ArrayList(WriteOps),
     getErrnoLocation: *const fn () callconv(.c) *c_int,
-    glibc_initial_thread: ?GlibcInitialThread = null,
+    glibc_threads: ?GlibcThreadLayout = null,
     musl_initial_thread: ?MuslInitialThread = null,
 };
 
@@ -900,6 +900,16 @@ fn loadWithRootResolveContext(f_path: []const u8, root_runpath: ?[]const u8, roo
         }
 
         if (dyn_obj.current_epoch == std.math.maxInt(u30)) return error.LibraryGenerationExhausted;
+
+        if (libc_specifics) |*specifics| {
+            if (specifics.kind == .glibc and specifics.glibc_threads == null and std.mem.eql(u8, dyn_obj.name, "libpthread.so.0")) {
+                specifics.glibc_threads = detectLegacyGlibcThreadLayout(dyn_obj) catch |err| switch (err) {
+                    error.CodePatternMismatch => return error.UnrecognizedGlibcThreadLayout,
+                    else => return err,
+                };
+                dyn_obj.pinned = true;
+            }
+        }
 
         try dyn_objects_init_indices.ensureUnusedCapacity(dll_allocator, 1);
         dyn_obj.current_epoch += 1;
@@ -2676,6 +2686,25 @@ const CodeView = struct {
         cursor.* += 4;
     }
 
+    fn requireUniqueI32Operand(code: CodeView, prefix: []const u8, expected: i64, suffix: []const u8) !void {
+        const suffix_offset = std.math.add(usize, prefix.len, 4) catch return error.TruncatedCodePattern;
+        const pattern_size = std.math.add(usize, suffix_offset, suffix.len) catch return error.TruncatedCodePattern;
+        if (pattern_size > code.bytes.len) return error.CodePatternMismatch;
+
+        var found = false;
+        for (0..code.bytes.len - pattern_size + 1) |offset| {
+            const candidate = code.bytes[offset..][0..pattern_size];
+            if (!std.mem.eql(u8, candidate[0..prefix.len], prefix)) continue;
+            if (std.mem.readInt(i32, candidate[prefix.len..][0..4], .little) != expected) continue;
+            if (!std.mem.eql(u8, candidate[suffix_offset..], suffix)) continue;
+
+            if (found) return error.AmbiguousCodePattern;
+            found = true;
+        }
+
+        if (!found) return error.CodePatternMismatch;
+    }
+
     fn relativeTarget(code: CodeView, operand_offset: usize) !usize {
         const operand = try code.slice(operand_offset, 4);
         const next_instruction_address = std.math.add(usize, operand.address, 4) catch return error.InvalidCodeAddress;
@@ -3127,7 +3156,7 @@ const GlibcThreadList = extern struct {
     }
 };
 
-const GlibcInitialThread = struct {
+const GlibcThreadLayout = struct {
     const Ownership = union(enum) {
         byte_flag: usize,
         word_mode: struct {
@@ -3141,12 +3170,16 @@ const GlibcInitialThread = struct {
     cache: *GlibcThreadList,
     list_offset: usize,
     ownership: Ownership,
+    lock: *u32,
+    in_flight: *usize,
+    nthreads: *u32,
+    single_threaded: ?*u8,
     initialized: bool = false,
 };
 
 const GlibcForkLists = struct {
     cache: usize,
-    ownership: GlibcInitialThread.Ownership,
+    ownership: GlibcThreadLayout.Ownership,
     global_load: []const u8,
 };
 
@@ -3168,8 +3201,11 @@ fn threadDbFieldOffset(dyn_object: *DynObject, name: []const u8, field_size: usi
     return offset;
 }
 
-fn detectGlibcInitialThread(dyn_object: *DynObject) !?GlibcInitialThread {
+fn detectGlibcThreadLayout(dyn_object: *DynObject) !?GlibcThreadLayout {
     if (try findLibcSymbol(dyn_object, "_thread_db_rtld_global__dl_stack_used") == null) return null;
+
+    const create_code = try symbolCode(dyn_object, "pthread_create");
+    try create_code.requireUniqueI32Operand("\x64\xc7\x04\x25", 24, "\x01\x00\x00\x00");
 
     const global = try getResolvedSymbolByName(dyn_object, "_rtld_global", false, false, true);
     const global_object = &dyn_objects.values()[global.dyn_object_idx];
@@ -3230,7 +3266,7 @@ fn detectGlibcInitialThread(dyn_object: *DynObject) !?GlibcInitialThread {
             if (offset < previous + list_size and previous < offset + list_size) return error.InvalidGlibcThreadLayout;
         }
 
-        const virtual_address = std.math.add(usize, global.value, offset) catch return error.InvalidLibcDataAddress;
+        const virtual_address = std.math.add(usize, global.value, offset) catch return error.InvalidDataAddress;
         const address = try mappedDataAddress(global_object, virtual_address, list_size);
         const location = try findDynObjectSegmentForLoadedAddr(address);
         if (!location.dyn_object.segments.values()[location.segment_index].flags_first.write) return error.InvalidGlibcThreadLayout;
@@ -3239,12 +3275,121 @@ fn detectGlibcInitialThread(dyn_object: *DynObject) !?GlibcInitialThread {
 
     if (list_offset % @alignOf(GlibcThreadList) != 0) return error.InvalidGlibcThreadLayout;
 
+    // These fields follow the cache head in rtld
+    const in_flight_offset = offsets.cache + 24;
+    const lock_offset = offsets.cache + 32;
+    const word_mode = offsets.ownership == .word_mode;
+    try code.requireUniqueI32Operand(if (word_mode) "\x48\x8b\x83" else "\x49\x8b\x84\x24", @intCast(in_flight_offset), &.{});
+    try code.requireUniqueI32Operand(if (word_mode) "\x48\xc7\x83" else "\x49\xc7\x84\x24", @intCast(in_flight_offset), "\x00\x00\x00\x00");
+    try code.requireUniqueI32Operand(if (word_mode) "\xc7\x83" else "\x41\xc7\x84\x24", @intCast(lock_offset), "\x00\x00\x00\x00");
+
+    if (lock_offset > global_size or 4 > global_size - lock_offset) return error.InvalidGlibcThreadLayout;
+
+    const nthreads = try getResolvedSymbolByName(dyn_object, "__nptl_nthreads", false, false, true);
+    const single_threaded = try getResolvedSymbolByName(dyn_object, "__libc_single_threaded", false, false, true);
+
+    if (&dyn_objects.values()[nthreads.dyn_object_idx] != dyn_object or &dyn_objects.values()[single_threaded.dyn_object_idx] != dyn_object) return error.InvalidGlibcThreadLayout;
+    if (dyn_object.syms_array.items[nthreads.sym_idx].size != 4 or dyn_object.syms_array.items[single_threaded.sym_idx].size != 1) return error.InvalidGlibcThreadLayout;
+
     return .{
         .used = heads[0],
         .user = heads[1],
         .cache = heads[2],
         .list_offset = list_offset,
         .ownership = offsets.ownership,
+        .lock = @ptrFromInt(try mappedWritableDataAddress(global_object, global.value + lock_offset, 4, 4)),
+        .in_flight = @ptrFromInt(try mappedWritableDataAddress(global_object, global.value + in_flight_offset, 8, 8)),
+        .nthreads = @ptrFromInt(try mappedWritableDataAddress(dyn_object, nthreads.value, 4, 4)),
+        .single_threaded = @ptrFromInt(try mappedWritableDataAddress(dyn_object, single_threaded.value, 1, 1)),
+    };
+}
+
+fn detectLegacyGlibcThreadLayout(dyn_object: *DynObject) !GlibcThreadLayout {
+    const init_code = try symbolCode(dyn_object, "__pthread_initialize_minimal");
+    const create_code = try symbolCode(dyn_object, "pthread_create");
+
+    try create_code.requireUniqueI32Operand("\x64\xc7\x04\x25", 24, "\x01\x00\x00\x00");
+
+    // __pthread_initialize_minimal passes __reclaim_stacks as the second argument to __libc_pthread_init.
+    const reclaim_load = (try init_code.findUnique("\x48\x8d\x35", 4, "\x49\x89\x84\x24\x88\x0f\x00\x00\x48\x8d\x3d")) orelse return error.UnrecognizedGlibcThreadLayout;
+
+    var cursor = reclaim_load + 22;
+    try init_code.expectBytes(&cursor, "\x48\x8d\x05");
+    cursor += 4;
+    try init_code.expectBytes(&cursor, "\x49\x89\x84\x24\x90\x0f\x00\x00\xe8");
+    _ = (try findPltSlot(dyn_object, try init_code.relativeTarget(cursor), "__libc_pthread_init")) orelse return error.UnrecognizedGlibcThreadLayout;
+
+    const code = try objectCode(dyn_object, try init_code.relativeTarget(reclaim_load + 3), 0x300);
+    cursor = 0;
+    try code.expectBytes(&cursor, "\x48\x8b\x05");
+    const in_flight = try code.relativeTarget(cursor);
+    cursor += 4;
+    try code.expectBytes(&cursor, "\x64\x4c\x8b\x14\x25\x10\x00\x00\x00\x48\x85\xc0");
+
+    const removal = (try code.findUnique("\x49\x8d\x82", 4, "\x48\x89\x05")) orelse return error.UnrecognizedGlibcThreadLayout;
+    const list_offset = try code.readI32(removal + 3);
+
+    if (list_offset != 704 or try code.relativeTarget(removal + 10) != in_flight) return error.InvalidGlibcThreadLayout;
+
+    cursor = removal + 14;
+    try code.expectI32Operand(&cursor, "\x49\x8b\x8a", list_offset);
+    try code.expectI32Operand(&cursor, "\x49\x8b\x92", list_offset + 8);
+    try code.expectBytes(&cursor, "\x48\x89\x51\x08\x48\x89\x0a\x48\x8d\x0d");
+
+    const user = try code.relativeTarget(cursor);
+
+    const used_load = (try code.findUnique("\x4c\x8d\x0d", 4, "\x4c\x89\xc9")) orelse return error.UnrecognizedGlibcThreadLayout;
+    const used = try code.relativeTarget(used_load + 3);
+    const cache_load = (try code.findUnique("\x48\x8d\x3d", 4, "\x48\x8b\x15")) orelse return error.UnrecognizedGlibcThreadLayout;
+    const cache = try code.relativeTarget(cache_load + 3);
+
+    if (try code.relativeTarget(cache_load + 10) != cache) return error.InvalidGlibcThreadLayout;
+
+    const ownership_load = (try code.findUnique("\x64\x8a\x14\x25", 4, "\x84\xd2\x0f\x85")) orelse return error.UnrecognizedGlibcThreadLayout;
+    const ownership_offset = try code.readI32(ownership_load + 4);
+
+    if (ownership_offset != 1554) return error.InvalidGlibcThreadLayout;
+
+    const insertion = try code.relativeTarget(ownership_load + 12);
+    if (insertion < code.address) return error.InvalidGlibcThreadLayout;
+
+    cursor = insertion - code.address;
+    try code.expectI32Operand(&cursor, "\x49\x89\x8a", list_offset);
+    try code.expectI32Operand(&cursor, "\x49\x89\x8a", list_offset + 8);
+    try code.expectBytes(&cursor, "\x48\x89\x05");
+    if (try code.relativeTarget(cursor) != user + 8) return error.InvalidGlibcThreadLayout;
+    cursor += 4;
+    try code.expectBytes(&cursor, "\x48\x89\x05");
+    if (try code.relativeTarget(cursor) != user) return error.InvalidGlibcThreadLayout;
+
+    const reset = (try code.findUnique("\xc7\x05", 4, "\x01\x00\x00\x00\x48\xc7\x05")) orelse return error.UnrecognizedGlibcThreadLayout;
+    const nthreads = try code.relativeTarget(reset + 2) + 4;
+    if (try code.relativeTarget(reset + 13) + 4 != in_flight) return error.InvalidGlibcThreadLayout;
+    cursor = reset + 17;
+    try code.expectBytes(&cursor, "\x00\x00\x00\x00\xc7\x05");
+    const lock = try code.relativeTarget(cursor) + 4;
+    cursor += 4;
+    try code.expectBytes(&cursor, "\x00\x00\x00\x00\xc7\x05");
+
+    const user_add = (try create_code.findUnique("\x48\x89\x42\x08\x48\x89\x05", 4, "\x31\xc0\x87\x05")) orelse return error.UnrecognizedGlibcThreadLayout;
+    if (try create_code.relativeTarget(user_add + 7) != user or try create_code.relativeTarget(user_add + 15) != lock) return error.InvalidGlibcThreadLayout;
+
+    // cross-check the user head, list offset, and ownership store
+    const initial_list = (try init_code.findUnique("\x48\x8d\x05", 4, "\x48\x8d\x8a\xc0\x02\x00\x00\x48\x89\x05")) orelse return error.UnrecognizedGlibcThreadLayout;
+    if (try init_code.relativeTarget(initial_list + 3) != user) return error.InvalidGlibcThreadLayout;
+    try init_code.requireUniqueI32Operand("\x64\xc6\x04\x25", ownership_offset, "\x01");
+
+    return .{
+        .used = @ptrFromInt(try mappedWritableDataAddress(dyn_object, used, 16, 8)),
+        .user = @ptrFromInt(try mappedWritableDataAddress(dyn_object, user, 16, 8)),
+        .cache = @ptrFromInt(try mappedWritableDataAddress(dyn_object, cache, 16, 8)),
+        .list_offset = @intCast(list_offset),
+        .ownership = .{ .byte_flag = @intCast(ownership_offset) },
+        .lock = @ptrFromInt(try mappedWritableDataAddress(dyn_object, lock, 4, 4)),
+        .in_flight = @ptrFromInt(try mappedWritableDataAddress(dyn_object, in_flight, 8, 8)),
+        .nthreads = @ptrFromInt(try mappedWritableDataAddress(dyn_object, nthreads, 4, 4)),
+        .single_threaded = null,
+        .initialized = true,
     };
 }
 
@@ -3303,7 +3448,7 @@ fn detectGlibcForkLists(code: CodeView, used_offset: usize, user_offset: usize, 
         try code.expectI32Operand(&cursor, shape.used_reset, @intCast(used_offset));
         try code.expectI32Operand(&cursor, shape.user_reset, @intCast(user_offset));
 
-        var ownership: GlibcInitialThread.Ownership = undefined;
+        var ownership: GlibcThreadLayout.Ownership = undefined;
         switch (shape.ownership_kind) {
             .word_mode => {
                 // cmp dword ptr fs:[offset], user_mode; je user_list_insertion
@@ -3381,10 +3526,20 @@ fn mappedDataAddress(dyn_object: *const DynObject, virtual_address: usize, size_
         const offset = virtual_address - segment.mem_offset;
         if (offset > segment.mem_size or size_bytes > segment.mem_size - offset) continue;
 
-        return std.math.add(usize, segment.loaded_at, offset) catch error.InvalidLibcDataAddress;
+        return std.math.add(usize, segment.loaded_at, offset) catch error.InvalidDataAddress;
     }
 
-    return error.InvalidLibcDataAddress;
+    return error.InvalidDataAddress;
+}
+
+fn mappedWritableDataAddress(dyn_object: *const DynObject, virtual_address: usize, size_bytes: usize, alignment: usize) !usize {
+    if (!std.math.isPowerOfTwo(alignment)) return error.InvalidDataAlignment;
+
+    const mapped = try mappedDataAddress(dyn_object, virtual_address, size_bytes);
+    const location = try findDynObjectSegmentForLoadedAddr(mapped);
+    if (!location.dyn_object.segments.values()[location.segment_index].flags_first.write) return error.InvalidDataPermissions;
+    if (mapped % alignment != 0) return error.InvalidDataAlignment;
+    return mapped;
 }
 
 fn detectMuslLayout(dyn_object: *DynObject) !MuslLayout {
@@ -3428,7 +3583,7 @@ fn detectMuslLayout(dyn_object: *DynObject) !MuslLayout {
             .byte_flags => 2,
         };
 
-        const virtual_address = std.math.sub(usize, secure_address, secure_offset) catch return error.InvalidLibcDataAddress;
+        const virtual_address = std.math.sub(usize, secure_address, secure_offset) catch return error.InvalidDataAddress;
 
         var layout: MuslLayout = switch (pattern.layout) {
             .int_flags => .{
@@ -3583,9 +3738,12 @@ fn getLibcSpecifics(dyn_object: *DynObject, layout: LibcLayout) !LibcSpecifics {
             });
         },
         .glibc => |glibc| {
-            specifics.glibc_initial_thread = try detectGlibcInitialThread(dyn_object);
+            specifics.glibc_threads = detectGlibcThreadLayout(dyn_object) catch |err| switch (err) {
+                error.CodePatternMismatch => return error.UnrecognizedGlibcThreadLayout,
+                else => return err,
+            };
 
-            const auxv_address = std.math.add(usize, glibc.rtld_mapped_address, 104) catch return error.InvalidLibcDataAddress;
+            const auxv_address = std.math.add(usize, glibc.rtld_mapped_address, 104) catch return error.InvalidDataAddress;
             try specifics.write_ops.append(dll_allocator, .{
                 .addr = auxv_address,
                 .relative_to = .zero,
@@ -3593,8 +3751,8 @@ fn getLibcSpecifics(dyn_object: *DynObject, layout: LibcLayout) !LibcSpecifics {
             });
 
             if (glibc.tls_offsets) |offsets| {
-                const size_address = std.math.add(usize, glibc.rtld_mapped_address, offsets.tls_size_offset) catch return error.InvalidLibcDataAddress;
-                const align_address = std.math.add(usize, glibc.rtld_mapped_address, offsets.tls_align_offset) catch return error.InvalidLibcDataAddress;
+                const size_address = std.math.add(usize, glibc.rtld_mapped_address, offsets.tls_size_offset) catch return error.InvalidDataAddress;
+                const align_address = std.math.add(usize, glibc.rtld_mapped_address, offsets.tls_align_offset) catch return error.InvalidDataAddress;
 
                 try specifics.write_ops.appendSlice(dll_allocator, &.{
                     .{
@@ -3640,7 +3798,7 @@ fn getLibcSpecifics(dyn_object: *DynObject, layout: LibcLayout) !LibcSpecifics {
                 const offset = op.addr - segment.loaded_at;
 
                 if (!segment.flags_first.read or segment.flags_first.exec or offset > segment.mem_size or @sizeOf(usize) > segment.mem_size - offset) {
-                    return error.InvalidLibcDataAddress;
+                    return error.InvalidDataAddress;
                 }
             },
         }
@@ -5380,7 +5538,7 @@ fn callInitFunctions(dyn_obj: *DynObject) !void {
 
 fn initGlibcInitialThread() !void {
     const specifics = if (libc_specifics) |*value| value else return;
-    const layout = if (specifics.glibc_initial_thread) |*value| value else return;
+    const layout = if (specifics.glibc_threads) |*value| value else return;
     if (layout.initialized) return;
 
     const tp = currentThreadPointer();
@@ -6771,6 +6929,7 @@ const ThreadInfos = struct {
     t: *std.Thread,
     ret: *anyopaque,
     handle: c_ulong,
+    joining: bool = false,
 };
 const ThreadInfosMap = std.AutoArrayHashMapUnmanaged(usize, ThreadInfos);
 
@@ -6779,6 +6938,7 @@ const ThreadRoutineContext = struct {
     thread: *std.Thread,
     f: *const fn (?*anyopaque) callconv(.c) *anyopaque,
     arg: ?*anyopaque,
+    signal_mask: ?std.os.linux.sigset_t,
 };
 
 const ThreadDestructor = struct {
@@ -6839,12 +6999,78 @@ fn runThreadDestructors(tp: usize) void {
     }
 }
 
+fn lockGlibcThreadList(layout: *const GlibcThreadLayout) void {
+    // glibc's lll_lock ABI: 0 unlocked, 1 locked, 2 locked with waiters.
+    if (@cmpxchgStrong(u32, layout.lock, 0, 1, .acquire, .monotonic) == null) return;
+    while (@atomicRmw(u32, layout.lock, .Xchg, 2, .acquire) != 0) {
+        _ = std.os.linux.futex_4arg(layout.lock, .{ .cmd = .WAIT, .private = true }, 2, null);
+    }
+}
+
+fn unlockGlibcThreadList(layout: *const GlibcThreadLayout) void {
+    if (@atomicRmw(u32, layout.lock, .Xchg, 0, .release) > 1) {
+        _ = std.os.linux.futex_3arg(layout.lock, .{ .cmd = .WAKE, .private = true }, 1);
+    }
+}
+
+fn registerGlibcWorker(tp: usize) void {
+    const layout = if (libc_specifics.?.glibc_threads) |*value| value else return;
+    const entry: *GlibcThreadList = @ptrFromInt(tp + layout.list_offset);
+    std.debug.assert(entry.next == 0 and entry.prev == 0);
+
+    @as(*c_int, @ptrFromInt(tp + 24)).* = 1;
+    switch (layout.ownership) {
+        .byte_flag => |offset| @as(*u8, @ptrFromInt(tp + offset)).* = 1,
+        .word_mode => |mode| @as(*u32, @ptrFromInt(tp + mode.offset)).* = mode.value,
+    }
+
+    lockGlibcThreadList(layout);
+    defer unlockGlibcThreadList(layout);
+
+    const next: *GlibcThreadList = @ptrFromInt(layout.user.next);
+    entry.* = .{ .next = @intFromPtr(next), .prev = @intFromPtr(layout.user) };
+    @atomicStore(usize, &next.prev, @intFromPtr(entry), .seq_cst);
+    @atomicStore(usize, &layout.user.next, @intFromPtr(entry), .seq_cst);
+}
+
+fn unregisterGlibcWorker(tp: usize) void {
+    const layout = if (libc_specifics.?.glibc_threads) |*value| value else return;
+    const entry: *GlibcThreadList = @ptrFromInt(tp + layout.list_offset);
+
+    lockGlibcThreadList(layout);
+    defer unlockGlibcThreadList(layout);
+
+    @atomicStore(usize, layout.in_flight, @intFromPtr(entry), .seq_cst);
+    const next: *GlibcThreadList = @ptrFromInt(entry.next);
+    const prev: *GlibcThreadList = @ptrFromInt(entry.prev);
+    @atomicStore(usize, &next.prev, entry.prev, .seq_cst);
+    @atomicStore(usize, &prev.next, entry.next, .seq_cst);
+    @atomicStore(usize, layout.in_flight, 0, .seq_cst);
+    _ = @atomicRmw(u32, layout.nthreads, .Sub, 1, .seq_cst);
+}
+
+fn blockThreadSignals() std.os.linux.sigset_t {
+    var previous: std.os.linux.sigset_t = undefined;
+    const all = std.os.linux.sigfillset();
+    const result = std.os.linux.sigprocmask(std.os.linux.SIG.BLOCK, &all, &previous);
+
+    std.debug.assert(std.os.linux.errno(result) == .SUCCESS);
+    return previous;
+}
+
+fn restoreThreadSignals(mask: *const std.os.linux.sigset_t) void {
+    const result = std.os.linux.sigprocmask(std.os.linux.SIG.SETMASK, mask, null);
+
+    std.debug.assert(std.os.linux.errno(result) == .SUCCESS);
+}
+
 fn threadRoutine(ctx: ThreadRoutineContext) void {
     const new_tp = currentThreadPointer();
 
     Logger.info("new thread spawned: {d} [0x{x}]", .{ ctx.idx, new_tp });
 
     applyLibcWriteOps(new_tp, true) catch @panic("error setting tp fields");
+    registerGlibcWorker(new_tp);
 
     if (libc_specifics.?.musl_initial_thread) |musl| {
         const head_address = new_tp + musl.layout.robust_head_offset;
@@ -6867,8 +7093,14 @@ fn threadRoutine(ctx: ThreadRoutineContext) void {
 
     thread_mutex.unlock(dll_io);
 
+    if (ctx.signal_mask) |mask| restoreThreadSignals(&mask);
+
     const ret = ctx.f(ctx.arg);
     runThreadDestructors(new_tp);
+
+    // Block signals from running after this thread leaves libc
+    if (ctx.signal_mask != null) _ = blockThreadSignals();
+    unregisterGlibcWorker(new_tp);
 
     thread_mutex.lockUncancelable(dll_io);
     const entry_after = thread_infos.getPtr(ctx.idx).?;
@@ -6884,6 +7116,8 @@ fn pthreadCreateSubstitute(newthread: *c_ulong, attr: ?*const anyopaque, start_r
     defer errno_location.* = entry_errno;
     Logger.debug("intercepted call: pthread_create(0x{x}, 0x{x}, 0x{x}, 0x{x})", .{ @intFromPtr(newthread), @intFromPtr(attr), @intFromPtr(start_routine), @intFromPtr(arg) });
 
+    if (libc_specifics.?.kind == .glibc and libc_specifics.?.glibc_threads == null) return @backingInt(std.os.linux.E.NOSYS);
+
     const page_size = std.heap.pageSize();
     const default_stack_size = std.Thread.SpawnConfig.default_stack_size;
 
@@ -6892,6 +7126,10 @@ fn pthreadCreateSubstitute(newthread: *c_ulong, attr: ?*const anyopaque, start_r
     bytes = std.mem.alignForward(usize, bytes, page_size);
     bytes = std.mem.alignForward(usize, bytes, ElfTlsRuntime.area_desc.alignment);
     const tls_offset = bytes + ElfTlsRuntime.area_desc.abi_tcb.offset;
+
+    // block signals until the native descriptor is ready.
+    const signal_mask = if (libc_specifics.?.glibc_threads != null) blockThreadSignals() else null;
+    defer if (signal_mask) |mask| restoreThreadSignals(&mask);
 
     thread_mutex.lockUncancelable(dll_io);
     defer thread_mutex.unlock(dll_io);
@@ -6911,9 +7149,19 @@ fn pthreadCreateSubstitute(newthread: *c_ulong, attr: ?*const anyopaque, start_r
     };
 
     const idx = @atomicRmw(usize, &thread_current_idx, .Add, 1, .seq_cst);
-    thread.* = std.Thread.spawn(.{}, threadRoutine, .{ThreadRoutineContext{ .idx = idx, .thread = thread, .f = start_routine, .arg = arg }}) catch |err| {
+
+    if (libc_specifics.?.glibc_threads) |layout| {
+        @as(*c_int, @ptrFromInt(currentThreadPointer() + 24)).* = 1;
+        if (layout.single_threaded) |flag| @atomicStore(u8, flag, 0, .seq_cst);
+        _ = @atomicRmw(u32, layout.nthreads, .Add, 1, .seq_cst);
+    }
+
+    thread.* = std.Thread.spawn(.{}, threadRoutine, .{ThreadRoutineContext{ .idx = idx, .thread = thread, .f = start_routine, .arg = arg, .signal_mask = signal_mask }}) catch |err| {
+        if (libc_specifics.?.glibc_threads) |layout| _ = @atomicRmw(u32, layout.nthreads, .Sub, 1, .seq_cst);
         dll_allocator.destroy(thread);
+
         Logger.warn("intercepted call: failed: pthread_create(0x{x}, 0x{x}, 0x{x}, 0x{x}): EAGAIN ({})", .{ @intFromPtr(newthread), @intFromPtr(attr), @intFromPtr(start_routine), @intFromPtr(arg), err });
+
         return @backingInt(switch (err) {
             error.OutOfMemory, error.SystemResources, error.ThreadQuotaExceeded, error.LockedMemoryLimitExceeded => std.os.linux.E.AGAIN,
             error.Unexpected => std.os.linux.E.AGAIN,
@@ -6966,12 +7214,14 @@ fn pthreadJoinSubstitute(thread_handle: c_ulong, retval: ?**anyopaque) callconv(
     thread_mutex.lockUncancelable(dll_io);
 
     for (thread_infos.values()) |*entry| {
-        if (entry.handle != thread_handle) {
+        if (entry.handle != thread_handle or entry.joining) {
             continue;
         }
 
         const thread = entry.t;
         const idx = entry.idx;
+
+        entry.joining = true;
         thread_mutex.unlock(dll_io);
 
         thread.join();
