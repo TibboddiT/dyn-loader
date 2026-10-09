@@ -362,6 +362,7 @@ const LibcSpecifics = struct {
     kind: enum { custom, glibc, musl },
     write_ops: std.ArrayList(WriteOps),
     getErrnoLocation: *const fn () callconv(.c) *c_int,
+    glibc_initial_thread: ?GlibcInitialThread = null,
 };
 
 // TODO global state
@@ -2663,6 +2664,17 @@ const CodeView = struct {
         return std.mem.readInt(i32, operand.bytes[0..4], .little);
     }
 
+    fn expectBytes(code: CodeView, cursor: *usize, bytes: []const u8) !void {
+        if (!std.mem.eql(u8, (try code.slice(cursor.*, bytes.len)).bytes, bytes)) return error.CodePatternMismatch;
+        cursor.* += bytes.len;
+    }
+
+    fn expectI32Operand(code: CodeView, cursor: *usize, prefix: []const u8, expected: i64) !void {
+        try code.expectBytes(cursor, prefix);
+        if (try code.readI32(cursor.*) != expected) return error.CodePatternMismatch;
+        cursor.* += 4;
+    }
+
     fn relativeTarget(code: CodeView, operand_offset: usize) !usize {
         const operand = try code.slice(operand_offset, 4);
         const next_instruction_address = std.math.add(usize, operand.address, 4) catch return error.InvalidCodeAddress;
@@ -3092,6 +3104,246 @@ const MuslLayout = struct {
     page_size_offset: usize,
 };
 
+const GlibcThreadList = extern struct {
+    next: usize,
+    prev: usize,
+
+    fn init(list: *GlibcThreadList) void {
+        list.* = .{ .next = @intFromPtr(list), .prev = @intFromPtr(list) };
+    }
+};
+
+const GlibcInitialThread = struct {
+    const Ownership = union(enum) {
+        byte_flag: usize,
+        word_mode: struct {
+            offset: usize,
+            value: u32,
+        },
+    };
+
+    used: *GlibcThreadList,
+    user: *GlibcThreadList,
+    cache: *GlibcThreadList,
+    list_offset: usize,
+    ownership: Ownership,
+    initialized: bool = false,
+};
+
+const GlibcForkLists = struct {
+    cache: usize,
+    ownership: GlibcInitialThread.Ownership,
+    global_load: []const u8,
+};
+
+// libthread_db describes fields with three uint32_t values: bit size, count, offset.
+fn threadDbFieldOffset(dyn_object: *DynObject, name: []const u8, field_size: usize, container_size: usize) !usize {
+    const symbol = try getResolvedSymbolByName(dyn_object, name, false, false, true);
+    const owner = &dyn_objects.values()[symbol.dyn_object_idx];
+    if (owner.syms_array.items[symbol.sym_idx].size != 12) return error.InvalidThreadDbDescriptor;
+
+    const address = try mappedDataAddress(owner, symbol.value, 12);
+    const descriptor: *align(1) const [3]u32 = @ptrFromInt(address);
+    const offset: usize = descriptor[2];
+    if (descriptor[0] != field_size * 8 or descriptor[1] != 1 or
+        offset > container_size or field_size > container_size - offset)
+    {
+        return error.InvalidThreadDbDescriptor;
+    }
+
+    return offset;
+}
+
+fn detectGlibcInitialThread(dyn_object: *DynObject) !?GlibcInitialThread {
+    if (try findLibcSymbol(dyn_object, "_thread_db_rtld_global__dl_stack_used") == null) return null;
+
+    const global = try getResolvedSymbolByName(dyn_object, "_rtld_global", false, false, true);
+    const global_object = &dyn_objects.values()[global.dyn_object_idx];
+    const global_size = global_object.syms_array.items[global.sym_idx].size;
+    const size_symbol = try getResolvedSymbolByName(dyn_object, "_thread_db_sizeof_pthread", false, false, true);
+    const size_object = &dyn_objects.values()[size_symbol.dyn_object_idx];
+    if (size_object.syms_array.items[size_symbol.sym_idx].size != 4) return error.InvalidGlibcThreadLayout;
+    const size_address = try mappedDataAddress(size_object, size_symbol.value, 4);
+    const pthread_size = @as(*align(1) const u32, @ptrFromInt(size_address)).*;
+
+    const list_size = @sizeOf(GlibcThreadList);
+    const used_offset = try threadDbFieldOffset(dyn_object, "_thread_db_rtld_global__dl_stack_used", list_size, global_size);
+    const user_offset = try threadDbFieldOffset(dyn_object, "_thread_db_rtld_global__dl_stack_user", list_size, global_size);
+    const list_offset = try threadDbFieldOffset(dyn_object, "_thread_db_pthread_list", list_size, pthread_size);
+    if (try threadDbFieldOffset(dyn_object, "_thread_db_list_t_next", @sizeOf(usize), list_size) != 0 or
+        try threadDbFieldOffset(dyn_object, "_thread_db_list_t_prev", @sizeOf(usize), list_size) != @sizeOf(usize))
+    {
+        return error.InvalidGlibcThreadLayout;
+    }
+
+    const code = try symbolCode(dyn_object, "fork");
+    const offsets = detectGlibcForkLists(code, used_offset, user_offset, list_offset) catch |err| switch (err) {
+        error.CodePatternMismatch => return error.UnrecognizedGlibcForkLayout,
+        else => return err,
+    };
+
+    var global_reference_found = false;
+    for (0..code.bytes.len) |offset| {
+        if (code.bytes.len - offset < offsets.global_load.len + 4) break;
+        if (!std.mem.startsWith(u8, code.bytes[offset..], offsets.global_load)) continue;
+
+        const slot = try code.relativeTarget(offset + offsets.global_load.len);
+        for (dyn_object.relocs.items) |reloc| {
+            if (reloc.offset == slot and reloc.type == .GLOB_DAT and
+                std.mem.eql(u8, dyn_object.syms_array.items[reloc.sym_idx].name, "_rtld_global"))
+            {
+                global_reference_found = true;
+                break;
+            }
+        }
+    }
+    if (!global_reference_found) return error.InvalidGlibcThreadLayout;
+
+    const ownership_offset, const ownership_size = switch (offsets.ownership) {
+        .byte_flag => |offset| .{ offset, @as(usize, 1) },
+        .word_mode => |mode| .{ mode.offset, @as(usize, 4) },
+    };
+
+    if (ownership_offset < list_offset + list_size or ownership_offset > pthread_size or ownership_size > pthread_size - ownership_offset or ownership_offset % ownership_size != 0) {
+        return error.InvalidGlibcThreadLayout;
+    }
+
+    var heads: [3]*GlibcThreadList = undefined;
+    const head_offsets = [_]usize{ used_offset, user_offset, offsets.cache };
+    for (head_offsets, 0..) |offset, i| {
+        if (offset > global_size or list_size > global_size - offset or offset % @alignOf(GlibcThreadList) != 0) return error.InvalidGlibcThreadLayout;
+        for (head_offsets[0..i]) |previous| {
+            if (offset < previous + list_size and previous < offset + list_size) return error.InvalidGlibcThreadLayout;
+        }
+
+        const virtual_address = std.math.add(usize, global.value, offset) catch return error.InvalidLibcDataAddress;
+        const address = try mappedDataAddress(global_object, virtual_address, list_size);
+        const location = try findDynObjectSegmentForLoadedAddr(address);
+        if (!location.dyn_object.segments.values()[location.segment_index].flags_first.write) return error.InvalidGlibcThreadLayout;
+        heads[i] = @ptrFromInt(address);
+    }
+
+    if (list_offset % @alignOf(GlibcThreadList) != 0) return error.InvalidGlibcThreadLayout;
+
+    return .{
+        .used = heads[0],
+        .user = heads[1],
+        .cache = heads[2],
+        .list_offset = list_offset,
+        .ownership = offsets.ownership,
+    };
+}
+
+fn detectGlibcForkLists(code: CodeView, used_offset: usize, user_offset: usize, list_offset: usize) !GlibcForkLists {
+    // Recognize the list_splice(used, cache) sequence.
+    const Shape = struct {
+        global_load: []const u8,
+        cache_lea: []const u8,
+        cache_load: []const u8,
+        used_prev_load: []const u8,
+        cache_store: []const u8,
+        used_reset: []const u8,
+        user_reset: []const u8,
+        ownership_kind: enum { word_mode, byte_flag },
+    };
+    const shapes = [_]Shape{
+        .{
+            .global_load = "\x48\x8b\x1d", // mov rbx,[rip + disp32]
+            .cache_lea = "\x48\x8d\x93", // lea rdx,[rbx + disp32]
+            .cache_load = "\x48\x8b\x83", // mov rax,[rbx + disp32]
+            .used_prev_load = "\x48\x8b\x93", // mov rdx,[rbx + disp32]
+            .cache_store = "\x48\x89\x83", // mov [rbx + disp32],rax
+            .used_reset = "\x0f\x11\x9b", // movups [rbx + disp32],xmm3
+            .user_reset = "\x0f\x11\xa3", // movups [rbx + disp32],xmm4
+            .ownership_kind = .word_mode,
+        },
+        .{
+            .global_load = "\x4c\x8b\x25", // mov r12,[rip + disp32]
+            .cache_lea = "\x49\x8d\x94\x24", // lea rdx,[r12 + disp32]
+            .cache_load = "\x49\x8b\x84\x24", // mov rax,[r12 + disp32]
+            .used_prev_load = "\x49\x8b\x94\x24", // mov rdx,[r12 + disp32]
+            .cache_store = "\x49\x89\x84\x24", // mov [r12 + disp32],rax
+            .used_reset = "\x41\x0f\x11\x84\x24", // movups [r12 + disp32],xmm0
+            .user_reset = "\x41\x0f\x11\x8c\x24", // movups [r12 + disp32],xmm1
+            .ownership_kind = .byte_flag,
+        },
+    };
+
+    var result: ?GlibcForkLists = null;
+    for (shapes) |shape| {
+        const start = (try code.findUnique(shape.cache_lea, 4, "\x48\x89\x50\x08")) orelse continue;
+        var cursor = start + shape.cache_lea.len;
+        const cache_offset = try code.readI32(cursor);
+        if (cache_offset < 0) return error.UnrecognizedGlibcForkLayout;
+        cursor += 8;
+
+        try code.expectI32Operand(&cursor, shape.cache_load, cache_offset);
+        try code.expectI32Operand(&cursor, shape.used_prev_load, @intCast(used_offset + @sizeOf(usize)));
+        try code.expectBytes(&cursor, "\x48\x89\x02\x48\x89\x50\x08");
+        try code.expectI32Operand(&cursor, shape.cache_load, @intCast(used_offset));
+        try code.expectI32Operand(&cursor, shape.cache_store, cache_offset);
+
+        const reset = (try code.findUnique(shape.used_reset, 4, shape.user_reset)) orelse return error.UnrecognizedGlibcForkLayout;
+        if (reset < cursor) return error.UnrecognizedGlibcForkLayout;
+        cursor = reset;
+        try code.expectI32Operand(&cursor, shape.used_reset, @intCast(used_offset));
+        try code.expectI32Operand(&cursor, shape.user_reset, @intCast(user_offset));
+
+        var ownership: GlibcInitialThread.Ownership = undefined;
+        switch (shape.ownership_kind) {
+            .word_mode => {
+                // cmp dword ptr fs:[offset], user_mode; je user_list_insertion
+                try code.expectBytes(&cursor, "\x64\x83\x3c\x25");
+                const offset = try code.readI32(cursor);
+                cursor += 4;
+                const value = (try code.slice(cursor, 1)).bytes[0];
+                cursor += 1;
+                if (offset < 0 or value == 0 or value > 127) return error.UnrecognizedGlibcForkLayout;
+                ownership = .{ .word_mode = .{ .offset = @intCast(offset), .value = value } };
+                try code.expectBytes(&cursor, "\x0f\x84");
+
+                const target = try code.relativeTarget(cursor);
+                if (target < code.address) return error.UnrecognizedGlibcForkLayout;
+                var insertion = target - code.address;
+                const store = try code.slice(insertion, 3);
+                if (!std.mem.eql(u8, store.bytes[0..2], "\x0f\x11") or store.bytes[2] & 0xf8 != 0xa0) return error.UnrecognizedGlibcForkLayout;
+                insertion += 3;
+                if (try code.readI32(insertion) != list_offset) return error.UnrecognizedGlibcForkLayout;
+                insertion += 4;
+                try code.expectI32Operand(&insertion, shape.cache_store, @intCast(user_offset + @sizeOf(usize)));
+                try code.expectI32Operand(&insertion, shape.cache_store, @intCast(user_offset));
+            },
+            .byte_flag => {
+                // Earlier glibc layouts use a byte user_stack flag, not stack_mode.
+                try code.expectBytes(&cursor, "\x64\x8a\x04\x25");
+                const offset = try code.readI32(cursor);
+                cursor += 4;
+                if (offset < 0) return error.UnrecognizedGlibcForkLayout;
+                ownership = .{ .byte_flag = @intCast(offset) };
+
+                const test_first = std.mem.startsWith(u8, code.bytes[cursor..], "\x84\xc0");
+                if (test_first) try code.expectBytes(&cursor, "\x84\xc0");
+                try code.expectI32Operand(&cursor, if (test_first) "\x49\x8d\x81" else "\x49\x8d\x91", @intCast(list_offset));
+                if (!test_first) try code.expectBytes(&cursor, "\x84\xc0");
+                try code.expectBytes(&cursor, "\x0f\x85");
+
+                const target = try code.relativeTarget(cursor);
+                if (target < code.address) return error.UnrecognizedGlibcForkLayout;
+                var insertion = target - code.address;
+                try code.expectI32Operand(&insertion, "\x41\x0f\x11\x89", @intCast(list_offset));
+                const store = if (test_first) "\x49\x89\x84\x24" else "\x49\x89\x94\x24";
+                try code.expectI32Operand(&insertion, store, @intCast(user_offset + @sizeOf(usize)));
+                try code.expectI32Operand(&insertion, store, @intCast(user_offset));
+            },
+        }
+
+        if (result != null) return error.AmbiguousCodePattern;
+        result = .{ .cache = @intCast(cache_offset), .ownership = ownership, .global_load = shape.global_load };
+    }
+
+    return result orelse error.UnrecognizedGlibcForkLayout;
+}
+
 const LibcLayout = union(enum) {
     musl: MuslLayout,
     glibc: struct {
@@ -3290,6 +3542,8 @@ fn getLibcSpecifics(dyn_object: *DynObject, layout: LibcLayout) !LibcSpecifics {
             });
         },
         .glibc => |glibc| {
+            specifics.glibc_initial_thread = try detectGlibcInitialThread(dyn_object);
+
             const auxv_address = std.math.add(usize, glibc.rtld_mapped_address, 104) catch return error.InvalidLibcDataAddress;
             try specifics.write_ops.append(dll_allocator, .{
                 .addr = auxv_address,
@@ -5000,6 +5254,8 @@ fn callInitFunctions(dyn_obj: *DynObject) !void {
     const is_libc_so = isLibcName(dyn_obj.name);
 
     if (is_libc_so) {
+        try initGlibcInitialThread();
+
         // TODO use libc_specifics.call_ops
         const maybe_sym = resolveSymbolByName("__libc_early_init") catch null;
         if (maybe_sym) |sym| {
@@ -5073,6 +5329,33 @@ fn callInitFunctions(dyn_obj: *DynObject) !void {
             }
         }
     }
+}
+
+fn initGlibcInitialThread() !void {
+    const specifics = if (libc_specifics) |*value| value else return;
+    const layout = if (specifics.glibc_initial_thread) |*value| value else return;
+    if (layout.initialized) return;
+
+    const tp = currentThreadPointer();
+    const entry: *GlibcThreadList = @ptrFromInt(tp + layout.list_offset);
+    const heads = [_]*GlibcThreadList{ layout.used, layout.user, layout.cache };
+    for (heads) |head| {
+        if (head.next != 0 or head.prev != 0) return error.GlibcThreadListsAlreadyInitialized;
+    }
+    if (entry.next != 0 or entry.prev != 0) return error.GlibcThreadAlreadyRegistered;
+
+    for (heads) |head| head.init();
+
+    switch (layout.ownership) {
+        .byte_flag => |offset| @as(*u8, @ptrFromInt(tp + offset)).* = 1,
+        .word_mode => |mode| @as(*u32, @ptrFromInt(tp + mode.offset)).* = mode.value,
+    }
+
+    entry.* = .{ .next = @intFromPtr(layout.user), .prev = @intFromPtr(layout.user) };
+    layout.user.* = .{ .next = @intFromPtr(entry), .prev = @intFromPtr(entry) };
+    layout.initialized = true;
+
+    Logger.info("libc: registered initial thread at 0x{x} in glibc's user-stack list", .{tp});
 }
 
 fn callFiniFunctions(dyn_obj: *DynObject) !void {
