@@ -324,6 +324,7 @@ export fn _dl_debug_state() callconv(.c) void {
 
 // TODO global state
 var dll_initialized: bool = false;
+var dll_deinitialized: bool = false;
 var dll_allocator: std.mem.Allocator = undefined;
 var dll_io: std.Io = undefined;
 var dll_args: std.process.Args = undefined;
@@ -360,6 +361,7 @@ const LibcSpecifics = struct {
 
     kind: enum { custom, glibc, musl },
     write_ops: std.ArrayList(WriteOps),
+    getErrnoLocation: *const fn () callconv(.c) *c_int,
 };
 
 // TODO global state
@@ -375,6 +377,7 @@ const InitOptions = struct {
 
 // TODO thread safety
 pub fn init(options: InitOptions) !void {
+    if (dll_deinitialized) return error.ReinitializationUnsupported;
     if (dll_initialized) {
         return error.AlreadyInitialized;
     }
@@ -389,15 +392,12 @@ pub fn init(options: InitOptions) !void {
     dll_environ = options.environ;
 
     // TODO
-    // - pre restructure TLS early
-    // - assert linux x86_64
     // - assert statically linked
-    // - assert only one thread
+    // - assert main thread
 
     dll_initialized = true;
 }
 
-// TODO thread safety
 pub fn deinit() void {
     if (!dll_initialized or dll_deinitializing) {
         return;
@@ -479,20 +479,13 @@ pub fn deinit() void {
     ifunc_resolved_addrs.clearAndFree(dll_allocator);
     irel_resolved_targets.clearAndFree(dll_allocator);
 
-    const current_tls_area_desc = std.os.linux.tls.area_desc;
-    if (current_tls_area_desc.gdt_entry_number != @as(usize, @bitCast(@as(isize, -1)))) {
+    const current_tls_area_desc = ElfTlsRuntime.area_desc;
+    ElfTlsRuntime.publish(ElfTlsRuntime.executable_desc);
+
+    normal_current_tls_area_desc = null;
+    if (current_tls_area_desc.owns_template) {
         dll_allocator.free(current_tls_area_desc.block.init);
     }
-
-    for (extra_strs.items) |e| {
-        dll_allocator.free(e);
-    }
-    extra_strs.deinit(dll_allocator);
-
-    for (extra_phdrs.items) |e| {
-        dll_allocator.destroy(e);
-    }
-    extra_phdrs.deinit(dll_allocator);
 
     for (extra_link_maps.items) |e| {
         dll_allocator.destroy(e);
@@ -504,10 +497,7 @@ pub fn deinit() void {
     }
     extra_threads.deinit(dll_allocator);
 
-    if (last_dl_error) |dle| {
-        dll_allocator.free(dle);
-        last_dl_error = null;
-    }
+    last_dl_error = null;
 
     thread_infos.clearAndFree(dll_allocator);
 
@@ -534,8 +524,7 @@ pub fn deinit() void {
     extra_strs_z.deinit(dll_allocator);
 
     dll_initialized = false;
-
-    // TODO restore the TLS initial setup
+    dll_deinitialized = true;
 }
 
 fn logSummary() void {
@@ -778,13 +767,18 @@ fn loadPreloads() void {
                 }
             };
 
+            preload_root_indices.ensureUnusedCapacity(dll_allocator, 1) catch |err| {
+                last_err = err;
+                continue;
+            };
+
             const preload_lib = load(real_candidate) catch |err| {
                 last_err = err;
                 continue;
             };
 
             if (std.mem.findScalar(usize, preload_root_indices.items, preload_lib.index) == null) {
-                preload_root_indices.append(dll_allocator, preload_lib.index) catch @panic("OOM");
+                preload_root_indices.appendAssumeCapacity(preload_lib.index);
             }
 
             Logger.info("preload: loaded {s} for {s}", .{ candidate, entry });
@@ -2447,6 +2441,156 @@ fn processRelativeRelocationsFast(dyn_object: *DynObject) void {
     }
 }
 
+comptime {
+    if (builtin.cpu.arch != .x86_64 or builtin.os.tag != .linux or @sizeOf(usize) != 8 or builtin.link_libc or builtin.single_threaded) {
+        @compileError("DynLoader requires a multithreaded x86_64 Linux no-libc host");
+    }
+
+    @export(&ElfTlsRuntime.descriptor, .{ .name = "__zig_elf_static_tls", .linkage = .strong });
+    @export(&ElfTlsRuntime.init, .{ .name = "__zig_elf_static_tls_init", .linkage = .strong });
+    @export(&ElfTlsRuntime.fill, .{ .name = "__zig_elf_static_tls_fill", .linkage = .strong });
+    @export(&ElfTlsRuntime.getAddress, .{ .name = "__tls_get_addr", .linkage = .strong });
+}
+
+const ElfTlsRuntime = struct {
+    // We use @trap because panic handling can use TLS, allocation, or logging.
+
+    const AreaDesc = struct {
+        size: usize,
+        alignment: usize,
+        dtv: struct { offset: usize },
+        abi_tcb: struct { offset: usize },
+        block: struct {
+            init: []const u8,
+            offset: usize,
+            size: usize,
+        },
+        owns_template: bool,
+    };
+
+    const Index = extern struct {
+        module: usize,
+        offset: usize,
+    };
+
+    extern var __zig_elf_auxv: [*]std.elf.Auxv;
+
+    var descriptor: extern struct {
+        size: usize,
+        alignment: usize,
+        gdt_entry_number: usize,
+    } = undefined;
+
+    var area_desc: AreaDesc = undefined;
+    var executable_desc: AreaDesc = undefined;
+    var initial_area: [4096]u8 align(4096) = undefined;
+
+    fn publish(desc: AreaDesc) void {
+        @setRuntimeSafety(false);
+        @disableInstrumentation();
+
+        area_desc = desc;
+        descriptor = .{
+            .size = desc.size,
+            .alignment = desc.alignment,
+            .gdt_entry_number = std.math.maxInt(usize),
+        };
+    }
+
+    fn init(phdrs: [*]std.elf.ElfN.Phdr, phnum: usize) callconv(.c) void {
+        @setRuntimeSafety(false);
+        @disableInstrumentation();
+
+        var load_base: usize = 0;
+        var tls_header: ?std.elf.ElfN.Phdr = null;
+        for (phdrs[0..phnum]) |header| {
+            switch (header.type) {
+                .PHDR => load_base = @intFromPtr(phdrs) - header.vaddr,
+                .TLS => tls_header = header,
+                else => {},
+            }
+        }
+
+        const alignment = @max(@alignOf(usize), if (tls_header) |header| header.@"align" else 1);
+        if (!std.math.isPowerOfTwo(alignment)) @trap();
+
+        const block_size = if (tls_header) |header| header.memsz else 0;
+        const template: []const u8 = if (tls_header) |header|
+            @as([*]const u8, @ptrFromInt(load_base + header.vaddr))[0..header.filesz]
+        else
+            &.{};
+        const metadata_size = @sizeOf(AbiTcb) + @sizeOf(ZigTcb) + @sizeOf(Dtv);
+        if (template.len > block_size or block_size > std.math.maxInt(usize) - alignment - metadata_size) @trap();
+
+        const tp_offset = std.mem.alignForward(usize, block_size, alignment);
+        const dtv_offset = tp_offset + @sizeOf(AbiTcb) + @sizeOf(ZigTcb);
+
+        executable_desc = .{
+            .size = dtv_offset + @sizeOf(Dtv),
+            .alignment = alignment,
+            .dtv = .{ .offset = dtv_offset },
+            .abi_tcb = .{ .offset = tp_offset },
+            .block = .{
+                .init = template,
+                .offset = 0,
+                .size = block_size,
+            },
+            .owns_template = false,
+        };
+        publish(executable_desc);
+
+        const area: [*]u8 = if (descriptor.size <= initial_area.len and alignment <= 4096)
+            &initial_area
+        else mapping: {
+            const mapping_size = @addWithOverflow(descriptor.size, alignment - 1);
+            if (mapping_size[1] != 0) @trap();
+
+            const protection: u32 = @bitCast(std.os.linux.PROT{ .READ = true, .WRITE = true });
+            const flags: u32 = @bitCast(std.os.linux.MAP{ .TYPE = .PRIVATE, .ANONYMOUS = true });
+            const address = std.os.linux.syscall6(.mmap, 0, mapping_size[0], protection, flags, std.math.maxInt(usize), 0);
+            if (std.os.linux.errno(address) != .SUCCESS) @trap();
+
+            break :mapping @ptrFromInt(std.mem.alignForward(usize, address, alignment));
+        };
+
+        const thread_pointer = fill(area);
+
+        if (std.os.linux.syscall2(.arch_prctl, std.os.linux.ARCH.SET_FS, thread_pointer) != 0) @trap();
+    }
+
+    fn fill(area: [*]u8) callconv(.c) usize {
+        @setRuntimeSafety(false);
+        @disableInstrumentation();
+
+        const desc = area_desc;
+        @memset(area[0..desc.size], 0);
+
+        const thread_pointer = @intFromPtr(area) + desc.abi_tcb.offset;
+        @as(*usize, @ptrFromInt(thread_pointer)).* = thread_pointer;
+
+        const dtv: *[2]usize = @ptrCast(@alignCast(area + desc.dtv.offset));
+        dtv.* = .{ 1, @intFromPtr(area) + desc.block.offset };
+
+        @memcpy(area[desc.block.offset..][0..desc.block.init.len], desc.block.init);
+        return thread_pointer;
+    }
+
+    fn getAddress(index: *const Index) callconv(.c) *anyopaque {
+        @setRuntimeSafety(false);
+        @disableInstrumentation();
+
+        // This is only used for the main executable.
+        // Loaded libraries will use the `__tls_get_addr` substitute we provide
+        if (index.module != 1) @trap();
+
+        const thread_pointer = asm ("movq %%fs:0, %[result]"
+            : [result] "=r" (-> usize),
+        );
+
+        return @ptrFromInt(thread_pointer - executable_desc.abi_tcb.offset + index.offset);
+    }
+};
+
 const AbiTcb = extern struct {
     self: *AbiTcb,
 };
@@ -2459,52 +2603,6 @@ const Dtv = extern struct {
     len: usize = 1,
     tls_block: [*]u8,
 };
-
-// What libpthread expects at FS:
-//
-// typedef struct
-// {
-//   void *tcb; /* Pointer to the TCB.  Not necessarily the
-//                 thread descriptor used by libpthread. */
-//   dtv_t *dtv;
-//   void *self; /* Pointer to the thread descriptor.  */
-//   int multiple_threads;
-//   int gscope_flag;
-//   uintptr_t sysinfo;
-//   uintptr_t stack_guard;
-//   uintptr_t pointer_guard;
-//   unsigned long int unused_vgetcpu_cache[2];
-//   /* Bit 0: X86_FEATURE_1_IBT.
-//      Bit 1: X86_FEATURE_1_SHSTK.
-//    */
-//   unsigned int feature_1;
-//   int __glibc_unused1;
-//   /* Reservation of some values for the TM ABI.  */
-//   void *__private_tm[4];
-//   /* GCC split stack support.  */
-//   void *__private_ss;
-//   /* The marker for the current shadow stack.  */
-//   unsigned long long int ssp_base;
-//   /* Must be kept even if it is no longer used by glibc since programs,
-//      like AddressSanitizer, depend on the size of tcbhead_t.  */
-//   __128bits __glibc_unused2[8][4] __attribute__ ((aligned (32)));
-//
-//   void *__padding[8];
-// } tcbhead_t;
-//
-// typedef union dtv
-// {
-//   size_t counter;
-//   struct dtv_pointer pointer;
-// } dtv_t;
-//
-// struct dtv_pointer
-// {
-//   void *val;                    /* Pointer to data, or TLS_DTV_UNALLOCATED.  */
-//   void *to_free;                /* Unaligned pointer, for deallocation.  */
-// };
-//
-// #define TLS_DTV_UNALLOCATED ((void *) -1l)
 
 // TODO global state
 var initial_tls_init_file_size: usize = undefined;
@@ -2522,7 +2620,7 @@ fn computeTcbOffset(dyn_object: *DynObject) void {
 
     dyn_object.tls_capacity = 0;
 
-    const current_tls_area_desc = normal_current_tls_area_desc orelse std.os.linux.tls.area_desc;
+    const current_tls_area_desc = normal_current_tls_area_desc orelse ElfTlsRuntime.area_desc;
 
     var new_area_size: usize = 0;
     new_area_size += dyn_object.tls_init_mem_size;
@@ -2537,7 +2635,7 @@ fn computeTcbOffset(dyn_object: *DynObject) void {
 
 // TODO global state
 var current_surplus_size: usize = 0x100000;
-var normal_current_tls_area_desc: ?@TypeOf(std.os.linux.tls.area_desc) = null;
+var normal_current_tls_area_desc: ?ElfTlsRuntime.AreaDesc = null;
 
 fn isLibcName(name: []const u8) bool {
     // alpine use architecture-qualified libc name
@@ -2574,17 +2672,15 @@ const CodeView = struct {
     }
 
     fn addDisplacement(address: usize, displacement: i32) !usize {
-        // Widen before negating so the minimum i32 displacement is representable.
-        const signed_displacement: i64 = displacement;
-        if (signed_displacement < 0) {
-            return std.math.sub(usize, address, @intCast(-signed_displacement)) catch error.InvalidCodeAddress;
+        // displacement can be −2147483648
+        const safe_displacement: i64 = displacement;
+        if (safe_displacement < 0) {
+            return std.math.sub(usize, address, @intCast(-safe_displacement)) catch error.InvalidCodeAddress;
         }
 
-        return std.math.add(usize, address, @intCast(signed_displacement)) catch error.InvalidCodeAddress;
+        return std.math.add(usize, address, @intCast(safe_displacement)) catch error.InvalidCodeAddress;
     }
 
-    // Only the gap is variable. Callers supply complete known opcode sequences
-    // around operands rather than searching for individual call-opcode bytes.
     fn findUnique(code: CodeView, prefix: []const u8, gap_bytes: usize, suffix: []const u8) !?usize {
         const suffix_offset = std.math.add(usize, prefix.len, gap_bytes) catch return error.TruncatedCodePattern;
         const pattern_size = std.math.add(usize, suffix_offset, suffix.len) catch return error.TruncatedCodePattern;
@@ -3123,13 +3219,16 @@ fn detectLibcLayout(dyn_object: *DynObject) !LibcLayout {
     return error.UnableToDetectLibc;
 }
 
-fn getLibcSpecifics(layout: LibcLayout) !LibcSpecifics {
+fn getLibcSpecifics(dyn_object: *DynObject, layout: LibcLayout) !LibcSpecifics {
+    const errno_symbol = try getResolvedSymbolByName(dyn_object, "__errno_location", false, false, false);
+
     var specifics: LibcSpecifics = .{
         .kind = switch (layout) {
             .musl => .musl,
             .glibc => .glibc,
         },
         .write_ops = .empty,
+        .getErrnoLocation = @ptrFromInt(errno_symbol.address),
     };
     errdefer specifics.write_ops.deinit(dll_allocator);
 
@@ -3449,7 +3548,7 @@ fn detectLibC(dyn_object: *DynObject) !void {
     const layout = try detectLibcLayout(dyn_object);
 
     // Prepare specifics
-    var specifics = try getLibcSpecifics(layout);
+    var specifics = try getLibcSpecifics(dyn_object, layout);
     errdefer specifics.write_ops.deinit(dll_allocator);
 
     // Prepare allocator patches
@@ -3497,7 +3596,7 @@ fn mapTlsBlock(dyn_object: *DynObject) !void {
     }
     if (dyn_object.tls_init_mem_size == 0 and normal_current_tls_area_desc != null) return;
 
-    const current_tls_area_desc = normal_current_tls_area_desc orelse std.os.linux.tls.area_desc;
+    const current_tls_area_desc = normal_current_tls_area_desc orelse ElfTlsRuntime.area_desc;
 
     var new_area_size: usize = 0;
     new_area_size += dyn_object.tls_init_mem_size;
@@ -3540,8 +3639,9 @@ fn mapTlsBlock(dyn_object: *DynObject) !void {
     errdefer if (owned_tls_mapping) |mapping| std.posix.munmap(mapping);
 
     var area_was_extended = false;
+    var remaining_surplus_size = current_surplus_size;
 
-    if (current_tls_area_desc.gdt_entry_number == @as(usize, @bitCast(@as(isize, -1)))) {
+    if (!current_tls_area_desc.owns_template) {
         Logger.debug("tls: mapping new area (first time): size: 0x{x} (surplus) + 0x{x} (new_area_size) + 0x{x} (size of pthread struct)", .{ current_surplus_size, new_area_size, sizeof_pthread });
         const space = std.posix.mmap(null, current_surplus_size + new_area_size + sizeof_pthread, .{ .READ = true, .WRITE = true }, .{ .TYPE = .PRIVATE, .ANONYMOUS = true }, -1, 0) catch |err| {
             Logger.err("failed to allocate tls space: {s}", .{@errorName(err)});
@@ -3555,18 +3655,13 @@ fn mapTlsBlock(dyn_object: *DynObject) !void {
         Logger.debug("tls: setting new area start at -0x{x} (0x{x})", .{ new_area_size - current_tls_area_desc.size, prev_area_addr - (new_area_size - current_tls_area_desc.size) });
         new_area = @as([*]u8, @ptrFromInt(prev_area_addr - (new_area_size - current_tls_area_desc.size)))[0..new_area_size];
         Logger.debug("tls: setting new surplus size: 0x{x}", .{current_surplus_size - (new_area_size - current_tls_area_desc.size)});
-        current_surplus_size -= (new_area_size - current_tls_area_desc.size);
+        remaining_surplus_size -= new_area_size - current_tls_area_desc.size;
         area_was_extended = true;
     } else if (new_area_size > current_tls_area_desc.size) {
-        // Logger.warn("tls: mapping new area (surplus exhausted, dangerous): size: 0x{x} (new_area_size) + 0x{x} (size of pthread struct)", .{ new_area_size, sizeof_pthread });
-        // new_area = std.posix.mmap(null, new_area_size + sizeof_pthread, std.posix.PROT.READ | std.posix.PROT.WRITE, .{ .TYPE = .PRIVATE, .ANONYMOUS = true }, -1, 0) catch |err| {
-        //     Logger.err("failed to allocate tls space: {s}", .{@errorName(err)});
-        //     return err;
-        // };
-
-        // the goal is to avoid unstable thread pointer
+        // That would require relocating an established TP.
         Logger.err("tls: surplus exhausted: wanted size: 0x{x} (new_area_size) + 0x{x} (size of pthread struct)", .{ new_area_size, sizeof_pthread });
-        @panic("unsupported tls area extension");
+
+        return error.TlsSurplusExhausted;
     }
 
     if (new_area != null and dyn_object.tls_init_file_size > 0) {
@@ -3587,7 +3682,7 @@ fn mapTlsBlock(dyn_object: *DynObject) !void {
         @memcpy(new_area.?[prev_block_offset .. prev_block_offset + current_tls_area_desc.block.size], @as([*]u8, @ptrFromInt(old_tp - (new_abi_tcb_offset - prev_block_offset))));
     }
 
-    if (current_tls_area_desc.gdt_entry_number != @as(usize, @bitCast(@as(isize, -1)))) {
+    if (current_tls_area_desc.owns_template) {
         if (new_area != null and !area_was_extended) {
             // TODO we should not have to do that
             Logger.debug("tls: copying previous pthread data: from 0x{x} to 0x{x} (size: 0x{x})", .{
@@ -3685,23 +3780,22 @@ fn mapTlsBlock(dyn_object: *DynObject) !void {
         break :init_blk block;
     };
 
-    // TODO area desc type is not really compliant.
+    // initial TLS area:
     //
-    // currently:
+    //                              --------------------------------------------
+    //                              | Executable TLS | ABI TCB | Zig TCB | DTV |
+    //                              --------------------------------------------
+    //                                               ^
+    //                                               TP
     //
-    //-----------------------------------------------
-    //| TLS Blocks | ABI TCB | Zig TCB | DTV struct |
-    //-------------^---------------------------------
-    //              `-- The TP register points here.
+    // new TLS area:
     //
-    // it should be:
-    //
-    //             | POTENTIAL PTHREAD STRUCT ====>
-    //----------------------------------------------
-    //| TLS Blocks | ABI TCB | *DTV | *SELF | SPACE
-    //-------------^--------------------------------
-    //              `-- The TP register points here.
-    //
+    // -------------------------------------------------------------------------
+    // | Surplus | Other TLS blocks | Executable TLS | ABI TCB | libc metadata >
+    // -------------------------------------------------------------------------
+    //                                               ^
+    //                                               TP
+
     const new_block_init = new_initial_block;
     const new_block_offset: usize = 0;
     const new_block_size = new_block_init.len;
@@ -3725,26 +3819,28 @@ fn mapTlsBlock(dyn_object: *DynObject) !void {
             .size = new_block_size,
         },
 
-        .gdt_entry_number = 1,
+        .owns_template = true,
     };
 
     owned_tls_mapping = null;
 
-    if (current_tls_area_desc.gdt_entry_number != @as(usize, @bitCast(@as(isize, -1)))) {
-        dll_allocator.free(current_tls_area_desc.block.init);
-    }
-
     // keep a copy of the normal area desc,
-    // and create another one to be set to `std.os.linux.tls.area_desc`
-    // that is adapted to the `std.os.linux.tls.prepareArea` call
+    // and publish another one to the owned TLS runtime
+    // that is adapted to the `__zig_elf_static_tls_fill` call
     // when spawning a thread
     normal_current_tls_area_desc = new_tls_area_desc;
+    current_surplus_size = remaining_surplus_size;
 
     new_tls_area_desc.size = current_surplus_size + new_area_size + sizeof_pthread;
     new_tls_area_desc.dtv.offset += current_surplus_size;
     new_tls_area_desc.abi_tcb.offset += current_surplus_size;
     new_tls_area_desc.block.offset += current_surplus_size;
-    std.os.linux.tls.area_desc = new_tls_area_desc;
+
+    ElfTlsRuntime.publish(new_tls_area_desc);
+
+    if (current_tls_area_desc.owns_template) {
+        dll_allocator.free(current_tls_area_desc.block.init);
+    }
 
     if (new_area != null) {
         const new_tp = @intFromPtr(new_area.?.ptr) + new_abi_tcb_offset;
@@ -3790,7 +3886,7 @@ fn resetTlsSlot(dyn_object: *DynObject) !void {
     @memcpy(@as([*]u8, @ptrFromInt(tp - dyn_object.tls_offset))[0..template.len], template);
     dyn_object.tls_mapped_at = tp - dyn_object.tls_offset;
 
-    thread_mutex.lock(dll_io) catch @panic("error locking mutex");
+    thread_mutex.lockUncancelable(dll_io);
     defer thread_mutex.unlock(dll_io);
 
     for (thread_infos.values()) |entry| {
@@ -3828,7 +3924,7 @@ fn applyLibcWriteOps(thread_pointer: usize, only_tp_relative: bool) !void {
 
         const addr = op.addr + if (op.relative_to == .tp) thread_pointer else 0;
         const val: usize = switch (op.value) {
-            .auxv => @intFromPtr(std.os.linux.elf_aux_maybe.?),
+            .auxv => @intFromPtr(ElfTlsRuntime.__zig_elf_auxv),
             .page_size => std.heap.pageSize(),
             .tid => std.Thread.getCurrentId(),
             .tls_size => staticTlsSize(),
@@ -3886,7 +3982,7 @@ fn processRelocations(dyn_object: *DynObject) !void {
                 const sym = try resolveSymbol(dyn_object, reloc.sym_idx);
                 const value = r64_blk: {
                     if (reloc.addend != 0) break :r64_blk sym.address +% @as(usize, @bitCast(reloc.addend));
-                    break :r64_blk if (getSubstituteAddress(sym, dyn_object, true)) |a| a else sym.address;
+                    break :r64_blk if (try getSubstituteAddress(sym, dyn_object, true)) |a| a else sym.address;
                 };
                 Logger.debug("  64: 0x{x} (0x{x}): 0x{x} -> 0x{x} (0x{x}, {s}@{s} + 0x{x})", .{ reloc_addr, reloc.offset, ptr.*, value, sym.value, sym.name, sym.version, reloc.addend });
                 ptr.* = value;
@@ -3895,7 +3991,7 @@ fn processRelocations(dyn_object: *DynObject) !void {
                 reloc_count += 1;
                 // R_X86_64_GLOB_DAT: S
                 const sym = try resolveSymbol(dyn_object, reloc.sym_idx);
-                const value = if (getSubstituteAddress(sym, dyn_object, true)) |a| a else sym.address;
+                const value = if (try getSubstituteAddress(sym, dyn_object, true)) |a| a else sym.address;
                 Logger.debug("  GLOB_DAT: 0x{x} (0x{x}): 0x{x} -> 0x{x} (0x{x}, {s}@{s} + 0x{x})", .{ reloc_addr, reloc.offset, ptr.*, value, sym.value, sym.name, sym.version, reloc.addend });
                 ptr.* = value;
             },
@@ -3903,7 +3999,7 @@ fn processRelocations(dyn_object: *DynObject) !void {
                 reloc_count += 1;
                 // R_X86_64_JUMP_SLOT: S
                 const sym = try resolveSymbol(dyn_object, reloc.sym_idx);
-                const value = if (getSubstituteAddress(sym, dyn_object, true)) |a| a else sym.address;
+                const value = if (try getSubstituteAddress(sym, dyn_object, true)) |a| a else sym.address;
                 Logger.debug("  JUMP_SLOT: 0x{x} (0x{x}): 0x{x} -> 0x{x} (0x{x}, {s}@{s} + 0x{x})", .{ reloc_addr, reloc.offset, ptr.*, value, sym.value, sym.name, sym.version, reloc.addend });
                 ptr.* = value;
             },
@@ -4022,7 +4118,7 @@ fn processRelocations(dyn_object: *DynObject) !void {
                     const sym = dyn_object.syms_array.items[r.sym_idx];
                     const r_sym = try resolveSymbol(dyn_object, r.sym_idx);
 
-                    const substitute_addr = getSubstituteAddress(r_sym, dyn_object, true);
+                    const substitute_addr = try getSubstituteAddress(r_sym, dyn_object, true);
                     if (substitute_addr == null) {
                         break;
                     }
@@ -4266,7 +4362,7 @@ fn getResolvedSymbolByName(maybe_dyn_object: ?*DynObject, sym_name: []const u8, 
                         };
 
                         if (!only_preload) {
-                            if (getSubstituteAddress(res_sym, dep_object, allow_preload_override)) |a| {
+                            if (try getSubstituteAddress(res_sym, dep_object, allow_preload_override)) |a| {
                                 res_sym.address = a;
                             }
                         }
@@ -4327,7 +4423,7 @@ fn getResolvedSymbolByName(maybe_dyn_object: ?*DynObject, sym_name: []const u8, 
                         };
 
                         if (!only_preload) {
-                            if (getSubstituteAddress(res_sym, dep_object, allow_preload_override)) |a| {
+                            if (try getSubstituteAddress(res_sym, dep_object, allow_preload_override)) |a| {
                                 res_sym.address = a;
                             }
                         }
@@ -4465,7 +4561,7 @@ fn getResolvedSymbolByNameAndVersion(maybe_dyn_object: ?*DynObject, sym_name: []
                         };
 
                         if (!only_preload) {
-                            if (getSubstituteAddress(res_sym, dep_object, allow_preload_override)) |a| {
+                            if (try getSubstituteAddress(res_sym, dep_object, allow_preload_override)) |a| {
                                 res_sym.address = a;
                             }
                         }
@@ -4526,7 +4622,7 @@ fn getResolvedSymbolByNameAndVersion(maybe_dyn_object: ?*DynObject, sym_name: []
                         };
 
                         if (!only_preload) {
-                            if (getSubstituteAddress(res_sym, dep_object, allow_preload_override)) |a| {
+                            if (try getSubstituteAddress(res_sym, dep_object, allow_preload_override)) |a| {
                                 res_sym.address = a;
                             }
                         }
@@ -5102,18 +5198,27 @@ const substitutes = std.StaticStringMap(*const anyopaque).initComptime([_]struct
     .{ "getaddrinfo_a", @ptrCast(&unsubstitutedTrap) },
 });
 
-fn selectSubstituteAddress(sym: ResolvedSymbol) ?usize {
+fn selectSubstituteAddress(sym: ResolvedSymbol) !?usize {
     if (substitutes.get(sym.name)) |replacement| {
+        // Save original symbol for `mq_notify`
+        if (std.mem.eql(u8, sym.name, "mq_notify")) {
+            const object = &dyn_objects.values()[sym.dyn_object_idx];
+            native_mq_notify = try vAddressToLoadedAddress(object, sym.value, false);
+        }
         return @intFromPtr(replacement);
     }
 
     // Special case for `timer_create`
     if (std.mem.eql(u8, sym.name, "timer_create")) {
+        const object = &dyn_objects.values()[sym.dyn_object_idx];
+        const original_address = try vAddressToLoadedAddress(object, sym.value, false);
         inline for (.{ "GLIBC_2.2.5", "GLIBC_2.3.3", "GLIBC_2.34" }) |version| {
             if (std.mem.eql(u8, sym.version, version)) {
+                native_timer_create[timerCreateIndex(version)] = original_address;
                 return @intFromPtr(&TimerCreateSubstitute(version).call);
             }
         }
+        native_timer_create[0] = original_address;
         return @intFromPtr(&TimerCreateSubstitute(null).call);
     }
 
@@ -5135,7 +5240,7 @@ fn selectSubstituteAddress(sym: ResolvedSymbol) ?usize {
     return null;
 }
 
-fn getSubstituteAddress(sym: ResolvedSymbol, for_obj: *DynObject, allow_preload_override: bool) ?usize {
+fn getSubstituteAddress(sym: ResolvedSymbol, for_obj: *DynObject, allow_preload_override: bool) anyerror!?usize {
     if (sym.dyn_object_idx == std.math.maxInt(usize)) {
         return null;
     }
@@ -5148,17 +5253,20 @@ fn getSubstituteAddress(sym: ResolvedSymbol, for_obj: *DynObject, allow_preload_
     }
 
     if (allow_preload_override and !for_obj_is_preload_root) {
-        const preload_sym = getResolvedSymbolByName(null, sym.name, false, true, false) catch null;
+        const preload_sym = getResolvedSymbolByName(null, sym.name, false, true, false) catch |err| switch (err) {
+            error.UnresolvedSymbol => null,
+            else => return err,
+        };
         if (preload_sym) |psym| {
             if (std.mem.findScalar(usize, for_obj.binding_dependencies.items, psym.dyn_object_idx) == null) {
-                for_obj.binding_dependencies.append(dll_allocator, psym.dyn_object_idx) catch @panic("OOM");
+                try for_obj.binding_dependencies.append(dll_allocator, psym.dyn_object_idx);
             }
             Logger.info("substitutes: preload override for {s}: 0x{x} => 0x{x}", .{ sym.name, sym.address, psym.address });
             return psym.address;
         }
     }
 
-    const address = selectSubstituteAddress(sym) orelse return null;
+    const address = (try selectSubstituteAddress(sym)) orelse return null;
 
     if (address == @intFromPtr(&unsubstitutedTrap)) {
         Logger.warn("substitutes: {s}: installing trap for [{s}] {s} at 0x{x}", .{ for_obj.name, dyn_object.name, sym.name, sym.address });
@@ -5168,8 +5276,10 @@ fn getSubstituteAddress(sym: ResolvedSymbol, for_obj: *DynObject, allow_preload_
     return address;
 }
 
-fn unsubstitutedTrap() void {
-    @panic("unsupported call to a dangerous function");
+fn unsubstitutedTrap() callconv(.c) noreturn {
+    Logger.debug("intercepted call: unsupported library function", .{});
+    Logger.err("intercepted call: failed: unsupported library function", .{});
+    @panic("unsupported library function called");
 }
 
 // Common libc sigevent prefix
@@ -5181,44 +5291,75 @@ const NotificationEvent = extern struct {
 
 const sigev_thread: c_int = 2;
 
-fn nativeNotificationAddress(name: []const u8, version: ?[]const u8) usize {
-    const symbol = if (version) |requested_version|
-        getResolvedSymbolByNameAndVersion(null, name, requested_version, false, false, false) catch @panic("native notification function unavailable")
-    else
-        getResolvedSymbolByName(null, name, false, false, false) catch @panic("native notification function unavailable");
+// Saved during symbol substitution.
+var native_mq_notify: usize = 0;
+var native_timer_create: [4]usize = @splat(0);
 
-    const dyn_object = &dyn_objects.values()[symbol.dyn_object_idx];
-
-    return vAddressToLoadedAddress(dyn_object, symbol.value, false) catch @panic("native notification function is not mapped");
+fn timerCreateIndex(version: ?[]const u8) usize {
+    const requested_version = version orelse return 0;
+    inline for (.{ "GLIBC_2.2.5", "GLIBC_2.3.3", "GLIBC_2.34" }, 1..) |candidate, index| {
+        if (std.mem.eql(u8, requested_version, candidate)) return index;
+    }
+    return 0;
 }
 
 fn TimerCreateSubstitute(comptime version: ?[]const u8) type {
     return struct {
         fn call(clock: c_int, event: ?*const NotificationEvent, timer_id: *anyopaque) callconv(.c) c_int {
+            const errno_location = libc_specifics.?.getErrnoLocation();
+            const entry_errno = errno_location.*;
+            Logger.debug("intercepted call: timer_create({d}, 0x{x}, 0x{x})", .{ clock, @intFromPtr(event), @intFromPtr(timer_id) });
+            errno_location.* = entry_errno;
+
             if (event) |notification| {
                 if (notification.sigev_notify == sigev_thread) {
+                    Logger.err("intercepted call: failed: timer_create: unsupported SIGEV_THREAD", .{});
                     @panic("unsupported timer_create notification: SIGEV_THREAD");
                 }
             }
 
             const NativeTimerCreate = *const fn (c_int, ?*const NotificationEvent, *anyopaque) callconv(.c) c_int;
-            const native: NativeTimerCreate = @ptrFromInt(nativeNotificationAddress("timer_create", version));
+            const native: NativeTimerCreate = @ptrFromInt(native_timer_create[timerCreateIndex(version)]);
 
-            return native(clock, event, timer_id);
+            const result = native(clock, event, timer_id);
+            const result_errno = errno_location.*;
+            defer errno_location.* = result_errno;
+
+            if (result == 0) {
+                Logger.info("intercepted call: success: timer_create({d}, 0x{x}, 0x{x}) = 0", .{ clock, @intFromPtr(event), @intFromPtr(timer_id) });
+            } else {
+                Logger.warn("intercepted call: failed: timer_create({d}, 0x{x}, 0x{x}) = {d}, errno={d}", .{ clock, @intFromPtr(event), @intFromPtr(timer_id), result, result_errno });
+            }
+            return result;
         }
     };
 }
 
 fn mqNotifySubstitute(queue: c_int, event: ?*const NotificationEvent) callconv(.c) c_int {
+    const errno_location = libc_specifics.?.getErrnoLocation();
+    const entry_errno = errno_location.*;
+    Logger.debug("intercepted call: mq_notify({d}, 0x{x})", .{ queue, @intFromPtr(event) });
+    errno_location.* = entry_errno;
+
     if (event) |notification| {
         if (notification.sigev_notify == sigev_thread) {
+            Logger.err("intercepted call: failed: mq_notify: unsupported SIGEV_THREAD", .{});
             @panic("unsupported mq_notify notification: SIGEV_THREAD");
         }
     }
 
     const NativeMqNotify = *const fn (c_int, ?*const NotificationEvent) callconv(.c) c_int;
-    const native: NativeMqNotify = @ptrFromInt(nativeNotificationAddress("mq_notify", null));
-    return native(queue, event);
+    const native: NativeMqNotify = @ptrFromInt(native_mq_notify);
+    const result = native(queue, event);
+    const result_errno = errno_location.*;
+    defer errno_location.* = result_errno;
+
+    if (result == 0) {
+        Logger.info("intercepted call: success: mq_notify({d}, 0x{x}) = 0", .{ queue, @intFromPtr(event) });
+    } else {
+        Logger.warn("intercepted call: failed: mq_notify({d}, 0x{x}) = {d}, errno={d}", .{ queue, @intFromPtr(event), result, result_errno });
+    }
+    return result;
 }
 
 const ExtraAlloc = struct {
@@ -5227,96 +5368,115 @@ const ExtraAlloc = struct {
     r_size: usize,
 };
 
-const alloc_zero_val: usize = 0xffffffffffffffff;
-
 // TODO global state
-var extra_strs: std.ArrayList([]const u8) = .empty;
 var extra_strs_z: std.ArrayList([:0]const u8) = .empty;
-var extra_phdrs: std.ArrayList(*std.posix.dl_phdr_info) = .empty;
 var extra_link_maps: std.ArrayList(*DlLinkMap) = .empty;
 var thread_mutex: std.Io.Mutex = .init;
 var extra_threads: std.ArrayList(*std.Thread) = .empty;
-var last_dl_error: ?[:0]const u8 = null;
 var extra_allocations: std.AutoArrayHashMapUnmanaged(usize, ExtraAlloc) = .empty;
 var alloc_mutex: std.Io.Mutex = .init;
 var dll_alloc_allocator: std.mem.Allocator = undefined;
 // var extra_onces: std.AutoHashMapUnmanaged(usize, void) = .empty;
+threadlocal var last_dl_error: ?[:0]const u8 = null;
+threadlocal var dl_error_buffer: [2048]u8 = undefined;
+threadlocal var dlerror_cleared: bool = true;
 
 // TODO general thread safety for the substitutes
 
-fn mallocSubstitute(size: usize) callconv(.c) ?*anyopaque {
-    alloc_mutex.lock(dll_io) catch @panic("error locking mutex");
+fn formatDlError(comptime format: []const u8, args: anytype) [:0]const u8 {
+    dlerror_cleared = false;
+    var scratch: [2048]u8 = undefined;
+    const message = std.fmt.bufPrintSentinel(&scratch, format, args, 0) catch return "loader operation failed (diagnostic exceeds buffer)";
+    @memcpy(dl_error_buffer[0 .. message.len + 1], scratch[0 .. message.len + 1]);
+    return dl_error_buffer[0..message.len :0];
+}
 
+fn allocateTracked(alignment: usize, size: usize) !*anyopaque {
+    const allocation_size = try std.math.add(usize, alignment, size);
+    if (size > std.math.maxInt(isize)) return error.OutOfMemory;
+    try extra_allocations.ensureUnusedCapacity(dll_allocator, 1);
+
+    const allocation = try dll_alloc_allocator.alloc(u8, allocation_size);
+    const address = std.mem.alignForward(usize, @intFromPtr(allocation.ptr), alignment);
+    extra_allocations.putAssumeCapacity(address, .{
+        .addr = @intFromPtr(allocation.ptr),
+        .size = allocation_size,
+        .r_size = size,
+    });
+    return @ptrFromInt(address);
+}
+
+fn mallocSubstitute(size: usize) callconv(.c) ?*anyopaque {
     Logger.debug("intercepted call: malloc({d})", .{size});
 
-    const result = dll_alloc_allocator.alloc(u8, 16 + size) catch @panic("OOM");
-    const aligned_result = @as([*]u8, @ptrFromInt(std.mem.alignForward(usize, @intFromPtr(result.ptr), 16)));
+    alloc_mutex.lockUncancelable(dll_io);
+    defer alloc_mutex.unlock(dll_io);
 
-    extra_allocations.put(dll_allocator, @intFromPtr(aligned_result), .{
-        .addr = @intFromPtr(result.ptr),
-        .size = 16 + size,
-        .r_size = size,
-    }) catch @panic("OOM");
+    const aligned_result = allocateTracked(16, size) catch |err| {
+        Logger.warn("intercepted call: failed: malloc({d}): ENOMEM ({})", .{ size, err });
+        return allocationFailure();
+    };
 
     Logger.info("intercepted call: success: malloc({d}) = 0x{x}", .{ size, @intFromPtr(aligned_result) });
-
-    alloc_mutex.unlock(dll_io);
 
     return aligned_result;
 }
 
 fn alignedAllocSubstitute(alignment: usize, size: usize) callconv(.c) ?*anyopaque {
-    alloc_mutex.lock(dll_io) catch @panic("error locking mutex");
-
     Logger.debug("intercepted call: aligned_alloc({d}, {d})", .{ alignment, size });
 
-    const result = dll_alloc_allocator.alloc(u8, alignment + size) catch @panic("OOM");
-    const aligned_result = @as([*]u8, @ptrFromInt(std.mem.alignForward(usize, @intFromPtr(result.ptr), alignment)));
+    if (!std.math.isPowerOfTwo(alignment)) {
+        Logger.warn("intercepted call: failed: aligned_alloc({d}, {d}): EINVAL", .{ alignment, size });
+        setErrno(.INVAL);
+        return null;
+    }
 
-    extra_allocations.put(dll_allocator, @intFromPtr(aligned_result), .{
-        .addr = @intFromPtr(result.ptr),
-        .size = alignment + size,
-        .r_size = size,
-    }) catch @panic("OOM");
+    alloc_mutex.lockUncancelable(dll_io);
+    defer alloc_mutex.unlock(dll_io);
+
+    const aligned_result = allocateTracked(@max(alignment, 16), size) catch |err| {
+        Logger.warn("intercepted call: failed: aligned_alloc({d}, {d}): ENOMEM ({})", .{ alignment, size, err });
+        return allocationFailure();
+    };
 
     Logger.info("intercepted call: success: aligned_alloc({d}, {d}) = 0x{x}", .{ alignment, size, @intFromPtr(aligned_result) });
-
-    alloc_mutex.unlock(dll_io);
 
     return aligned_result;
 }
 
 fn posixMemalignSubstitute(memptr: **anyopaque, alignment: usize, size: usize) callconv(.c) c_int {
+    const errno_location = libc_specifics.?.getErrnoLocation();
+    const entry_errno = errno_location.*;
+    defer errno_location.* = entry_errno;
+    Logger.debug("intercepted call: posix_memalign(0x{x}, {d}, {d})", .{ @intFromPtr(memptr), alignment, size });
+
     if (alignment == 0 or !std.math.isPowerOfTwo(alignment) or alignment % @sizeOf(*anyopaque) != 0) {
+        Logger.warn("intercepted call: failed: posix_memalign(0x{x}, {d}, {d}): EINVAL", .{ @intFromPtr(memptr), alignment, size });
         return @backingInt(std.os.linux.E.INVAL);
     }
 
-    alloc_mutex.lock(dll_io) catch @panic("error locking mutex");
+    alloc_mutex.lockUncancelable(dll_io);
+    defer alloc_mutex.unlock(dll_io);
 
-    Logger.debug("intercepted call: posix_memalign(0x{x}, {d}, {d})", .{ @intFromPtr(memptr), alignment, size });
-
-    const result = dll_alloc_allocator.alloc(u8, alignment + size) catch @panic("OOM");
-    const aligned_result = @as([*]u8, @ptrFromInt(std.mem.alignForward(usize, @intFromPtr(result.ptr), alignment)));
-
-    extra_allocations.put(dll_allocator, @intFromPtr(aligned_result), .{
-        .addr = @intFromPtr(result.ptr),
-        .size = alignment + size,
-        .r_size = size,
-    }) catch @panic("OOM");
-
-    Logger.info("intercepted call: success: posix_memalign(0x{x} [-> 0x{x}], {d}, {d}) = 0", .{ @intFromPtr(memptr), @intFromPtr(aligned_result), alignment, size });
+    const aligned_result = allocateTracked(@max(alignment, 16), size) catch |err| {
+        Logger.warn("intercepted call: failed: posix_memalign(0x{x}, {d}, {d}): ENOMEM ({})", .{ @intFromPtr(memptr), alignment, size, err });
+        return @backingInt(std.os.linux.E.NOMEM);
+    };
 
     memptr.* = aligned_result;
 
-    alloc_mutex.unlock(dll_io);
+    Logger.info("intercepted call: success: posix_memalign(0x{x} [-> 0x{x}], {d}, {d}) = 0", .{ @intFromPtr(memptr), @intFromPtr(aligned_result), alignment, size });
 
     return 0;
 }
 
 fn freeSubstitute(p: ?*anyopaque) callconv(.c) void {
-    alloc_mutex.lock(dll_io) catch @panic("error locking mutex");
-
+    const errno_location = libc_specifics.?.getErrnoLocation();
+    const entry_errno = errno_location.*;
+    defer errno_location.* = entry_errno;
     Logger.debug("intercepted call: free(0x{x})", .{@intFromPtr(p)});
+
+    alloc_mutex.lockUncancelable(dll_io);
 
     if (p != null) {
         const maybe_alloc = extra_allocations.get(@intFromPtr(p));
@@ -5327,165 +5487,100 @@ fn freeSubstitute(p: ?*anyopaque) callconv(.c) void {
 
             dll_alloc_allocator.free(slice);
 
-            if (@intFromPtr(p) != alloc_zero_val) {
-                _ = extra_allocations.swapRemove(@intFromPtr(p));
-            }
+            _ = extra_allocations.swapRemove(@intFromPtr(p));
         } else {
-            Logger.err("free(0x{x}) failed: externally allocated memory", .{@intFromPtr(p)});
+            alloc_mutex.unlock(dll_io);
+            Logger.err("intercepted call: failed: free(0x{x}): externally allocated memory", .{@intFromPtr(p)});
             @panic("free failed: externally allocated memory");
         }
     }
 
-    Logger.info("intercepted call: success: free(0x{x}) [{d} allocs remaining", .{ @intFromPtr(p), extra_allocations.count() });
+    Logger.info("intercepted call: success: free(0x{x}) [{d} allocs remaining]", .{ @intFromPtr(p), extra_allocations.count() });
 
     alloc_mutex.unlock(dll_io);
 }
 
+fn setErrno(value: std.os.linux.E) void {
+    libc_specifics.?.getErrnoLocation().* = @intCast(@backingInt(value));
+}
+
 fn allocationFailure() ?*anyopaque {
-    const sym = getResolvedSymbolByName(null, "__errno_location", false, false, false) catch @panic("libc errno accessor unavailable");
-    const errno_location: *const fn () callconv(.c) *c_int = @ptrFromInt(sym.address);
-    errno_location().* = @backingInt(std.os.linux.E.NOMEM);
+    setErrno(.NOMEM);
     return null;
 }
 
 fn callocSubstitute(n: usize, size: usize) callconv(.c) ?*anyopaque {
-    alloc_mutex.lock(dll_io) catch @panic("error locking mutex");
-    defer alloc_mutex.unlock(dll_io);
-
     Logger.debug("intercepted call: calloc({d}, {d})", .{ n, size });
 
-    const requested_size = std.math.mul(usize, n, size) catch return allocationFailure();
-    const allocation_size = std.math.add(usize, 16, requested_size) catch return allocationFailure();
-    const result = dll_alloc_allocator.alloc(u8, allocation_size) catch return allocationFailure();
-    @memset(result, 0x0);
-    const aligned_result = @as([*]u8, @ptrFromInt(std.mem.alignForward(usize, @intFromPtr(result.ptr), 16)));
+    alloc_mutex.lockUncancelable(dll_io);
+    defer alloc_mutex.unlock(dll_io);
 
-    extra_allocations.put(dll_allocator, @intFromPtr(aligned_result), .{
-        .addr = @intFromPtr(result.ptr),
-        .size = allocation_size,
-        .r_size = requested_size,
-    }) catch {
-        dll_alloc_allocator.free(result);
+    const requested_size = std.math.mul(usize, n, size) catch {
+        Logger.warn("intercepted call: failed: calloc({d}, {d}): ENOMEM (size overflow)", .{ n, size });
         return allocationFailure();
     };
+    const aligned_result = allocateTracked(16, requested_size) catch |err| {
+        Logger.warn("intercepted call: failed: calloc({d}, {d}): ENOMEM ({})", .{ n, size, err });
+        return allocationFailure();
+    };
+    @memset(@as([*]u8, @ptrCast(aligned_result))[0..requested_size], 0);
 
     Logger.info("intercepted call: success: calloc({d}, {d}) = 0x{x}", .{ n, size, @intFromPtr(aligned_result) });
 
     return aligned_result;
 }
 
-fn reallocSubstitute(p: ?*anyopaque, size: usize) callconv(.c) *anyopaque {
-    alloc_mutex.lock(dll_io) catch @panic("error locking mutex");
-
+fn reallocSubstitute(p: ?*anyopaque, size: usize) callconv(.c) ?*anyopaque {
     Logger.debug("intercepted call: realloc(0x{x}, {d})", .{ @intFromPtr(p), size });
 
-    var result: []u8 = undefined;
-    var aligned_result: [*]u8 = undefined;
-
-    if (p != null) {
-        const maybe_prev_alloc = extra_allocations.get(@intFromPtr(p));
-
-        if (maybe_prev_alloc) |prev_alloc| {
-            Logger.debug("REALLOC: PREV: size: {d}, content: {x}", .{ prev_alloc.r_size, @as([*]u8, @ptrCast(p))[0..@min(@min(size, prev_alloc.r_size), 20)] });
-
-            const n_prev_bad_bytes = @intFromPtr(p) - prev_alloc.addr;
-
-            const prev_arr = @as([*]u8, @ptrFromInt(prev_alloc.addr));
-            const prev_slice = prev_arr[0..prev_alloc.size];
-
-            if (n_prev_bad_bytes > 0) {
-                @memmove(prev_slice.ptr, @as([*]u8, @ptrCast(p))[0..prev_alloc.r_size]);
-            }
-
-            result = dll_alloc_allocator.realloc(prev_slice, size + 16) catch @panic("OOM");
-            aligned_result = @as([*]u8, @ptrFromInt(std.mem.alignForward(usize, @intFromPtr(result.ptr), 16)));
-
-            _ = extra_allocations.swapRemove(@intFromPtr(p));
-
-            const n_post_bad_bytes = @intFromPtr(aligned_result) - @intFromPtr(result.ptr);
-
-            if (n_post_bad_bytes > 0) {
-                @memmove(aligned_result, result[0..size]);
-            }
-
-            Logger.debug("REALLOC: POST: size: {d},: {x}", .{ size, @as([*]u8, @ptrCast(aligned_result))[0..@min(@min(size, prev_alloc.r_size), 20)] });
-        } else {
-            Logger.err("realloc(0x{x}, {d}) failed: externally allocated memory", .{ @intFromPtr(p), size });
+    const result = reallocateTracked(p, size) catch |err| {
+        if (err == error.ExternalAllocation) {
+            Logger.err("intercepted call: failed: realloc(0x{x}, {d}): externally allocated memory", .{ @intFromPtr(p), size });
             @panic("realloc failed: externally allocated memory");
         }
-    } else {
-        result = dll_alloc_allocator.alloc(u8, size + 16) catch @panic("OOM");
-        aligned_result = @as([*]u8, @ptrFromInt(std.mem.alignForward(usize, @intFromPtr(result.ptr), 16)));
-    }
+        Logger.warn("intercepted call: failed: realloc(0x{x}, {d}): ENOMEM ({})", .{ @intFromPtr(p), size, err });
+        return allocationFailure();
+    };
 
-    extra_allocations.put(dll_allocator, @intFromPtr(aligned_result), .{
-        .addr = @intFromPtr(result.ptr),
-        .r_size = size,
-        .size = size + 16,
-    }) catch @panic("OOM");
-
-    Logger.info("intercepted call: success: realloc(0x{x}, {d}) = 0x{x}", .{ @intFromPtr(p), size, @intFromPtr(aligned_result) });
-
-    alloc_mutex.unlock(dll_io);
-
-    return aligned_result;
+    Logger.info("intercepted call: success: realloc(0x{x}, {d}) = 0x{x}", .{ @intFromPtr(p), size, @intFromPtr(result) });
+    return result;
 }
 
-fn reallocarraySubstitute(p: ?*anyopaque, n: usize, size: usize) callconv(.c) *anyopaque {
-    alloc_mutex.lock(dll_io) catch @panic("error locking mutex");
+fn reallocateTracked(p: ?*anyopaque, size: usize) !*anyopaque {
+    alloc_mutex.lockUncancelable(dll_io);
+    defer alloc_mutex.unlock(dll_io);
 
-    Logger.debug("intercepted call: reallocarray(0x{x}, {d}, {d})", .{ @intFromPtr(p), n, size });
+    const previous = if (p) |pointer| extra_allocations.get(@intFromPtr(pointer)) orelse return error.ExternalAllocation else null;
 
-    var result: []u8 = undefined;
-    var aligned_result: [*]u8 = undefined;
-
-    if (p != null) {
-        const maybe_prev_alloc = extra_allocations.get(@intFromPtr(p));
-
-        if (maybe_prev_alloc) |prev_alloc| {
-            Logger.debug("REALLOCARRAY: PREV: size: {d}, content: {x}", .{ prev_alloc.r_size, @as([*]u8, @ptrCast(p))[0..@min(@min(n * size, prev_alloc.r_size), 20)] });
-
-            const n_prev_bad_bytes = @intFromPtr(p) - prev_alloc.addr;
-
-            const prev_arr = @as([*]u8, @ptrFromInt(prev_alloc.addr));
-            const prev_slice = prev_arr[0..prev_alloc.size];
-
-            if (n_prev_bad_bytes > 0) {
-                @memmove(prev_slice.ptr, @as([*]u8, @ptrCast(p))[0..prev_alloc.r_size]);
-            }
-
-            result = dll_alloc_allocator.realloc(prev_slice, n * size + 16) catch @panic("OOM");
-            aligned_result = @as([*]u8, @ptrFromInt(std.mem.alignForward(usize, @intFromPtr(result.ptr), 16)));
-
-            _ = extra_allocations.swapRemove(@intFromPtr(p));
-
-            const n_post_bad_bytes = @intFromPtr(aligned_result) - @intFromPtr(result.ptr);
-
-            if (n_post_bad_bytes > 0) {
-                @memmove(aligned_result, result[0 .. n * size]);
-            }
-
-            Logger.debug("REALLOCARRAY: POST: size: {d}, content: {x}", .{ n * size, @as([*]u8, @ptrCast(aligned_result))[0..@min(@min(n * size, prev_alloc.r_size), 20)] });
-        } else {
-            Logger.err("reallocarray(0x{x}, {d}. {d}) failed: externally allocated memory", .{ @intFromPtr(p), n, size });
-            @panic("reallocarray failed: externally allocated memory");
-        }
-    } else {
-        result = dll_alloc_allocator.alloc(u8, n * size + 16) catch @panic("OOM");
-        aligned_result = @as([*]u8, @ptrFromInt(std.mem.alignForward(usize, @intFromPtr(result.ptr), 16)));
+    const result = try allocateTracked(16, size);
+    if (previous) |allocation| {
+        const preserved_size = @min(allocation.r_size, size);
+        @memcpy(@as([*]u8, @ptrCast(result))[0..preserved_size], @as([*]const u8, @ptrCast(p.?))[0..preserved_size]);
+        dll_alloc_allocator.free(@as([*]u8, @ptrFromInt(allocation.addr))[0..allocation.size]);
+        _ = extra_allocations.swapRemove(@intFromPtr(p.?));
     }
 
-    extra_allocations.put(dll_allocator, @intFromPtr(aligned_result), .{
-        .addr = @intFromPtr(result.ptr),
-        .size = n * size + 16,
-        .r_size = n * size,
-    }) catch @panic("OOM");
+    return result;
+}
 
-    Logger.info("intercepted call: success: reallocarray(0x{x}, {d}, {d}) = 0x{x}", .{ @intFromPtr(p), n, size, @intFromPtr(aligned_result) });
+fn reallocarraySubstitute(p: ?*anyopaque, n: usize, size: usize) callconv(.c) ?*anyopaque {
+    Logger.debug("intercepted call: reallocarray(0x{x}, {d}, {d})", .{ @intFromPtr(p), n, size });
 
-    alloc_mutex.unlock(dll_io);
+    const requested_size = std.math.mul(usize, n, size) catch {
+        Logger.warn("intercepted call: failed: reallocarray(0x{x}, {d}, {d}): ENOMEM (size overflow)", .{ @intFromPtr(p), n, size });
+        return allocationFailure();
+    };
+    const result = reallocateTracked(p, requested_size) catch |err| {
+        if (err == error.ExternalAllocation) {
+            Logger.err("intercepted call: failed: reallocarray(0x{x}, {d}, {d}): externally allocated memory", .{ @intFromPtr(p), n, size });
+            @panic("reallocarray failed: externally allocated memory");
+        }
+        Logger.warn("intercepted call: failed: reallocarray(0x{x}, {d}, {d}): ENOMEM ({})", .{ @intFromPtr(p), n, size, err });
+        return allocationFailure();
+    };
 
-    return aligned_result;
+    Logger.info("intercepted call: success: reallocarray(0x{x}, {d}, {d}) = 0x{x}", .{ @intFromPtr(p), n, size, @intFromPtr(result) });
+    return result;
 }
 
 const rtld_flags = struct {
@@ -5505,8 +5600,7 @@ fn dlopenSubstitute(path: ?[*:0]const u8, flags: c_int) callconv(.c) ?*anyopaque
         return @ptrFromInt(@as(usize, @intCast(DlHandle.rtld_main.toInt())));
     }
 
-    const owned_path = dll_allocator.dupe(u8, std.mem.span(path.?)) catch @panic("OOM");
-    extra_strs.append(dll_allocator, owned_path) catch @panic("OOM");
+    const requested_path = std.mem.span(path.?);
 
     var caller_runpath: ?[]const u8 = null;
     var caller_origin_dir: ?[]const u8 = null;
@@ -5520,17 +5614,13 @@ fn dlopenSubstitute(path: ?[*:0]const u8, flags: c_int) callconv(.c) ?*anyopaque
     }
 
     // TODO we should not try to load the library if RTLD_NOLOAD is set
-    const lib = loadWithRootResolveContext(owned_path, caller_runpath, caller_origin_dir) catch |err| {
+    const lib = loadWithRootResolveContext(requested_path, caller_runpath, caller_origin_dir) catch |err| {
         if ((flags & rtld_flags.noload) == 0) {
-            if (last_dl_error != null) {
-                dll_allocator.free(last_dl_error.?);
-            }
-            last_dl_error = std.fmt.allocPrintSentinel(dll_allocator, "unable to load library {s}: {}", .{ owned_path, err }, 0) catch @panic("OOM");
+            last_dl_error = formatDlError("unable to load library {s}: {}", .{ requested_path, err });
             dlerror_cleared = false;
-
-            Logger.err("dlopen(\"{s}\", 0x{x}) failed: {}", .{ owned_path, flags, err });
         }
 
+        Logger.warn("intercepted call: failed: dlopen(\"{s}\", 0x{x}): {}", .{ requested_path, flags, err });
         return null;
     };
 
@@ -5543,7 +5633,17 @@ fn dlopenSubstitute(path: ?[*:0]const u8, flags: c_int) callconv(.c) ?*anyopaque
         .index = @intCast(lib.index),
     };
     const handle_raw = handle.toInt();
-    const gop = dl_handles.getOrPut(dll_allocator, handle_raw) catch @panic("OOM");
+
+    const gop = dl_handles.getOrPut(dll_allocator, handle_raw) catch |err| {
+        for (dyn_objects.values()[lib.index].deps_breadth_first.items) |dep_idx| {
+            dyn_objects.values()[dep_idx].ref_count -= 1;
+        }
+        unloadUnreferencedObjects() catch |unload_err| Logger.warn("dlopen rollback: {}", .{unload_err});
+        last_dl_error = formatDlError("unable to register library handle: {}", .{err});
+        Logger.warn("intercepted call: failed: dlopen(\"{s}\", 0x{x}): handle registration: {}", .{ requested_path, flags, err });
+        return null;
+    };
+
     if (gop.found_existing) {
         std.debug.assert(gop.value_ptr.dyn_object_idx == lib.index);
         std.debug.assert(gop.value_ptr.epoch == dyn_object.current_epoch);
@@ -5573,49 +5673,37 @@ fn dlcloseSubstitute(lib: *anyopaque) callconv(.c) c_int {
     }
 
     if (handle == DlHandle.rtld_default or handle == DlHandle.rtld_next or handle.tag != 0b10) {
-        if (last_dl_error != null) {
-            dll_allocator.free(last_dl_error.?);
-        }
-        last_dl_error = std.fmt.allocPrintSentinel(dll_allocator, "invalid library handle 0x{x}", .{handle_raw}, 0) catch @panic("OOM");
+        last_dl_error = formatDlError("invalid library handle 0x{x}", .{handle_raw});
         dlerror_cleared = false;
 
-        Logger.warn("dlclose(0x{x}) failed: invalid library handle", .{handle_raw});
+        Logger.warn("intercepted call: failed: dlclose(0x{x}): invalid library handle", .{handle_raw});
 
         return 1;
     }
 
     const metadata = dl_handles.getPtr(handle_raw) orelse {
-        if (last_dl_error != null) {
-            dll_allocator.free(last_dl_error.?);
-        }
-        last_dl_error = std.fmt.allocPrintSentinel(dll_allocator, "invalid library handle 0x{x}", .{handle_raw}, 0) catch @panic("OOM");
+        last_dl_error = formatDlError("invalid library handle 0x{x}", .{handle_raw});
         dlerror_cleared = false;
 
-        Logger.warn("dlclose(0x{x}) failed: invalid library handle", .{handle_raw});
+        Logger.warn("intercepted call: failed: dlclose(0x{x}): invalid library handle", .{handle_raw});
 
         return 1;
     };
 
     if (metadata.open_count == 0) {
-        if (last_dl_error != null) {
-            dll_allocator.free(last_dl_error.?);
-        }
-        last_dl_error = std.fmt.allocPrintSentinel(dll_allocator, "library handle 0x{x} is already closed", .{handle_raw}, 0) catch @panic("OOM");
+        last_dl_error = formatDlError("library handle 0x{x} is already closed", .{handle_raw});
         dlerror_cleared = false;
 
-        Logger.warn("dlclose(0x{x}) failed: already closed", .{handle_raw});
+        Logger.warn("intercepted call: failed: dlclose(0x{x}): already closed", .{handle_raw});
 
         return 1;
     }
 
     if (metadata.epoch != handle.epoch) {
-        if (last_dl_error != null) {
-            dll_allocator.free(last_dl_error.?);
-        }
-        last_dl_error = std.fmt.allocPrintSentinel(dll_allocator, "invalid library handle 0x{x}: stale epoch", .{handle_raw}, 0) catch @panic("OOM");
+        last_dl_error = formatDlError("invalid library handle 0x{x}: stale epoch", .{handle_raw});
         dlerror_cleared = false;
 
-        Logger.warn("dlclose(0x{x}) failed: stale handle epoch", .{handle_raw});
+        Logger.warn("intercepted call: failed: dlclose(0x{x}): stale handle epoch", .{handle_raw});
 
         return 1;
     }
@@ -5624,13 +5712,10 @@ fn dlcloseSubstitute(lib: *anyopaque) callconv(.c) c_int {
     const dyn_object = &dyn_objects.values()[dyn_object_idx];
 
     if (dyn_object.current_epoch != metadata.epoch) {
-        if (last_dl_error != null) {
-            dll_allocator.free(last_dl_error.?);
-        }
-        last_dl_error = std.fmt.allocPrintSentinel(dll_allocator, "library handle 0x{x} is stale", .{handle_raw}, 0) catch @panic("OOM");
+        last_dl_error = formatDlError("library handle 0x{x} is stale", .{handle_raw});
         dlerror_cleared = false;
 
-        Logger.warn("dlclose(0x{x} [{s}]) failed: stale handle", .{ handle_raw, dyn_object.name });
+        Logger.warn("intercepted call: failed: dlclose(0x{x} [{s}]): stale handle", .{ handle_raw, dyn_object.name });
 
         return 1;
     }
@@ -5650,9 +5735,9 @@ fn dlcloseSubstitute(lib: *anyopaque) callconv(.c) c_int {
 
     metadata.open_count -= 1;
     unloadUnreferencedObjects() catch |err| {
-        if (last_dl_error) |message| dll_allocator.free(message);
-        last_dl_error = std.fmt.allocPrintSentinel(dll_allocator, "unable to close library handle 0x{x}: {}", .{ handle_raw, err }, 0) catch @panic("OOM");
+        last_dl_error = formatDlError("unable to close library handle 0x{x}: {}", .{ handle_raw, err });
         dlerror_cleared = false;
+        Logger.warn("intercepted call: failed: dlclose(0x{x}): {}", .{ handle_raw, err });
         return 1;
     };
 
@@ -5828,13 +5913,10 @@ fn dlsymSubstitute(lib_handle: ?*anyopaque, sym_name: [*:0]const u8) callconv(.c
 
     if (find_next) {
         const infos = maybe_caller_infos orelse {
-            if (last_dl_error != null) {
-                dll_allocator.free(last_dl_error.?);
-            }
-            last_dl_error = std.fmt.allocPrintSentinel(dll_allocator, "unable to resolve RTLD_NEXT caller for symbol {s} at 0x{x}", .{ sym_name, caller_addr }, 0) catch @panic("OOM");
+            last_dl_error = formatDlError("unable to resolve RTLD_NEXT caller for symbol {s} at 0x{x}", .{ sym_name, caller_addr });
             dlerror_cleared = false;
 
-            Logger.warn("dlsym(RTLD_NEXT, \"{s}\") failed: unable to resolve caller at 0x{x}", .{ sym_name, caller_addr });
+            Logger.warn("intercepted call: failed: dlsym(RTLD_NEXT, \"{s}\"): unable to resolve caller at 0x{x}", .{ sym_name, caller_addr });
 
             return null;
         };
@@ -5842,37 +5924,28 @@ fn dlsymSubstitute(lib_handle: ?*anyopaque, sym_name: [*:0]const u8) callconv(.c
         dyn_object = infos.dyn_object;
     } else if (lib_handle != null and handle != DlHandle.rtld_default and handle != DlHandle.rtld_main) {
         if (handle.tag != 0b10) {
-            if (last_dl_error != null) {
-                dll_allocator.free(last_dl_error.?);
-            }
-            last_dl_error = std.fmt.allocPrintSentinel(dll_allocator, "unable to get symbol {s}: invalid library handle 0x{x}", .{ sym_name, handle_raw }, 0) catch @panic("OOM");
+            last_dl_error = formatDlError("unable to get symbol {s}: invalid library handle 0x{x}", .{ sym_name, handle_raw });
             dlerror_cleared = false;
 
-            Logger.warn("dlsym({d}, \"{s}\") failed: invalid library handle", .{ @intFromPtr(lib_handle), sym_name });
+            Logger.warn("intercepted call: failed: dlsym({d}, \"{s}\"): invalid library handle", .{ @intFromPtr(lib_handle), sym_name });
 
             return null;
         }
 
         const metadata = dl_handles.getPtr(handle_raw) orelse {
-            if (last_dl_error != null) {
-                dll_allocator.free(last_dl_error.?);
-            }
-            last_dl_error = std.fmt.allocPrintSentinel(dll_allocator, "unable to get symbol {s}: invalid library handle 0x{x}", .{ sym_name, handle_raw }, 0) catch @panic("OOM");
+            last_dl_error = formatDlError("unable to get symbol {s}: invalid library handle 0x{x}", .{ sym_name, handle_raw });
             dlerror_cleared = false;
 
-            Logger.warn("dlsym({d}, \"{s}\") failed: invalid library handle", .{ @intFromPtr(lib_handle), sym_name });
+            Logger.warn("intercepted call: failed: dlsym({d}, \"{s}\"): invalid library handle", .{ @intFromPtr(lib_handle), sym_name });
 
             return null;
         };
 
         if (metadata.open_count == 0) {
-            if (last_dl_error != null) {
-                dll_allocator.free(last_dl_error.?);
-            }
-            last_dl_error = std.fmt.allocPrintSentinel(dll_allocator, "unable to get symbol {s}: library handle 0x{x} is closed", .{ sym_name, handle_raw }, 0) catch @panic("OOM");
+            last_dl_error = formatDlError("unable to get symbol {s}: library handle 0x{x} is closed", .{ sym_name, handle_raw });
             dlerror_cleared = false;
 
-            Logger.warn("dlsym({d}, \"{s}\") failed: library handle is closed", .{ @intFromPtr(lib_handle), sym_name });
+            Logger.warn("intercepted call: failed: dlsym({d}, \"{s}\"): library handle is closed", .{ @intFromPtr(lib_handle), sym_name });
 
             return null;
         }
@@ -5880,26 +5953,20 @@ fn dlsymSubstitute(lib_handle: ?*anyopaque, sym_name: [*:0]const u8) callconv(.c
         dyn_object = &dyn_objects.values()[metadata.dyn_object_idx];
 
         if (dyn_object.?.current_epoch != metadata.epoch) {
-            if (last_dl_error != null) {
-                dll_allocator.free(last_dl_error.?);
-            }
-            last_dl_error = std.fmt.allocPrintSentinel(dll_allocator, "unable to get symbol {s}: library handle 0x{x} is stale", .{ sym_name, handle_raw }, 0) catch @panic("OOM");
+            last_dl_error = formatDlError("unable to get symbol {s}: library handle 0x{x} is stale", .{ sym_name, handle_raw });
             dlerror_cleared = false;
 
-            Logger.warn("dlsym({d}, \"{s}\") failed: library handle is stale", .{ @intFromPtr(lib_handle), sym_name });
+            Logger.warn("intercepted call: failed: dlsym({d}, \"{s}\"): library handle is stale", .{ @intFromPtr(lib_handle), sym_name });
 
             return null;
         }
     }
 
     if (dyn_object != null and dyn_object.?.ref_count == 0) {
-        if (last_dl_error != null) {
-            dll_allocator.free(last_dl_error.?);
-        }
-        last_dl_error = std.fmt.allocPrintSentinel(dll_allocator, "unable to get symbol {s} for library {s}: library handle is closed", .{ sym_name, dyn_object.?.name }, 0) catch @panic("OOM");
+        last_dl_error = formatDlError("unable to get symbol {s} for library {s}: library handle is closed", .{ sym_name, dyn_object.?.name });
         dlerror_cleared = false;
 
-        Logger.warn("dlsym({d} [{s}], \"{s}\") failed: library handle is closed", .{ @intFromPtr(lib_handle), dyn_object.?.name, sym_name });
+        Logger.warn("intercepted call: failed: dlsym({d} [{s}], \"{s}\"): library handle is closed", .{ @intFromPtr(lib_handle), dyn_object.?.name, sym_name });
 
         return null;
     }
@@ -5907,13 +5974,10 @@ fn dlsymSubstitute(lib_handle: ?*anyopaque, sym_name: [*:0]const u8) callconv(.c
     const allow_preload_override = !find_next and !caller_is_preload_root;
 
     const sym = getResolvedSymbolByName(dyn_object, std.mem.span(sym_name), find_next, false, allow_preload_override) catch |err| {
-        if (last_dl_error != null) {
-            dll_allocator.free(last_dl_error.?);
-        }
-        last_dl_error = std.fmt.allocPrintSentinel(dll_allocator, "unable to get symbol {s} for library {s}: {}", .{ sym_name, if (dyn_object) |do| do.name else "NULL", err }, 0) catch @panic("OOM");
+        last_dl_error = formatDlError("unable to get symbol {s} for library {s}: {}", .{ sym_name, if (dyn_object) |do| do.name else "NULL", err });
         dlerror_cleared = false;
 
-        Logger.warn("dlsym({d} [{s}], \"{s}\") failed: {}", .{ @intFromPtr(lib_handle), if (dyn_object) |do| do.name else "NULL", sym_name, err });
+        Logger.warn("intercepted call: failed: dlsym({d} [{s}], \"{s}\"): {}", .{ @intFromPtr(lib_handle), if (dyn_object) |do| do.name else "NULL", sym_name, err });
 
         return null;
     };
@@ -5943,13 +6007,10 @@ fn dlvsymSubstitute(lib_handle: ?*anyopaque, sym_name: [*:0]const u8, version: [
 
     if (find_next) {
         const infos = maybe_caller_infos orelse {
-            if (last_dl_error != null) {
-                dll_allocator.free(last_dl_error.?);
-            }
-            last_dl_error = std.fmt.allocPrintSentinel(dll_allocator, "unable to resolve RTLD_NEXT caller for symbol {s}@{s} at 0x{x}", .{ sym_name, version, caller_addr }, 0) catch @panic("OOM");
+            last_dl_error = formatDlError("unable to resolve RTLD_NEXT caller for symbol {s}@{s} at 0x{x}", .{ sym_name, version, caller_addr });
             dlerror_cleared = false;
 
-            Logger.warn("dlvsym(RTLD_NEXT, \"{s}\", \"{s}\") failed: unable to resolve caller at 0x{x}", .{ sym_name, version, caller_addr });
+            Logger.warn("intercepted call: failed: dlvsym(RTLD_NEXT, \"{s}\", \"{s}\"): unable to resolve caller at 0x{x}", .{ sym_name, version, caller_addr });
 
             return null;
         };
@@ -5957,37 +6018,28 @@ fn dlvsymSubstitute(lib_handle: ?*anyopaque, sym_name: [*:0]const u8, version: [
         dyn_object = infos.dyn_object;
     } else if (lib_handle != null and handle != DlHandle.rtld_default and handle != DlHandle.rtld_main) {
         if (handle.tag != 0b10) {
-            if (last_dl_error != null) {
-                dll_allocator.free(last_dl_error.?);
-            }
-            last_dl_error = std.fmt.allocPrintSentinel(dll_allocator, "unable to get symbol {s}@{s}: invalid library handle 0x{x}", .{ sym_name, version, handle_raw }, 0) catch @panic("OOM");
+            last_dl_error = formatDlError("unable to get symbol {s}@{s}: invalid library handle 0x{x}", .{ sym_name, version, handle_raw });
             dlerror_cleared = false;
 
-            Logger.warn("dlvsym({d}, \"{s}\", \"{s}\") failed: invalid library handle", .{ @intFromPtr(lib_handle), sym_name, version });
+            Logger.warn("intercepted call: failed: dlvsym({d}, \"{s}\", \"{s}\"): invalid library handle", .{ @intFromPtr(lib_handle), sym_name, version });
 
             return null;
         }
 
         const metadata = dl_handles.getPtr(handle_raw) orelse {
-            if (last_dl_error != null) {
-                dll_allocator.free(last_dl_error.?);
-            }
-            last_dl_error = std.fmt.allocPrintSentinel(dll_allocator, "unable to get symbol {s}@{s}: invalid library handle 0x{x}", .{ sym_name, version, handle_raw }, 0) catch @panic("OOM");
+            last_dl_error = formatDlError("unable to get symbol {s}@{s}: invalid library handle 0x{x}", .{ sym_name, version, handle_raw });
             dlerror_cleared = false;
 
-            Logger.warn("dlvsym({d}, \"{s}\", \"{s}\") failed: invalid library handle", .{ @intFromPtr(lib_handle), sym_name, version });
+            Logger.warn("intercepted call: failed: dlvsym({d}, \"{s}\", \"{s}\"): invalid library handle", .{ @intFromPtr(lib_handle), sym_name, version });
 
             return null;
         };
 
         if (metadata.open_count == 0) {
-            if (last_dl_error != null) {
-                dll_allocator.free(last_dl_error.?);
-            }
-            last_dl_error = std.fmt.allocPrintSentinel(dll_allocator, "unable to get symbol {s}@{s}: library handle 0x{x} is closed", .{ sym_name, version, handle_raw }, 0) catch @panic("OOM");
+            last_dl_error = formatDlError("unable to get symbol {s}@{s}: library handle 0x{x} is closed", .{ sym_name, version, handle_raw });
             dlerror_cleared = false;
 
-            Logger.warn("dlvsym({d}, \"{s}\", \"{s}\") failed: library handle is closed", .{ @intFromPtr(lib_handle), sym_name, version });
+            Logger.warn("intercepted call: failed: dlvsym({d}, \"{s}\", \"{s}\"): library handle is closed", .{ @intFromPtr(lib_handle), sym_name, version });
 
             return null;
         }
@@ -5995,26 +6047,20 @@ fn dlvsymSubstitute(lib_handle: ?*anyopaque, sym_name: [*:0]const u8, version: [
         dyn_object = &dyn_objects.values()[metadata.dyn_object_idx];
 
         if (dyn_object.?.current_epoch != metadata.epoch) {
-            if (last_dl_error != null) {
-                dll_allocator.free(last_dl_error.?);
-            }
-            last_dl_error = std.fmt.allocPrintSentinel(dll_allocator, "unable to get symbol {s}@{s}: library handle 0x{x} is stale", .{ sym_name, version, handle_raw }, 0) catch @panic("OOM");
+            last_dl_error = formatDlError("unable to get symbol {s}@{s}: library handle 0x{x} is stale", .{ sym_name, version, handle_raw });
             dlerror_cleared = false;
 
-            Logger.warn("dlvsym({d}, \"{s}\", \"{s}\") failed: library handle is stale", .{ @intFromPtr(lib_handle), sym_name, version });
+            Logger.warn("intercepted call: failed: dlvsym({d}, \"{s}\", \"{s}\"): library handle is stale", .{ @intFromPtr(lib_handle), sym_name, version });
 
             return null;
         }
     }
 
     if (dyn_object != null and dyn_object.?.ref_count == 0) {
-        if (last_dl_error != null) {
-            dll_allocator.free(last_dl_error.?);
-        }
-        last_dl_error = std.fmt.allocPrintSentinel(dll_allocator, "unable to get symbol {s}@{s} for library {s}: library handle is closed", .{ sym_name, version, dyn_object.?.name }, 0) catch @panic("OOM");
+        last_dl_error = formatDlError("unable to get symbol {s}@{s} for library {s}: library handle is closed", .{ sym_name, version, dyn_object.?.name });
         dlerror_cleared = false;
 
-        Logger.warn("dlvsym({d} [{s}], \"{s}\", \"{s}\") failed: library handle is closed", .{ @intFromPtr(lib_handle), dyn_object.?.name, sym_name, version });
+        Logger.warn("intercepted call: failed: dlvsym({d} [{s}], \"{s}\", \"{s}\"): library handle is closed", .{ @intFromPtr(lib_handle), dyn_object.?.name, sym_name, version });
 
         return null;
     }
@@ -6022,13 +6068,10 @@ fn dlvsymSubstitute(lib_handle: ?*anyopaque, sym_name: [*:0]const u8, version: [
     const allow_preload_override = !find_next and !caller_is_preload_root;
 
     const sym = getResolvedSymbolByNameAndVersion(dyn_object, std.mem.span(sym_name), std.mem.span(version), find_next, false, allow_preload_override) catch |err| {
-        if (last_dl_error != null) {
-            dll_allocator.free(last_dl_error.?);
-        }
-        last_dl_error = std.fmt.allocPrintSentinel(dll_allocator, "unable to get symbol {s}@{s} for library {s}: {}", .{ sym_name, version, if (dyn_object) |do| do.name else "NULL", err }, 0) catch @panic("OOM");
+        last_dl_error = formatDlError("unable to get symbol {s}@{s} for library {s}: {}", .{ sym_name, version, if (dyn_object) |do| do.name else "NULL", err });
         dlerror_cleared = false;
 
-        Logger.warn("dlvsym({d} [{s}], \"{s}\", \"{s}\") failed: {}", .{ @intFromPtr(lib_handle), if (dyn_object) |do| do.name else "NULL", sym_name, version, err });
+        Logger.warn("intercepted call: failed: dlvsym({d} [{s}], \"{s}\", \"{s}\"): {}", .{ @intFromPtr(lib_handle), if (dyn_object) |do| do.name else "NULL", sym_name, version, err });
 
         return null;
     };
@@ -6070,22 +6113,53 @@ const DlFindObject = extern struct {
     __dlfo_reserved: [7]c_ulonglong, // TODO implementation dependent
 };
 
+fn retainDiagnosticString(value: []const u8) ![:0]const u8 {
+    try extra_strs_z.ensureUnusedCapacity(dll_allocator, 1);
+    const owned = try dll_allocator.dupeSentinel(u8, value, 0);
+    extra_strs_z.appendAssumeCapacity(owned);
+    return owned;
+}
+
+fn retainLinkMap() !*DlLinkMap {
+    try extra_link_maps.ensureUnusedCapacity(dll_allocator, 1);
+    const link_map = try dll_allocator.create(DlLinkMap);
+    extra_link_maps.appendAssumeCapacity(link_map);
+    return link_map;
+}
+
+fn discardDiagnosticAllocations(string_count: usize, link_map_count: usize) void {
+    for (extra_strs_z.items[string_count..]) |text| {
+        dll_allocator.free(text);
+    }
+    extra_strs_z.shrinkRetainingCapacity(string_count);
+
+    for (extra_link_maps.items[link_map_count..]) |link_map| {
+        dll_allocator.destroy(link_map);
+    }
+    extra_link_maps.shrinkRetainingCapacity(link_map_count);
+}
+
 fn dladdrSubstitute(addr: *anyopaque, dl_info: *DlInfo) callconv(.c) c_int {
     Logger.debug("intercepted call: dladdr(0x{x}, dl_info: *DlInfo [0x{x}])", .{ @intFromPtr(addr), @intFromPtr(dl_info) });
 
-    const infos = findDynObjectSegmentForLoadedAddr(@intFromPtr(addr)) catch |err| {
-        if (last_dl_error != null) {
-            dll_allocator.free(last_dl_error.?);
-        }
-        last_dl_error = std.fmt.allocPrintSentinel(dll_allocator, "unable to get infos for address 0x{x}: {}", .{ @intFromPtr(addr), err }, 0) catch @panic("OOM");
+    const string_count = extra_strs_z.items.len;
+    const link_map_count = extra_link_maps.items.len;
+    var completed = false;
+    defer if (!completed) discardDiagnosticAllocations(string_count, link_map_count);
 
-        Logger.warn("dladdr(0x{x}, {}) failed: {}", .{ @intFromPtr(addr), dl_info.*, err });
+    const infos = findDynObjectSegmentForLoadedAddr(@intFromPtr(addr)) catch |err| {
+        last_dl_error = formatDlError("unable to get infos for address 0x{x}: {}", .{ @intFromPtr(addr), err });
+
+        Logger.warn("intercepted call: failed: dladdr(0x{x}): {}", .{ @intFromPtr(addr), err });
 
         return 0;
     };
 
-    const owned_name = dll_allocator.dupeSentinel(u8, infos.dyn_object.name, 0) catch @panic("OOM");
-    extra_strs_z.append(dll_allocator, owned_name) catch @panic("OOM");
+    const owned_name = retainDiagnosticString(infos.dyn_object.name) catch {
+        last_dl_error = formatDlError("dladdr: out of memory", .{});
+        Logger.warn("intercepted call: failed: dladdr(0x{x}): out of memory", .{@intFromPtr(addr)});
+        return 0;
+    };
 
     dl_info.dli_fname = owned_name.ptr;
     dl_info.dli_fbase = @ptrFromInt(infos.dyn_object.loaded_at.?);
@@ -6094,8 +6168,11 @@ fn dladdrSubstitute(addr: *anyopaque, dl_info: *DlInfo) callconv(.c) c_int {
         const sym = infos.dyn_object.syms_array.items[sidx];
         const sym_addr = vAddressToLoadedAddress(infos.dyn_object, sym.value, false) catch unreachable;
 
-        const owned_sym_name = dll_allocator.dupeSentinel(u8, sym.name, 0) catch @panic("OOM");
-        extra_strs_z.append(dll_allocator, owned_sym_name) catch @panic("OOM");
+        const owned_sym_name = retainDiagnosticString(sym.name) catch {
+            last_dl_error = formatDlError("dladdr: out of memory", .{});
+            Logger.warn("intercepted call: failed: dladdr(0x{x}): out of memory", .{@intFromPtr(addr)});
+            return 0;
+        };
 
         dl_info.dli_fsname = owned_sym_name.ptr;
         dl_info.dli_fsaddr = @ptrFromInt(sym_addr);
@@ -6104,6 +6181,7 @@ fn dladdrSubstitute(addr: *anyopaque, dl_info: *DlInfo) callconv(.c) c_int {
         dl_info.dli_fsaddr = null;
     }
 
+    completed = true;
     Logger.info("intercepted call: success: dladdr(0x{x}, .{{.dli_fname = {s}, .dli_fbase = 0x{x}, .dli_fsname = {?s}, .dli_fs_addr = 0x{x}}}) = 1", .{
         @intFromPtr(addr),
         dl_info.dli_fname,
@@ -6115,36 +6193,29 @@ fn dladdrSubstitute(addr: *anyopaque, dl_info: *DlInfo) callconv(.c) c_int {
     return 1;
 }
 
-// TODO global state
-// TODO dlerror should be threadlocal
-var dlerror_cleared: bool = true;
-
 fn dlerrorSubstitute() callconv(.c) ?[*:0]const u8 {
     Logger.debug("intercepted call: dlerror()", .{});
-    Logger.info("intercepted call: success: dlerror() = {?s}", .{last_dl_error});
 
     const err = if (!dlerror_cleared and last_dl_error != null) last_dl_error.?.ptr else null;
     dlerror_cleared = true;
+    Logger.info("intercepted call: success: dlerror() = {?s}", .{err});
 
     return err;
 }
 
 fn dladdr1Substitute(addr: *anyopaque, dl_info: *DlInfo, extra_infos: *anyopaque, flags: c_int) callconv(.c) c_int {
-    Logger.debug("intercepted call: dladdr1(0x{x}, dl_info: *DlInfo [0x{x}], extra_infos: 0x{x}, flags: 0x{x})", .{
-        @intFromPtr(addr),
-        @intFromPtr(dl_info),
-        @intFromPtr(extra_infos),
-        if (flags == 1) "RTLD_DL_SYMENT" else if (flags == 2) "RTLD_DL_LINKMAP" else "UNKNOWN_FLAGS",
-    });
+    Logger.debug("intercepted call: dladdr1(0x{x}, 0x{x}, 0x{x}, flags={d})", .{ @intFromPtr(addr), @intFromPtr(dl_info), @intFromPtr(extra_infos), flags });
+
+    const string_count = extra_strs_z.items.len;
+    const link_map_count = extra_link_maps.items.len;
+    var completed = false;
+    defer if (!completed) discardDiagnosticAllocations(string_count, link_map_count);
 
     const infos = findDynObjectSegmentForLoadedAddr(@intFromPtr(addr)) catch |err| {
-        if (last_dl_error != null) {
-            dll_allocator.free(last_dl_error.?);
-        }
-        last_dl_error = std.fmt.allocPrintSentinel(dll_allocator, "unable to get infos for address 0x{x}: {}", .{ @intFromPtr(addr), err }, 0) catch @panic("OOM");
+        last_dl_error = formatDlError("unable to get infos for address 0x{x}: {}", .{ @intFromPtr(addr), err });
         dlerror_cleared = false;
 
-        Logger.warn("dladdr1(0x{x}, dl_info: *DlInfo [0x{x}], extra_infos: 0x{x}, flags: 0x{x}) failed: {}", .{
+        Logger.warn("intercepted call: failed: dladdr1(0x{x}, dl_info: *DlInfo [0x{x}], extra_infos: 0x{x}, flags: {s}): {}", .{
             @intFromPtr(addr),
             @intFromPtr(dl_info),
             @intFromPtr(extra_infos),
@@ -6155,8 +6226,11 @@ fn dladdr1Substitute(addr: *anyopaque, dl_info: *DlInfo, extra_infos: *anyopaque
         return 0;
     };
 
-    const owned_name = dll_allocator.dupeSentinel(u8, infos.dyn_object.name, 0) catch @panic("OOM");
-    extra_strs_z.append(dll_allocator, owned_name) catch @panic("OOM");
+    const owned_name = retainDiagnosticString(infos.dyn_object.name) catch {
+        last_dl_error = formatDlError("dladdr1: out of memory", .{});
+        Logger.warn("intercepted call: failed: dladdr1(0x{x}): out of memory", .{@intFromPtr(addr)});
+        return 0;
+    };
 
     dl_info.dli_fname = owned_name.ptr;
     dl_info.dli_fbase = @ptrFromInt(infos.dyn_object.loaded_at.?);
@@ -6165,8 +6239,11 @@ fn dladdr1Substitute(addr: *anyopaque, dl_info: *DlInfo, extra_infos: *anyopaque
         const sym = infos.dyn_object.syms_array.items[sidx];
         const sym_addr = vAddressToLoadedAddress(infos.dyn_object, sym.value, false) catch unreachable;
 
-        const owned_sym_name = dll_allocator.dupeSentinel(u8, sym.name, 0) catch @panic("OOM");
-        extra_strs_z.append(dll_allocator, owned_sym_name) catch @panic("OOM");
+        const owned_sym_name = retainDiagnosticString(sym.name) catch {
+            last_dl_error = formatDlError("dladdr1: out of memory", .{});
+            Logger.warn("intercepted call: failed: dladdr1(0x{x}): out of memory", .{@intFromPtr(addr)});
+            return 0;
+        };
 
         dl_info.dli_fsname = owned_sym_name.ptr;
         dl_info.dli_fsaddr = @ptrFromInt(sym_addr);
@@ -6184,9 +6261,12 @@ fn dladdr1Substitute(addr: *anyopaque, dl_info: *DlInfo, extra_infos: *anyopaque
                 continue;
             }
 
-            // TODO we should cache and reuse produced link maps (store them in a hasmap, keyed by dyn object name)
-            const link_map = dll_allocator.create(DlLinkMap) catch @panic("OOM");
-            extra_link_maps.append(dll_allocator, link_map) catch @panic("OOM");
+            // TODO we should cache and reuse produced link maps
+            const link_map = retainLinkMap() catch {
+                last_dl_error = formatDlError("dladdr1: out of memory", .{});
+                Logger.warn("intercepted call: failed: dladdr1(0x{x}): out of memory", .{@intFromPtr(addr)});
+                return 0;
+            };
 
             link_map.l_addr = dyn_obj.loaded_at.?;
             link_map.l_name = owned_name;
@@ -6201,7 +6281,7 @@ fn dladdr1Substitute(addr: *anyopaque, dl_info: *DlInfo, extra_infos: *anyopaque
             curr = link_map;
         }
     } else {
-        Logger.err("dladdr1(0x{x}, .{{.dli_fname = {s}, .dli_fbase = 0x{x}, .dli_fsname = {?s}, .dli_fs_addr = 0x{x}}}) = 1, extra_infos: 0x{x}, flags: {s}) failed: {s}", .{
+        Logger.err("intercepted call: failed: dladdr1(0x{x}, .{{.dli_fname = {s}, .dli_fbase = 0x{x}, .dli_fsname = {?s}, .dli_fs_addr = 0x{x}}}, extra_infos: 0x{x}, flags: {s}): {s}", .{
             @intFromPtr(addr),
             dl_info.dli_fname,
             @intFromPtr(dl_info.dli_fbase),
@@ -6215,7 +6295,8 @@ fn dladdr1Substitute(addr: *anyopaque, dl_info: *DlInfo, extra_infos: *anyopaque
         @panic("dladdr1 implementation incomplete: flags = RTLD_DL_SYMENT");
     }
 
-    Logger.info("intercepted call: success: dladdr1(0x{x}, .{{.dli_fname = {s}, .dli_fbase = 0x{x}, .dli_fsname = {?s}, .dli_fs_addr = 0x{x}}}) = 1, extra_infos: 0x{x}, flags: {s}) = 1", .{
+    completed = true;
+    Logger.info("intercepted call: success: dladdr1(0x{x}, .{{.dli_fname = {s}, .dli_fbase = 0x{x}, .dli_fsname = {?s}, .dli_fs_addr = 0x{x}}}, extra_infos: 0x{x}, flags: {s}) = 1", .{
         @intFromPtr(addr),
         dl_info.dli_fname,
         @intFromPtr(dl_info.dli_fbase),
@@ -6229,14 +6310,16 @@ fn dladdr1Substitute(addr: *anyopaque, dl_info: *DlInfo, extra_infos: *anyopaque
 }
 
 fn dlinfoSubstitute(lib: *anyopaque, request: c_int, info: *anyopaque) callconv(.c) c_int {
+    Logger.debug("intercepted call: dlinfo(0x{x}, 0x{x}, 0x{x})", .{ @intFromPtr(lib), request, @intFromPtr(info) });
     // TODO real implementation
-    Logger.err("unimplemented: dlinfo(0x{x}, 0x{x}, 0x{x})", .{ @intFromPtr(lib), request, @intFromPtr(info) });
+    Logger.err("intercepted call: failed: dlinfo(0x{x}, 0x{x}, 0x{x}): unimplemented", .{ @intFromPtr(lib), request, @intFromPtr(info) });
     @panic("unimplemented dlinfo");
 }
 
 fn dlmopenSubstitute(lmid: c_long, path: ?[*:0]u8, flags: c_int) callconv(.c) ?*anyopaque {
+    Logger.debug("intercepted call: dlmopen({d}, \"{?s}\", 0x{x})", .{ lmid, path, flags });
     // TODO real implementation
-    Logger.err("unimplemented: dlmopen({d}, \"{s}\", 0x{x})", .{ lmid, path orelse "NULL", flags });
+    Logger.err("intercepted call: failed: dlmopen({d}, \"{?s}\", 0x{x}): unimplemented", .{ lmid, path, flags });
     @panic("unimplemented dlmopen");
 }
 
@@ -6244,7 +6327,7 @@ fn dlFindObjectSubstitute(pc: *anyopaque, result: *DlFindObject) callconv(.c) c_
     Logger.debug("intercepted call: _dl_find_object(0x{x}, *DlFindObject [0x{x}])", .{ @intFromPtr(pc), @intFromPtr(result) });
 
     const infos = findDynObjectSegmentForLoadedAddr(@intFromPtr(pc)) catch |err| {
-        Logger.warn("_dl_find_object(0x{x}, *DlFindObject [0x{x}]) failed: {}", .{ @intFromPtr(pc), @intFromPtr(result), err });
+        Logger.warn("intercepted call: failed: _dl_find_object(0x{x}, *DlFindObject [0x{x}]): {}", .{ @intFromPtr(pc), @intFromPtr(result), err });
         return 1;
     };
 
@@ -6260,19 +6343,30 @@ fn dlFindObjectSubstitute(pc: *anyopaque, result: *DlFindObject) callconv(.c) c_
 fn dlFindDsoForObjectSubstitute(addr: *anyopaque) callconv(.c) ?*DlLinkMap {
     Logger.debug("intercepted call: _dl_find_dso_for_object(0x{x})", .{@intFromPtr(addr)});
 
+    const string_count = extra_strs_z.items.len;
+    const link_map_count = extra_link_maps.items.len;
+    var completed = false;
+    defer if (!completed) discardDiagnosticAllocations(string_count, link_map_count);
+
     const infos = findDynObjectSegmentForLoadedAddr(@intFromPtr(addr)) catch |err| {
-        Logger.warn("_dl_find_dso_for_object(0x{x}) failed: {}", .{ @intFromPtr(addr), err });
+        Logger.warn("intercepted call: failed: _dl_find_dso_for_object(0x{x}): {}", .{ @intFromPtr(addr), err });
         return null;
     };
 
-    const owned_name = dll_allocator.dupeSentinel(u8, infos.dyn_object.name, 0) catch @panic("OOM");
-    extra_strs_z.append(dll_allocator, owned_name) catch @panic("OOM");
+    const owned_name = retainDiagnosticString(infos.dyn_object.name) catch {
+        last_dl_error = formatDlError("_dl_find_dso_for_object: out of memory", .{});
+        Logger.warn("intercepted call: failed: _dl_find_dso_for_object(0x{x}): out of memory", .{@intFromPtr(addr)});
+        return null;
+    };
 
     Logger.warn("_dl_find_dso_for_object: partial implementation: link maps should be reused as they can be compared by address", .{});
 
-    // TODO we should cache and reuse produced link maps (store them in a hasmap, keyed by dyn object name)
-    const link_map = dll_allocator.create(DlLinkMap) catch @panic("OOM");
-    extra_link_maps.append(dll_allocator, link_map) catch @panic("OOM");
+    // TODO we should cache and reuse produced link maps
+    const link_map = retainLinkMap() catch {
+        last_dl_error = formatDlError("_dl_find_dso_for_object: out of memory", .{});
+        Logger.warn("intercepted call: failed: _dl_find_dso_for_object(0x{x}): out of memory", .{@intFromPtr(addr)});
+        return null;
+    };
 
     link_map.l_addr = infos.dyn_object.loaded_at.?;
     link_map.l_name = owned_name;
@@ -6281,40 +6375,29 @@ fn dlFindDsoForObjectSubstitute(addr: *anyopaque) callconv(.c) ?*DlLinkMap {
     link_map.l_next = null;
     link_map._others = @splat(0);
 
-    Logger.info("intercepted call: success: _dl_find_object(0x{x}) = 0x{x}", .{ @intFromPtr(addr), @intFromPtr(link_map) });
-
+    completed = true;
+    Logger.info("intercepted call: success: _dl_find_dso_for_object(0x{x}) = 0x{x}", .{ @intFromPtr(addr), @intFromPtr(link_map) });
     return link_map;
 }
 
 fn dlIteratePhdrSubstitute(callback: *const fn (*anyopaque, c_uint, *anyopaque) callconv(.c) c_int, data: *anyopaque) callconv(.c) c_int {
     Logger.debug("intercepted call: dl_iterate_phdr(callback: 0x{x}, data: 0x{x})", .{ @intFromPtr(callback), @intFromPtr(data) });
 
-    for (dyn_objects.values()) |*dyn_obj| {
-        if (!dyn_obj.loaded) {
-            continue;
-        }
+    const object_count = dyn_objects.count();
+    for (0..object_count) |index| {
+        const dyn_obj = &dyn_objects.values()[index];
+        if (!dyn_obj.loaded) continue;
+        const registered_info = dyn_obj.phdr_info orelse continue;
 
-        const dl_phdr_info = dll_allocator.create(std.posix.dl_phdr_info) catch @panic("OOM");
-        extra_phdrs.append(dll_allocator, dl_phdr_info) catch @panic("OOM");
-
-        const owned_path_z = dll_allocator.dupeSentinel(u8, dyn_obj.path, 0) catch @panic("OOM");
-        extra_strs_z.append(dll_allocator, owned_path_z) catch @panic("OOM");
-
-        dl_phdr_info.* = .{
-            .addr = dyn_obj.loaded_at.?,
-            .name = owned_path_z.ptr,
-            .phdr = @ptrFromInt(dyn_obj.mapped_at + dyn_obj.eh.e_phoff),
-            .phnum = dyn_obj.eh.e_phnum,
-        };
-
-        const ret = callback(dl_phdr_info, @sizeOf(std.posix.dl_phdr_info), data);
+        var info = registered_info.*;
+        const ret = callback(&info, @sizeOf(std.posix.dl_phdr_info), data);
         if (ret != 0) {
-            Logger.info("intercepted call: success: dl_iterate_phdr(callback: 0x{x}, data: 0x{x}), callback() != 0 for {s}", .{ @intFromPtr(callback), @intFromPtr(data), dyn_obj.name });
+            Logger.info("intercepted call: success: dl_iterate_phdr(callback: 0x{x}, data: 0x{x}) = {d} (callback stopped iteration)", .{ @intFromPtr(callback), @intFromPtr(data), ret });
             return ret;
         }
     }
 
-    Logger.info("intercepted call: success: dl_iterate_phdr(callback: 0x{x}, data: 0x{x})", .{ @intFromPtr(callback), @intFromPtr(data) });
+    Logger.info("intercepted call: success: dl_iterate_phdr(callback: 0x{x}, data: 0x{x}) = 0", .{ @intFromPtr(callback), @intFromPtr(data) });
 
     return 0;
 }
@@ -6322,8 +6405,10 @@ fn dlIteratePhdrSubstitute(callback: *const fn (*anyopaque, c_uint, *anyopaque) 
 // In glibc < 2.34 libpthread asks the loader for these values during initialization.
 // Newer glibc initialization reads the patched TLS fields.
 fn dlGetTlsStaticInfoSubstitute(size: *usize, alignment: *usize) callconv(.c) void {
+    Logger.debug("intercepted call: _dl_get_tls_static_info(0x{x}, 0x{x})", .{ @intFromPtr(size), @intFromPtr(alignment) });
     size.* = staticTlsSize();
     alignment.* = staticTlsAlignment();
+    Logger.info("intercepted call: success: _dl_get_tls_static_info: size={d}, alignment={d}", .{ size.*, alignment.* });
 }
 
 const ThreadInfos = struct {
@@ -6354,9 +6439,14 @@ var thread_current_idx: usize = 1;
 var thread_destructors: std.ArrayList(ThreadDestructor) = .empty;
 
 fn cxaThreadAtExitSubstitute(function: *const fn (?*anyopaque) callconv(.c) void, argument: ?*anyopaque, dso: ?*anyopaque) callconv(.c) c_int {
-    const object = findDynObjectForLoadedAddr(@intFromPtr(dso)) orelse findDynObjectForLoadedAddr(@intFromPtr(function)) orelse return -1;
+    Logger.debug("intercepted call: __cxa_thread_atexit_impl(0x{x}, 0x{x}, 0x{x})", .{ @intFromPtr(function), @intFromPtr(argument), @intFromPtr(dso) });
 
-    thread_mutex.lock(dll_io) catch @panic("error locking mutex");
+    const object = findDynObjectForLoadedAddr(@intFromPtr(dso)) orelse findDynObjectForLoadedAddr(@intFromPtr(function)) orelse {
+        Logger.warn("intercepted call: failed: __cxa_thread_atexit_impl: defining object not found", .{});
+        return -1;
+    };
+
+    thread_mutex.lockUncancelable(dll_io);
     defer thread_mutex.unlock(dll_io);
 
     thread_destructors.append(dll_allocator, .{
@@ -6364,15 +6454,19 @@ fn cxaThreadAtExitSubstitute(function: *const fn (?*anyopaque) callconv(.c) void
         .object_idx = object.dyn_object_index,
         .function = function,
         .argument = argument,
-    }) catch return -1;
+    }) catch |err| {
+        Logger.warn("intercepted call: failed: __cxa_thread_atexit_impl: {}", .{err});
+        return -1;
+    };
     dyn_objects.values()[object.dyn_object_index].tls_destructors += 1;
 
+    Logger.info("intercepted call: success: __cxa_thread_atexit_impl(0x{x}, 0x{x}, 0x{x}) = 0", .{ @intFromPtr(function), @intFromPtr(argument), @intFromPtr(dso) });
     return 0;
 }
 
 fn runThreadDestructors(tp: usize) void {
     while (true) {
-        thread_mutex.lock(dll_io) catch @panic("error locking mutex");
+        thread_mutex.lockUncancelable(dll_io);
 
         var remaining = thread_destructors.items.len;
         const entry = blk: {
@@ -6405,23 +6499,18 @@ fn threadRoutine(ctx: ThreadRoutineContext) void {
         ctypeInit();
     }
 
-    thread_mutex.lock(dll_io) catch @panic("error locking mutex");
+    thread_mutex.lockUncancelable(dll_io);
 
-    const entry = thread_infos.getOrPut(dll_allocator, ctx.idx) catch @panic("OOM");
-    if (!entry.found_existing) {
-        entry.value_ptr.* = .{ .idx = ctx.idx, .handle = new_tp, .t = ctx.thread, .ret = undefined };
-    } else {
-        std.debug.assert(entry.value_ptr.idx == ctx.idx);
-        std.debug.assert(entry.value_ptr.handle == new_tp);
-        std.debug.assert(entry.value_ptr.t == ctx.thread);
-    }
+    const entry = thread_infos.getPtr(ctx.idx).?;
+    std.debug.assert(entry.handle == new_tp);
+    std.debug.assert(entry.t == ctx.thread);
 
     thread_mutex.unlock(dll_io);
 
     const ret = ctx.f(ctx.arg);
     runThreadDestructors(new_tp);
 
-    thread_mutex.lock(dll_io) catch @panic("error locking mutex");
+    thread_mutex.lockUncancelable(dll_io);
     const entry_after = thread_infos.getPtr(ctx.idx).?;
     entry_after.ret = ret;
     thread_mutex.unlock(dll_io);
@@ -6430,6 +6519,9 @@ fn threadRoutine(ctx: ThreadRoutineContext) void {
 }
 
 fn pthreadCreateSubstitute(newthread: *c_ulong, attr: ?*const anyopaque, start_routine: *const fn (?*anyopaque) callconv(.c) *anyopaque, arg: ?*anyopaque) callconv(.c) c_int {
+    const errno_location = libc_specifics.?.getErrnoLocation();
+    const entry_errno = errno_location.*;
+    defer errno_location.* = entry_errno;
     Logger.debug("intercepted call: pthread_create(0x{x}, 0x{x}, 0x{x}, 0x{x})", .{ @intFromPtr(newthread), @intFromPtr(attr), @intFromPtr(start_routine), @intFromPtr(arg) });
 
     const page_size = std.heap.pageSize();
@@ -6438,36 +6530,41 @@ fn pthreadCreateSubstitute(newthread: *c_ulong, attr: ?*const anyopaque, start_r
     var bytes: usize = page_size;
     bytes += @max(page_size, default_stack_size);
     bytes = std.mem.alignForward(usize, bytes, page_size);
-    bytes = std.mem.alignForward(usize, bytes, std.os.linux.tls.area_desc.alignment);
-    const tls_offset = bytes + std.os.linux.tls.area_desc.abi_tcb.offset;
+    bytes = std.mem.alignForward(usize, bytes, ElfTlsRuntime.area_desc.alignment);
+    const tls_offset = bytes + ElfTlsRuntime.area_desc.abi_tcb.offset;
 
-    const thread = dll_allocator.create(std.Thread) catch @panic("OOM");
+    thread_mutex.lockUncancelable(dll_io);
+    defer thread_mutex.unlock(dll_io);
 
-    thread_mutex.lock(dll_io) catch @panic("error locking mutex");
-    extra_threads.append(dll_allocator, thread) catch @panic("OOM");
-    thread_mutex.unlock(dll_io);
+    // Reserve everything before spawning.
+    thread_infos.ensureUnusedCapacity(dll_allocator, 1) catch {
+        Logger.warn("intercepted call: failed: pthread_create: EAGAIN (thread registry allocation)", .{});
+        return @backingInt(std.os.linux.E.AGAIN);
+    };
+    extra_threads.ensureUnusedCapacity(dll_allocator, 1) catch {
+        Logger.warn("intercepted call: failed: pthread_create: EAGAIN (thread list allocation)", .{});
+        return @backingInt(std.os.linux.E.AGAIN);
+    };
+    const thread = dll_allocator.create(std.Thread) catch {
+        Logger.warn("intercepted call: failed: pthread_create: EAGAIN (thread allocation)", .{});
+        return @backingInt(std.os.linux.E.AGAIN);
+    };
 
     const idx = @atomicRmw(usize, &thread_current_idx, .Add, 1, .seq_cst);
     thread.* = std.Thread.spawn(.{}, threadRoutine, .{ThreadRoutineContext{ .idx = idx, .thread = thread, .f = start_routine, .arg = arg }}) catch |err| {
-        Logger.warn("pthread_create(0x{x}, 0x{x}, 0x{x}, 0x{x}) failed: {}", .{ @intFromPtr(newthread), @intFromPtr(attr), @intFromPtr(start_routine), @intFromPtr(arg), err });
-        return 1;
+        dll_allocator.destroy(thread);
+        Logger.warn("intercepted call: failed: pthread_create(0x{x}, 0x{x}, 0x{x}, 0x{x}): EAGAIN ({})", .{ @intFromPtr(newthread), @intFromPtr(attr), @intFromPtr(start_routine), @intFromPtr(arg), err });
+        return @backingInt(switch (err) {
+            error.OutOfMemory, error.SystemResources, error.ThreadQuotaExceeded, error.LockedMemoryLimitExceeded => std.os.linux.E.AGAIN,
+            error.Unexpected => std.os.linux.E.AGAIN,
+        });
     };
 
     const newthread_handle: *c_ulong = @ptrCast(@alignCast(newthread));
     newthread_handle.* = @intFromPtr(thread.impl.thread.mapped.ptr) + tls_offset;
 
-    thread_mutex.lock(dll_io) catch @panic("error locking mutex");
-
-    const entry = thread_infos.getOrPut(dll_allocator, idx) catch @panic("OOM");
-    if (!entry.found_existing) {
-        entry.value_ptr.* = .{ .idx = idx, .handle = newthread_handle.*, .t = thread, .ret = undefined };
-    } else {
-        std.debug.assert(entry.value_ptr.idx == idx);
-        std.debug.assert(entry.value_ptr.handle == newthread_handle.*);
-        std.debug.assert(entry.value_ptr.t == thread);
-    }
-
-    thread_mutex.unlock(dll_io);
+    extra_threads.appendAssumeCapacity(thread);
+    thread_infos.putAssumeCapacity(idx, .{ .idx = idx, .handle = newthread_handle.*, .t = thread, .ret = undefined });
 
     Logger.info("intercepted call: success: pthread_create(0x{x}, 0x{x}, 0x{x}, 0x{x}) = 0", .{ @intFromPtr(newthread), @intFromPtr(attr), @intFromPtr(start_routine), @intFromPtr(arg) });
 
@@ -6475,27 +6572,38 @@ fn pthreadCreateSubstitute(newthread: *c_ulong, attr: ?*const anyopaque, start_r
 }
 
 fn pthreadExitSubstitute() callconv(.c) void {
+    Logger.debug("intercepted call: pthread_exit()", .{});
     // TODO real implementation
-    Logger.err("unimplemented: pthread_exit()", .{});
+    Logger.err("intercepted call: failed: pthread_exit(): unimplemented", .{});
     @panic("unimplemented pthread_exit");
 }
 
 fn pthreadCancelSubstitute() callconv(.c) void {
+    Logger.debug("intercepted call: pthread_cancel()", .{});
     // TODO real implementation
-    Logger.err("unimplemented: pthread_cancel()", .{});
+    Logger.err("intercepted call: failed: pthread_cancel(): unimplemented", .{});
     @panic("unimplemented pthread_cancel");
 }
 
 fn pthreadDetachSubstitute() callconv(.c) void {
+    Logger.debug("intercepted call: pthread_detach()", .{});
     // TODO real implementation
-    Logger.err("unimplemented: pthread_detach()", .{});
+    Logger.err("intercepted call: failed: pthread_detach(): unimplemented", .{});
     @panic("unimplemented pthread_detach");
 }
 
 fn pthreadJoinSubstitute(thread_handle: c_ulong, retval: ?**anyopaque) callconv(.c) c_int {
+    const errno_location = libc_specifics.?.getErrnoLocation();
+    const entry_errno = errno_location.*;
+    defer errno_location.* = entry_errno;
     Logger.debug("intercepted call: pthread_join(0x{x}, 0x{x})", .{ thread_handle, @intFromPtr(retval) });
 
-    thread_mutex.lock(dll_io) catch @panic("error locking mutex");
+    if (thread_handle == currentThreadPointer()) {
+        Logger.warn("intercepted call: failed: pthread_join(0x{x}, 0x{x}): EDEADLK", .{ thread_handle, @intFromPtr(retval) });
+        return @backingInt(std.os.linux.E.DEADLK);
+    }
+
+    thread_mutex.lockUncancelable(dll_io);
 
     for (thread_infos.values()) |*entry| {
         if (entry.handle != thread_handle) {
@@ -6508,7 +6616,7 @@ fn pthreadJoinSubstitute(thread_handle: c_ulong, retval: ?**anyopaque) callconv(
 
         thread.join();
 
-        thread_mutex.lock(dll_io) catch @panic("error locking mutex");
+        thread_mutex.lockUncancelable(dll_io);
 
         if (retval) |result| result.* = thread_infos.get(idx).?.ret;
         _ = thread_infos.swapRemove(idx);
@@ -6527,13 +6635,14 @@ fn pthreadJoinSubstitute(thread_handle: c_ulong, retval: ?**anyopaque) callconv(
 
     thread_mutex.unlock(dll_io);
 
-    Logger.err("pthread_join(0x{x}, 0x{x}) failed: thread not found", .{ thread_handle, @intFromPtr(retval) });
-    @panic("pthread_join: thread not found");
+    Logger.warn("intercepted call: failed: pthread_join(0x{x}, 0x{x}): ESRCH (thread not found)", .{ thread_handle, @intFromPtr(retval) });
+    return @backingInt(std.os.linux.E.SRCH);
 }
 
 fn pthreadKillSubstitute() callconv(.c) void {
+    Logger.debug("intercepted call: pthread_kill()", .{});
     // TODO real implementation
-    Logger.err("unimplemented: pthread_kill()", .{});
+    Logger.err("intercepted call: failed: pthread_kill(): unimplemented", .{});
     @panic("unimplemented pthread_kill");
 }
 

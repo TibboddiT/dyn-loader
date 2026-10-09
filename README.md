@@ -1,16 +1,16 @@
-## Loading dynamic libraries from non libc static executables
+# DynLoader
 
-### Proof of concept
+Loading system dynamic libraries from non libc static executables.
+
+## Proof of concept
 
 All executable artifacts produced by the included examples are static executables that load dynamic libraries without using libc's `dlopen`.
 
-*Warning: prototype quality: lots of bugs, lots of TODOs remaining.*
-
-Tested on `x86_64-linux`, with libraries compiled against glibc from 2.23 to 2.43 and musl from 1.2.1 to 1.2.5.
+*Warning: prototype quality: can contain bugs, lots of TODOs remaining.*
 
 See [this thread](https://ziggit.dev/t/dynamic-linking-without-libc-adventures) for further information.
 
-### Usage
+## Usage
 
 For now, the library always follows the latest "master" x86_64 tarball available on [ziglang.org](https://ziglang.org/download/).
 
@@ -63,14 +63,17 @@ pub fn main(init: std.process.Init) !void {
 }
 ```
 
-### Current known limitations
+## Current known limitations
 
 - Initializing the loader and loading libraries should be done before starting any thread.
-- Some (rare) relocation types are still missing.
 - Dirty tricks are used to accommodate patched libc versions from various distros.
 - Some libc functions that need to be implemented in zig are not yet implemented.
 
-### How it works
+## How it works
+
+Before `main`, the loader takes ownership of TLS through strong definitions of
+`__zig_elf_static_tls`, `__zig_elf_static_tls_init`, `__zig_elf_static_tls_fill`, and
+`__tls_get_addr`.
 
 Here is a simplified overview of what is done when loading a dynamic library:
 
@@ -91,7 +94,7 @@ Here is a simplified overview of what is done when loading a dynamic library:
   - init functions are called
     - with specific handling in the case of libc
 
-### Notes
+## Notes
 
 A copy of musl's `libc.so` is included, compiled from sources without any modification.
 You should load it before loading libraries compiled against musl on a non musl based system (see [the musl printf example](examples/printf_musl.zig)).
@@ -100,20 +103,14 @@ The library is stripped (`strip --strip-unneeded lib/libc.so`) as is often the c
 To demonstrate loading musl based libraries, an original copy of `libvulkan.so.1.4.326` from the `vulkan-loader` package of [Chimera Linux](https://repo.chimera-linux.org/current/main/x86_64/)
 is also included (renamed `libvulkan.so.1`) to make the `vulkan_version_musl` example work.
 
----
-
 A copy of `libraylib.so.5.5.0` from [the raylib repository release assets](https://github.com/raysan5/raylib/releases/download/5.5/raylib-5.5_linux_amd64.tar.gz)
-is included to make the `raylib` example work. Since this library is compiled against glibc, it will not work on musl based systems.
-
-It is in the `resources/raylib` directory.
-
----
+is included to make the `raylib` example work. Since this library is compiled against glibc, it will not work on musl based systems. It is in the `resources/raylib` directory.
 
 It is recommended that you build these binary artifacts yourself.
 
-### Run examples
+## Run examples
 
-```
+```sh
 zig build run-printf
 zig build run-printf_musl
 zig build run-vulkan_version
@@ -127,18 +124,33 @@ zig build run-wayland_vulkan_triangle
 
 The following example will intentionally trigger a segfault to demonstrate stack traces across loaded libraries:
 
-```
+```sh
 zig build run-segfault
 ```
 
 The following example will only work on glibc-based systems (because it uses libraries compiled against glibc):
 
-```
+```sh
 zig build run-raylib
 ```
 
-### Test matrix
+## Test matrix
 
-```
+Note: *Not all tests pass yet*
+
+Tested environments:
+
+| OS                                 | libc                       | Toolchain         |
+| ---                                | ---                        | ---               |
+| Debian 11 (bullseye)               | glibc 2.31                 | GCC 10.2.1        |
+| Debian 12 (bookworm)               | glibc 2.36                 | GCC 12.2.0        |
+| Debian testing (forky), 2026-10-07 | glibc 2.43                 | GCC 16.2.0        |
+| Arch Linux, 2026-10-07             | glibc 2.44                 | GCC 16.2.1        |
+| Alpine 3.10.9                      | musl 1.1.22                | GCC 8.3.0         |
+| Chimera Linux, 2025-12-20          | musl 1.2.6 (with mimalloc) | Clang/LLVM 22.1.8 |
+| NixOS/nixpkgs, Nix 2.24.11         | glibc 2.39                 | GCC 13.2.0        |
+| Alpine 3.22.6                      | musl 1.2.5                 | GCC 14.2.0        |
+
+```sh
 zig build run-tests_matrix -- --help
 ```

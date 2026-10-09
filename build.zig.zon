@@ -1,6 +1,7 @@
 .{
     .name = .dynamic_library_loader,
     .version = "0.0.0",
+    .minimum_zig_version = "0.18.0-dev.120+9fe22a29b",
     .dependencies = .{},
     .paths = .{
         "build.zig",

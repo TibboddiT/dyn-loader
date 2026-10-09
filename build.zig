@@ -15,6 +15,8 @@ pub fn build(b: *std.Build) void {
 
     const optimize = b.standardOptimizeOption(.{});
 
+    const use_llvm = b.option(bool, "llvm", "Use LLVM and LLD for loader hosts");
+
     const dll_mod = b.addModule("dll", .{
         .root_source_file = b.path("src/dynamic_library_loader.zig"),
         .target = target,
@@ -29,7 +31,7 @@ pub fn build(b: *std.Build) void {
 
     const check_step = b.step("check", "Check");
 
-    addTestMatrix(b, check_step, dll_mod, target, optimize);
+    addTestMatrix(b, check_step, dll_mod, target, optimize, use_llvm);
 
     const examples = [_]Example{
         .{ .source_path = "examples/load_lib.zig" },
@@ -48,7 +50,7 @@ pub fn build(b: *std.Build) void {
     };
 
     for (examples) |example| {
-        addExample(b, &resources_dir.step, check_step, dll_mod, target, example.optimize orelse optimize, example);
+        addExample(b, &resources_dir.step, check_step, dll_mod, target, example.optimize orelse optimize, example, use_llvm);
     }
 }
 
@@ -60,9 +62,12 @@ fn addExample(
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
     example: Example,
+    use_llvm: ?bool,
 ) void {
     const name = std.fs.path.stem(example.source_path);
     const exe = b.addExecutable(.{
+        .use_llvm = use_llvm,
+        .use_lld = use_llvm,
         .name = name,
         .root_module = b.createModule(.{
             .root_source_file = b.path(example.source_path),
@@ -89,6 +94,8 @@ fn addExample(
 
     const check_name = b.fmt("check-{s}", .{name});
     const check = b.addExecutable(.{
+        .use_llvm = use_llvm,
+        .use_lld = use_llvm,
         .name = check_name,
         .root_module = b.createModule(.{
             .root_source_file = b.path(example.source_path),
@@ -103,7 +110,7 @@ fn addExample(
     check_step.dependOn(&check.step);
 }
 
-fn addTestMatrix(b: *std.Build, check_step: *std.Build.Step, dll_mod: *std.Build.Module, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) void {
+fn addTestMatrix(b: *std.Build, check_step: *std.Build.Step, dll_mod: *std.Build.Module, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, use_llvm: ?bool) void {
     const regression_abi = b.createModule(.{
         .root_source_file = b.path("tests/resources/regression/abi.zig"),
         .target = target,
@@ -117,6 +124,13 @@ fn addTestMatrix(b: *std.Build, check_step: *std.Build.Step, dll_mod: *std.Build
         .imports = &.{.{ .name = "dll", .module = dll_mod }},
     });
 
+    const behavior_support = b.createModule(.{
+        .root_source_file = b.path("tests/behaviors/support.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "dll", .module = dll_mod }},
+    });
+
     const lifecycle_runner = b.createModule(.{
         .root_source_file = b.path("tests/behaviors/runner.zig"),
         .target = target,
@@ -124,6 +138,7 @@ fn addTestMatrix(b: *std.Build, check_step: *std.Build.Step, dll_mod: *std.Build
         .imports = &.{
             .{ .name = "dll", .module = dll_mod },
             .{ .name = "regression_abi", .module = regression_abi },
+            .{ .name = "behavior_support", .module = behavior_support },
         },
     });
 
@@ -144,10 +159,14 @@ fn addTestMatrix(b: *std.Build, check_step: *std.Build.Step, dll_mod: *std.Build
         .imports = &.{
             .{ .name = "lifecycle_runner", .module = lifecycle_runner },
             .{ .name = "regression_abi", .module = regression_abi },
+            .{ .name = "dll", .module = dll_mod },
+            .{ .name = "behavior_support", .module = behavior_support },
         },
     });
 
     const cases_worker = b.addExecutable(.{
+        .use_llvm = use_llvm,
+        .use_lld = use_llvm,
         .name = "loader-cases",
         .root_module = b.createModule(.{
             .root_source_file = b.path("tests/workers/assertions.zig"),
@@ -164,6 +183,8 @@ fn addTestMatrix(b: *std.Build, check_step: *std.Build.Step, dll_mod: *std.Build
     });
 
     const libc_runner = b.addExecutable(.{
+        .use_llvm = use_llvm,
+        .use_lld = use_llvm,
         .name = "libc-runner",
         .root_module = b.createModule(.{
             .root_source_file = b.path("tests/workers/libc.zig"),
