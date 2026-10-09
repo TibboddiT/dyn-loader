@@ -35,6 +35,7 @@ pub fn build(b: *std.Build) void {
 
     const examples = [_]Example{
         .{ .source_path = "examples/load_lib.zig" },
+        .{ .source_path = "examples/gstreamer_convert.zig" },
         .{ .source_path = "examples/printf.zig" },
         .{ .source_path = "examples/printf_musl.zig" },
         .{ .source_path = "examples/segfault.zig", .force_unstripped = true },

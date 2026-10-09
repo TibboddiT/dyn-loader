@@ -6155,13 +6155,13 @@ fn dladdrSubstitute(addr: *anyopaque, dl_info: *DlInfo) callconv(.c) c_int {
         return 0;
     };
 
-    const owned_name = retainDiagnosticString(infos.dyn_object.name) catch {
+    const owned_path = retainDiagnosticString(infos.dyn_object.path) catch {
         last_dl_error = formatDlError("dladdr: out of memory", .{});
         Logger.warn("intercepted call: failed: dladdr(0x{x}): out of memory", .{@intFromPtr(addr)});
         return 0;
     };
 
-    dl_info.dli_fname = owned_name.ptr;
+    dl_info.dli_fname = owned_path.ptr;
     dl_info.dli_fbase = @ptrFromInt(infos.dyn_object.loaded_at.?);
 
     if (infos.sym_index) |sidx| {
@@ -6226,13 +6226,13 @@ fn dladdr1Substitute(addr: *anyopaque, dl_info: *DlInfo, extra_infos: *anyopaque
         return 0;
     };
 
-    const owned_name = retainDiagnosticString(infos.dyn_object.name) catch {
+    const owned_path = retainDiagnosticString(infos.dyn_object.path) catch {
         last_dl_error = formatDlError("dladdr1: out of memory", .{});
         Logger.warn("intercepted call: failed: dladdr1(0x{x}): out of memory", .{@intFromPtr(addr)});
         return 0;
     };
 
-    dl_info.dli_fname = owned_name.ptr;
+    dl_info.dli_fname = owned_path.ptr;
     dl_info.dli_fbase = @ptrFromInt(infos.dyn_object.loaded_at.?);
 
     if (infos.sym_index) |sidx| {
@@ -6269,7 +6269,7 @@ fn dladdr1Substitute(addr: *anyopaque, dl_info: *DlInfo, extra_infos: *anyopaque
             };
 
             link_map.l_addr = dyn_obj.loaded_at.?;
-            link_map.l_name = owned_name;
+            link_map.l_name = owned_path;
             link_map.l_ld = @ptrFromInt(dyn_obj.loaded_at.? + dyn_obj.dyn_section_offset);
             link_map.l_prev = curr;
             link_map.l_next = null;
