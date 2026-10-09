@@ -363,6 +363,7 @@ const LibcSpecifics = struct {
     write_ops: std.ArrayList(WriteOps),
     getErrnoLocation: *const fn () callconv(.c) *c_int,
     glibc_initial_thread: ?GlibcInitialThread = null,
+    musl_initial_thread: ?MuslInitialThread = null,
 };
 
 // TODO global state
@@ -3097,11 +3098,24 @@ fn detectGlibcTlsOffsets(code: CodeView) !GlibcTlsOffsets {
 }
 
 const MuslLayout = struct {
+    const Flags = enum { int_flags, byte_flags };
+
     mapped_address: usize,
+    flags: Flags,
     auxv_offset: usize,
     tls_size_offset: usize,
     tls_align_offset: usize,
     page_size_offset: usize,
+    tid_offset: usize,
+    tsd_offset: usize,
+    robust_head_offset: usize,
+    locale_offset: usize,
+    joinable_state: c_int,
+};
+
+const MuslInitialThread = struct {
+    layout: MuslLayout,
+    initialized: bool = false,
 };
 
 const GlibcThreadList = extern struct {
@@ -3379,7 +3393,7 @@ fn detectMuslLayout(dyn_object: *DynObject) !MuslLayout {
     const Pattern = struct {
         prefix: []const u8,
         suffix: []const u8,
-        layout: enum { int_flags, byte_flags },
+        layout: MuslLayout.Flags,
     };
 
     const patterns = [_]Pattern{
@@ -3419,21 +3433,35 @@ fn detectMuslLayout(dyn_object: *DynObject) !MuslLayout {
         var layout: MuslLayout = switch (pattern.layout) {
             .int_flags => .{
                 .mapped_address = 0,
+                .flags = .int_flags,
                 .auxv_offset = 16,
                 .tls_size_offset = 32,
                 .tls_align_offset = 40,
                 .page_size_offset = 56,
+                .tid_offset = 56,
+                .tsd_offset = 136,
+                .robust_head_offset = 144,
+                .locale_offset = 176,
+                .joinable_state = 1,
             },
             .byte_flags => .{
                 .mapped_address = 0,
+                .flags = .byte_flags,
                 .auxv_offset = 8,
                 .tls_size_offset = 24,
                 .tls_align_offset = 32,
                 .page_size_offset = 48,
+                .tid_offset = 48,
+                .tsd_offset = 128,
+                .robust_head_offset = 136,
+                .locale_offset = 168,
+                .joinable_state = 2,
             },
         };
 
-        layout.mapped_address = try mappedDataAddress(dyn_object, virtual_address, layout.page_size_offset + @sizeOf(usize));
+        // global_locale follows page_size and contains six category pointers.
+        layout.mapped_address = try mappedDataAddress(dyn_object, virtual_address, layout.page_size_offset + 7 * @sizeOf(usize));
+        try validateMuslThreadLayout(dyn_object, layout);
 
         if (try findLibcSymbol(dyn_object, "__libc")) |symbol| {
             if (symbol.address != layout.mapped_address) return error.InconsistentMuslLayout;
@@ -3443,6 +3471,22 @@ fn detectMuslLayout(dyn_object: *DynObject) !MuslLayout {
     }
 
     return detected orelse error.UnrecognizedMuslLayout;
+}
+
+fn validateMuslThreadLayout(dyn_object: *DynObject, layout: MuslLayout) !void {
+    // Check the known layouts
+    const clock_code = try symbolCode(dyn_object, "pthread_getcpuclockid");
+    const load_tid = try clock_code.findUnique("\x8b\x47", 1, "\xf7\xd0\x8d\x04\xc5\x06\x00\x00\x00"); // mov eax,[rdi+disp8]; not eax; lea eax,[rax*8+6]
+    const subtract_tid = try clock_code.findUnique("\x31\xc0\x2b\x47", 1, "\x70"); // xor eax,eax; sub eax,[rdi+disp8]; jo
+    if (load_tid != null and subtract_tid != null) return error.AmbiguousCodePattern;
+
+    const tid_operand = if (load_tid) |offset| offset + 2 else if (subtract_tid) |offset| offset + 4 else return error.UnrecognizedMuslThreadLayout;
+    if (clock_code.bytes[tid_operand] != layout.tid_offset) return error.InconsistentMuslLayout;
+
+    const tsd_code = try symbolCode(dyn_object, "pthread_getspecific");
+    const prefix = "\x64\x48\x8b\x04\x25\x00\x00\x00\x00\x48\x8b\x80"; // mov rax,fs:0; mov rax,[rax+disp32]
+    const tsd_load = (try tsd_code.findUnique(prefix, 4, &.{})) orelse return error.UnrecognizedMuslThreadLayout;
+    if (try tsd_code.readI32(tsd_load + prefix.len) != layout.tsd_offset) return error.InconsistentMuslLayout;
 }
 
 fn detectLibcLayout(dyn_object: *DynObject) !LibcLayout {
@@ -3486,6 +3530,8 @@ fn getLibcSpecifics(dyn_object: *DynObject, layout: LibcLayout) !LibcSpecifics {
 
     switch (layout) {
         .musl => |musl| {
+            specifics.musl_initial_thread = .{ .layout = musl };
+
             const program_name = try resolveSymbolByName("program_invocation_name");
             const environment = try resolveSymbolByName("environ");
             const argv: [*c]const [*c]const u8 = @ptrCast(dll_args.vector);
@@ -3530,14 +3576,9 @@ fn getLibcSpecifics(dyn_object: *DynObject, layout: LibcLayout) !LibcSpecifics {
                     .value = .tp,
                 },
                 .{
-                    .addr = 48,
+                    .addr = musl.tid_offset,
                     .relative_to = .tp,
                     .value = .tid,
-                },
-                .{
-                    .addr = 136,
-                    .relative_to = .tp,
-                    .value = .self,
                 },
             });
         },
@@ -4196,8 +4237,13 @@ fn applyLibcWriteOps(thread_pointer: usize, only_tp_relative: bool) !void {
             try unprotectSegment(seg_infos.?.dyn_object, seg_infos.?.segment_index);
         }
 
-        const ptr: *volatile usize = @ptrFromInt(addr);
-        ptr.* = val;
+        if (op.value == .tid) {
+            const ptr: *volatile c_int = @ptrFromInt(addr);
+            ptr.* = @intCast(val);
+        } else {
+            const ptr: *volatile usize = @ptrFromInt(addr);
+            ptr.* = val;
+        }
 
         if (seg_infos != null) {
             try reprotectSegment(seg_infos.?.dyn_object, seg_infos.?.segment_index);
@@ -5255,6 +5301,7 @@ fn callInitFunctions(dyn_obj: *DynObject) !void {
 
     if (is_libc_so) {
         try initGlibcInitialThread();
+        initMuslInitialThread();
 
         // TODO use libc_specifics.call_ops
         const maybe_sym = resolveSymbolByName("__libc_early_init") catch null;
@@ -5356,6 +5403,31 @@ fn initGlibcInitialThread() !void {
     layout.initialized = true;
 
     Logger.info("libc: registered initial thread at 0x{x} in glibc's user-stack list", .{tp});
+}
+
+fn initMuslInitialThread() void {
+    const specifics = if (libc_specifics) |*value| value else return;
+    const initial_thread = if (specifics.musl_initial_thread) |*value| value else return;
+    if (initial_thread.initialized) return;
+
+    const layout = initial_thread.layout;
+    const tp = currentThreadPointer();
+
+    @as(*usize, @ptrFromInt(tp + 16)).* = tp;
+    @as(*usize, @ptrFromInt(tp + 24)).* = tp;
+
+    @as(*usize, @ptrFromInt(tp + layout.tsd_offset)).* = 0;
+    @as(*usize, @ptrFromInt(tp + layout.robust_head_offset)).* = tp + layout.robust_head_offset;
+    @as(*usize, @ptrFromInt(tp + layout.locale_offset)).* = layout.mapped_address + layout.page_size_offset + @sizeOf(usize);
+    @as(*c_int, @ptrFromInt(tp + layout.tid_offset + 2 * @sizeOf(c_int))).* = layout.joinable_state;
+
+    switch (layout.flags) {
+        .int_flags => @as(*c_int, @ptrFromInt(layout.mapped_address)).* = 1,
+        .byte_flags => @as(*u8, @ptrFromInt(layout.mapped_address)).* = 1,
+    }
+    initial_thread.initialized = true;
+
+    Logger.info("libc: initialized musl's initial thread at 0x{x}", .{tp});
 }
 
 fn callFiniFunctions(dyn_obj: *DynObject) !void {
@@ -6773,6 +6845,11 @@ fn threadRoutine(ctx: ThreadRoutineContext) void {
     Logger.info("new thread spawned: {d} [0x{x}]", .{ ctx.idx, new_tp });
 
     applyLibcWriteOps(new_tp, true) catch @panic("error setting tp fields");
+
+    if (libc_specifics.?.musl_initial_thread) |musl| {
+        const head_address = new_tp + musl.layout.robust_head_offset;
+        @as(*usize, @ptrFromInt(head_address)).* = head_address;
+    }
 
     // TODO should be lib_specifics.call_ops
     const maybe_sym = getResolvedSymbolByName(null, "__ctype_init", false, false, true) catch null;
