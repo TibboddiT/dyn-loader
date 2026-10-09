@@ -14,6 +14,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 #include <wchar.h>
@@ -470,6 +471,41 @@ static void dependencyLookup(const struct probe_host_api *host, struct probe_res
     EXPECT(result, dlclose(handle), 0);
 }
 
+static void keyCreateDelete(const struct probe_host_api *host, struct probe_result *result) {
+    UNUSED_HOST();
+    pthread_key_t key;
+    EXPECT(result, pthread_key_create(&key, NULL), 0);
+    EXPECT(result, pthread_key_delete(key), 0);
+}
+
+static void keySurvivesLoad(const struct probe_host_api *host, struct probe_result *result) {
+    UNUSED_HOST();
+    pthread_key_t key;
+    EXPECT(result, pthread_key_create(&key, NULL), 0);
+
+    int value = 42;
+    int set_error = pthread_setspecific(key, &value);
+    if (set_error) {
+        pthread_key_delete(key);
+        EXPECT(result, set_error, 0);
+    }
+    void *before_load = pthread_getspecific(key);
+
+    void *library = dlopen("/fixtures/libtls_object.so", RTLD_NOW | RTLD_LOCAL);
+    int loaded = library != NULL;
+    void *after_load = pthread_getspecific(key);
+    int close_error = loaded ? dlclose(library) : 0;
+    void *after_close = pthread_getspecific(key);
+    int delete_error = pthread_key_delete(key);
+
+    EXPECT(result, before_load == &value, 1);
+    EXPECT(result, loaded, 1);
+    EXPECT(result, after_load == &value, 1);
+    EXPECT(result, close_error, 0);
+    EXPECT(result, after_close == &value, 1);
+    EXPECT(result, delete_error, 0);
+}
+
 struct KeyCleanup {
     pthread_key_t key;
     unsigned calls;
@@ -902,6 +938,282 @@ static void localeThreadIsolation(const struct probe_host_api *host, struct prob
     EXPECT(result, uselocale((locale_t)0) == main_locale, 1);
 }
 
+static void checkFork(struct probe_result *result) {
+    const unsigned char marker[] = {0x46, 0x4f, 0x52, 0x4b};
+    const int child_exit_status = 37;
+    int descriptors[2];
+    EXPECT(result, pipe(descriptors), 0);
+
+    pid_t child = fork();
+    if (child < 0) {
+        int saved_errno = errno;
+        close(descriptors[0]);
+        close(descriptors[1]);
+        recordFailure(result, __LINE__, "fork returned a child PID", 1, 0, saved_errno);
+        return;
+    }
+
+    if (child == 0) {
+        if (close(descriptors[0]) != 0) _exit(1);
+
+        size_t written = 0;
+        while (written < sizeof marker) {
+            ssize_t count = write(descriptors[1], marker + written, sizeof marker - written);
+            if (count < 0 && errno == EINTR) continue;
+            if (count <= 0) _exit(2);
+
+            written += (size_t)count;
+        }
+
+        if (close(descriptors[1]) != 0) _exit(3);
+        _exit(child_exit_status);
+    }
+
+    int close_write_result = close(descriptors[1]);
+    int close_write_errno = errno;
+    unsigned char received[sizeof marker] = {0};
+    size_t received_size = 0;
+    int read_error = 0;
+    while (received_size < sizeof received) {
+        ssize_t count = read(descriptors[0], received + received_size, sizeof received - received_size);
+        if (count < 0 && errno == EINTR) continue;
+        if (count < 0) {
+            read_error = errno;
+            break;
+        }
+        if (count == 0) break;
+
+        received_size += (size_t)count;
+    }
+
+    int close_read_result = close(descriptors[0]);
+    int close_read_errno = errno;
+    if (read_error != 0) kill(child, SIGKILL);
+
+    int status = 0;
+    pid_t waited;
+    do {
+        waited = waitpid(child, &status, 0);
+    } while (waited < 0 && errno == EINTR);
+
+    EXPECT(result, waited, child);
+    EXPECT(result, WIFEXITED(status), 1);
+    EXPECT(result, WEXITSTATUS(status), child_exit_status);
+    EXPECT(result, read_error, 0);
+    EXPECT(result, received_size, sizeof marker);
+    EXPECT(result, memcmp(received, marker, sizeof marker), 0);
+
+    errno = close_write_errno;
+    EXPECT(result, close_write_result, 0);
+    errno = close_read_errno;
+    EXPECT(result, close_read_result, 0);
+}
+
+struct ForkWaitingWorker {
+    pthread_mutex_t mutex;
+    pthread_cond_t condition;
+    int ready;
+    int released;
+    int error;
+};
+
+static void *waitForFork(void *argument) {
+    struct ForkWaitingWorker *state = argument;
+    int error_code = pthread_mutex_lock(&state->mutex);
+    if (error_code) return (void *)(uintptr_t)error_code;
+
+    state->ready = 1;
+    state->error = pthread_cond_broadcast(&state->condition);
+    while (!state->released && !state->error) {
+        state->error = pthread_cond_wait(&state->condition, &state->mutex);
+    }
+
+    error_code = pthread_mutex_unlock(&state->mutex);
+    return (void *)(uintptr_t)error_code;
+}
+
+static void *forkFromWorker(void *argument) {
+    struct probe_result *result = argument;
+    checkFork(result);
+    return argument;
+}
+
+static void processFork(const struct probe_host_api *host, struct probe_result *result) {
+    UNUSED_HOST();
+    checkFork(result);
+}
+
+static void processForkWithWorker(const struct probe_host_api *host, struct probe_result *result) {
+    UNUSED_HOST();
+    static struct ForkWaitingWorker state = {
+        .mutex = PTHREAD_MUTEX_INITIALIZER,
+        .condition = PTHREAD_COND_INITIALIZER,
+    };
+
+    EXPECT(result, pthread_mutex_lock(&state.mutex), 0);
+    pthread_t thread;
+    int create_error = pthread_create(&thread, NULL, &waitForFork, &state);
+    if (create_error) {
+        pthread_mutex_unlock(&state.mutex);
+        pthread_cond_destroy(&state.condition);
+        pthread_mutex_destroy(&state.mutex);
+        EXPECT(result, create_error, 0);
+    }
+
+    int wait_error = 0;
+    while (!state.ready && !wait_error) {
+        wait_error = pthread_cond_wait(&state.condition, &state.mutex);
+    }
+    int worker_ready_error = state.error;
+    int unlock_error = pthread_mutex_unlock(&state.mutex);
+
+    if (!wait_error && !worker_ready_error && !unlock_error) checkFork(result);
+
+    int release_lock_error = pthread_mutex_lock(&state.mutex);
+    if (release_lock_error) {
+        EXPECT(result, release_lock_error, 0);
+    }
+    state.released = 1;
+    int signal_error = pthread_cond_broadcast(&state.condition);
+    int release_unlock_error = pthread_mutex_unlock(&state.mutex);
+
+    void *returned = NULL;
+    int join_error = pthread_join(thread, &returned);
+    EXPECT(result, join_error, 0);
+    int destroy_condition_error = pthread_cond_destroy(&state.condition);
+    int destroy_mutex_error = pthread_mutex_destroy(&state.mutex);
+
+    if (result->status != PROBE_PASS) return;
+    EXPECT(result, wait_error, 0);
+    EXPECT(result, worker_ready_error, 0);
+    EXPECT(result, unlock_error, 0);
+    EXPECT(result, signal_error, 0);
+    EXPECT(result, release_unlock_error, 0);
+    EXPECT(result, (uintptr_t)returned, 0);
+    EXPECT(result, state.error, 0);
+    EXPECT(result, destroy_condition_error, 0);
+    EXPECT(result, destroy_mutex_error, 0);
+}
+
+static void processForkFromWorker(const struct probe_host_api *host, struct probe_result *result) {
+    UNUSED_HOST();
+    static struct probe_result worker_result;
+    worker_result = *result;
+    pthread_t thread;
+    EXPECT(result, pthread_create(&thread, NULL, &forkFromWorker, &worker_result), 0);
+
+    void *returned = NULL;
+    EXPECT(result, pthread_join(thread, &returned), 0);
+    EXPECT(result, returned == &worker_result, 1);
+    *result = worker_result;
+}
+
+static void processForkAfterWorkerExit(const struct probe_host_api *host, struct probe_result *result) {
+    UNUSED_HOST();
+    for (unsigned iteration = 0; iteration < 8; ++iteration) {
+        pthread_t threads[4];
+        unsigned created = 0;
+        int create_error = 0;
+        for (; created < 4; ++created) {
+            create_error = pthread_create(&threads[created], NULL, &returnArgument, NULL);
+            if (create_error) break;
+        }
+
+        int join_error = 0;
+        for (unsigned index = 0; index < created; ++index) {
+            int error_code = pthread_join(threads[index], NULL);
+            if (error_code) join_error = error_code;
+        }
+        EXPECT(result, create_error, 0);
+        EXPECT(result, join_error, 0);
+
+        checkFork(result);
+        if (result->status != PROBE_PASS) return;
+    }
+}
+
+struct ForkChurn {
+    atomic_int started;
+    atomic_int stop;
+    unsigned completed;
+    int error;
+};
+
+static void *churnForFork(void *argument) {
+    struct ForkChurn *state = argument;
+    do {
+        pthread_t thread;
+        state->error = pthread_create(&thread, NULL, &returnArgument, NULL);
+        if (!state->error) state->error = pthread_join(thread, NULL);
+        if (!state->error) ++state->completed;
+        atomic_store(&state->started, 1);
+    } while (!state->error && !atomic_load(&state->stop));
+    return argument;
+}
+
+static void processForkDuringWorkerChurn(const struct probe_host_api *host, struct probe_result *result) {
+    static struct ForkChurn state;
+    atomic_store(&state.started, 0);
+    atomic_store(&state.stop, 0);
+    state.completed = 0;
+    state.error = 0;
+    pthread_t thread;
+    EXPECT(result, pthread_create(&thread, NULL, &churnForFork, &state), 0);
+    while (!atomic_load(&state.started)) sched_yield();
+
+    for (unsigned iteration = 0; iteration < 16; ++iteration) {
+        checkFork(result);
+        if (result->status != PROBE_PASS) break;
+        processForkFromWorker(host, result);
+        if (result->status != PROBE_PASS) break;
+    }
+
+    atomic_store(&state.stop, 1);
+    int join_error = pthread_join(thread, NULL);
+    EXPECT(result, join_error, 0);
+    if (result->status != PROBE_PASS) return;
+    EXPECT(result, state.error, 0);
+    EXPECT(result, state.completed > 0, 1);
+}
+
+struct InheritedSignalMask {
+    sigset_t mask;
+    int error;
+};
+
+static void *readInheritedSignalMask(void *argument) {
+    struct InheritedSignalMask *state = argument;
+    state->error = pthread_sigmask(SIG_SETMASK, NULL, &state->mask);
+    return argument;
+}
+
+static void threadSignalMaskInheritance(const struct probe_host_api *host, struct probe_result *result) {
+    UNUSED_HOST();
+    sigset_t original, requested, after_create;
+    EXPECT(result, pthread_sigmask(SIG_SETMASK, NULL, &original), 0);
+    requested = original;
+    sigaddset(&requested, SIGUSR1);
+    sigdelset(&requested, SIGUSR2);
+    EXPECT(result, pthread_sigmask(SIG_SETMASK, &requested, NULL), 0);
+
+    static struct InheritedSignalMask state;
+    pthread_t thread;
+    int create_error = pthread_create(&thread, NULL, &readInheritedSignalMask, &state);
+    int mask_error = pthread_sigmask(SIG_SETMASK, NULL, &after_create);
+    int restore_error = pthread_sigmask(SIG_SETMASK, &original, NULL);
+    int join_error = create_error ? 0 : pthread_join(thread, NULL);
+
+    EXPECT(result, create_error, 0);
+    EXPECT(result, join_error, 0);
+    EXPECT(result, mask_error, 0);
+    EXPECT(result, restore_error, 0);
+    EXPECT(result, state.error, 0);
+    EXPECT(result, sigismember(&after_create, SIGUSR1), 1);
+    EXPECT(result, sigismember(&after_create, SIGUSR2), 0);
+    EXPECT(result, sigismember(&state.mask, SIGUSR1), 1);
+    EXPECT(result, sigismember(&state.mask, SIGUSR2), 0);
+}
+
 static const struct {
     const char *name;
     void (*run)(const struct probe_host_api *, struct probe_result *);
@@ -936,6 +1248,14 @@ static const struct {
     {"async.queue_notification_cancel", queueNotificationCancel},
     {"conversion.shift_jis", convertJapanese},
     {"locale.thread_isolation", localeThreadIsolation},
+    {"process.fork", processFork},
+    {"process.fork_with_worker", processForkWithWorker},
+    {"process.fork_from_worker", processForkFromWorker},
+    {"thread.key_create_delete", keyCreateDelete},
+    {"thread.key_survives_load", keySurvivesLoad},
+    {"process.fork_after_worker_exit", processForkAfterWorkerExit},
+    {"process.fork_during_worker_churn", processForkDuringWorkerChurn},
+    {"thread.signal_mask_inheritance", threadSignalMaskInheritance},
 };
 
 uint32_t probe_abi_version(void) { return PROBE_ABI_VERSION; }
