@@ -57,14 +57,28 @@ const vertices = [_]Vertex{
 
 const WaylandState = struct {
     api: *const wl.Api,
-    compositor: ?*wl.Compositor = null,
-    wm_base: ?*wl.XdgWmBase = null,
-    extent: vk.Extent2D = .{ .width = 800, .height = 600 },
-    pending_extent: ?vk.Extent2D = null,
-    resize_pending: bool = false,
-    configured: bool = false,
-    running: bool = true,
-    bind_failed: bool = false,
+    compositor: ?*wl.Compositor,
+    wm_base: ?*wl.XdgWmBase,
+    extent: vk.Extent2D,
+    pending_extent: ?vk.Extent2D,
+    resize_pending: bool,
+    configured: bool,
+    running: bool,
+    bind_failed: bool,
+
+    fn init(api: *const wl.Api) WaylandState {
+        return .{
+            .api = api,
+            .compositor = null,
+            .wm_base = null,
+            .extent = .{ .width = 800, .height = 600 },
+            .pending_extent = null,
+            .resize_pending = false,
+            .configured = false,
+            .running = true,
+            .bind_failed = false,
+        };
+    }
 
     fn registryGlobal(data: ?*anyopaque, registry: *wl.Registry, name: u32, interface: [*:0]const u8, version: u32) callconv(.c) void {
         const self: *WaylandState = @ptrCast(@alignCast(data.?));
@@ -159,7 +173,7 @@ pub fn main(init: std.process.Init) !void {
     const display = try wayland.connect();
     defer wayland.disconnect(display);
 
-    var window = WaylandState{ .api = &wayland };
+    var window = WaylandState.init(&wayland);
 
     const registry = try wayland.getRegistry(display);
     defer wayland.destroyProxy(@ptrCast(registry));

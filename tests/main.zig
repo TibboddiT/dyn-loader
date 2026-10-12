@@ -1,3 +1,8 @@
+//! Host matrix coordinator: prepare matching runtime/SDK artifacts, discover
+//! worker catalogs, execute isolated cases, and persist reference comparisons.
+//! The process arena owns command arguments, JSON trees, catalogs, and report
+//! records until exit. Files, child processes, and containers have explicit cleanup.
+
 const std = @import("std");
 const builtin = @import("builtin");
 
@@ -209,6 +214,10 @@ fn trimOutput(text: []const u8) []const u8 {
 const WorkerKind = enum { assertion, reference, dynloader };
 
 const Runtime = struct {
+    // `image` is the pinned execution image (or a built image ID). Informational
+    // manifest fields such as `discovery_tag` remain in `metadata` for provenance;
+    // they do not replace pinned image selection. Native paths refer to the image,
+    // while SDK recipe paths are resolved inside the project.
     const SdkRecipe = enum { debian, arch, alpine, chimera, nixos };
     const LibcFamily = enum { glibc, musl };
 
@@ -224,7 +233,10 @@ const Runtime = struct {
     cpp_libraries: []const []const u8,
 
     fn buildsRuntime(runtime: Runtime) bool {
-        return runtime.sdk_recipe == .chimera or runtime.sdk_recipe == .nixos;
+        return switch (runtime.sdk_recipe) {
+            .chimera, .nixos => true,
+            .debian, .arch, .alpine => false,
+        };
     }
 
     fn initFromJson(value: json.Value) !Runtime {
@@ -261,7 +273,7 @@ const Runtime = struct {
             .cpp_libraries = switch (sdk_recipe) {
                 .chimera => &.{ "libc++.so.1", "libc++abi.so.1", "libunwind.so.1" },
                 .nixos => &.{},
-                else => &.{ "libstdc++.so.6", "libgcc_s.so.1" },
+                .debian, .arch, .alpine => &.{ "libstdc++.so.6", "libgcc_s.so.1" },
             },
         };
     }
@@ -541,7 +553,9 @@ const Matrix = struct {
         try argv.appendSlice(allocator, &.{ "-t", image_tag });
         try argv.appendSlice(allocator, &.{ "--build-arg", base_argument });
         try argv.appendSlice(allocator, &.{ "--build-arg", version_argument });
-        if (runtime.buildsRuntime()) try argv.appendSlice(allocator, &.{ "--target", target });
+        if (runtime.buildsRuntime()) {
+            try argv.appendSlice(allocator, &.{ "--target", target });
+        }
 
         var entries = runtime.sdk_args.object.iterator();
         while (entries.next()) |entry| {
@@ -566,6 +580,9 @@ const Matrix = struct {
         return matrix.imageId(image_tag);
     }
 
+    /// Reuses artifacts only when both their input keys and recorded hashes agree.
+    /// Recipes that build a runtime replace `runtime.image` with its concrete
+    /// image ID; `runtime.metadata` retains the original manifest for cache identity.
     fn prepareRuntime(matrix: *Matrix, runtime: *Runtime) !json.Value {
         const context = matrix.context;
         const allocator = context.allocator;
@@ -644,9 +661,8 @@ const Matrix = struct {
         const runtime_hashes = json.field(runtime_identity, "runtime_sha256");
         const sdk_runtime_hashes = json.field(sdk_identity, "runtime_sha256");
 
-        if (!json.eql(runtime_hashes, sdk_runtime_hashes)) {
-            return error.SdkChangedRuntime;
-        }
+        // Installing SDK packages must not silently replace the libc under test.
+        if (!json.eql(runtime_hashes, sdk_runtime_hashes)) return error.SdkChangedRuntime;
 
         const source_hashes = try matrix.hashFiles(context.project_dir, &libc_sources);
         const fixture_key = try json.cloneViaSerialization(allocator, .{
@@ -678,9 +694,7 @@ const Matrix = struct {
         const previous_worker_hash = try context.hashOptionalFile(worker_destination) orelse "";
         const worker_changed = !std.mem.eql(u8, previous_worker_hash, worker_hash);
 
-        if (worker_changed) {
-            try context.copyFile(matrix.libc_worker_path, worker_destination);
-        }
+        if (worker_changed) try context.copyFile(matrix.libc_worker_path, worker_destination);
 
         if (!fixtures_current or worker_changed) {
             for (filenames) |name| {
@@ -793,6 +807,8 @@ const Matrix = struct {
         return commands;
     }
 
+    /// Builds SDK-linked regression objects and derives the non-identity ELF
+    /// layout from that output. Validate fixtures before publishing reusable state.
     fn prepareAssertions(matrix: *Matrix, runtime: Runtime, prepared: json.Value) !json.Value {
         const context = matrix.context;
         const allocator = context.allocator;
@@ -825,6 +841,7 @@ const Matrix = struct {
                 "if cc -x c -shared -fPIC -nostdlib -Wl,--fatal-warnings -Wl,-z,pack-relative-relocs -o /tmp/relr-probe.so -; then " ++
                 "readelf -d /tmp/relr-probe.so; fi",
         });
+        // An accepted linker flag is insufficient: require an emitted RELR tag.
         const relr_supported = std.mem.indexOf(u8, relr_probe, "(RELR)") != null;
 
         const toolchain = .{
@@ -994,13 +1011,19 @@ const Matrix = struct {
         });
 
         if (is_assertion) {
-            const abi = if (runtime.libc_family == .musl) "musl" else "gnu";
+            const abi = switch (runtime.libc_family) {
+                .musl => "musl",
+                .glibc => "gnu",
+            };
             try argv.append(allocator, abi);
         }
 
         return argv.toOwnedSlice(allocator);
     }
 
+    /// One fresh container per catalog/case prevents native state from crossing
+    /// cases. Always remove the named container, including descendants surviving
+    /// a timed-out Docker client. Inspect container state before that removal.
     fn execute(matrix: *Matrix, runtime: Runtime, options: ExecuteOptions) !protocol.Outcome {
         const context = matrix.context;
 
@@ -1084,6 +1107,8 @@ const Matrix = struct {
     }
 };
 
+/// Reject a host worker requiring a dynamic interpreter: it would test the host
+/// toolchain's runtime assumptions rather than a static host loading the fixture.
 fn verifyWorker(context: *Context, path: []const u8) !void {
     const file = try std.Io.Dir.cwd().openFile(context.io, path, .{});
     defer file.close(context.io);
@@ -1135,6 +1160,8 @@ fn discoverAssertions(matrix: *Matrix) ![]const protocol.Case {
     return outcome.cases;
 }
 
+/// Assertion suites check loader invariants directly. Libc cases first require
+/// matching catalogs, then compare isolated native-reference and loader runs.
 fn runRuntimeCases(
     matrix: *Matrix,
     runtime: Runtime,
@@ -1280,7 +1307,14 @@ fn runMatrix(matrix: *Matrix, selected_runtimes: []const Runtime, options: Optio
     const source_paths = libc_sources ++ .{
         "build.zig",
         "build.zig.zon",
-        "src/dynamic_library_loader.zig",
+        "src/dll.zig",
+        "src/CodeView.zig",
+        "src/DynObject.zig",
+        "src/logger.zig",
+        "src/libc.zig",
+        "src/libc/musl.zig",
+        "src/InstructionFlow.zig",
+        "src/libc/glibc.zig",
         "src/CustomSelfInfo.zig",
         "tests/environments/runtimes.json",
         "tests/workers/libc.zig",
@@ -1457,6 +1491,8 @@ fn runIsolationChecks(matrix: *Matrix, runtime: Runtime) !u8 {
     return 0;
 }
 
+/// Returns an owned slice in manifest order, with strings borrowed from the JSON
+/// tree. Validate every requested ID; repeated selections do not duplicate runs.
 fn selectRuntimes(allocator: std.mem.Allocator, manifest: json.Value, requested_ids: []const []const u8) ![]const Runtime {
     const records = json.field(manifest, "runtimes");
     if (records != .array) return error.InvalidManifest;
@@ -1465,9 +1501,7 @@ fn selectRuntimes(allocator: std.mem.Allocator, manifest: json.Value, requested_
     defer runtimes.deinit(allocator);
 
     try runtimes.ensureTotalCapacity(allocator, records.array.items.len);
-    for (records.array.items) |record| {
-        runtimes.appendAssumeCapacity(try Runtime.initFromJson(record));
-    }
+    for (records.array.items) |record| runtimes.appendAssumeCapacity(try Runtime.initFromJson(record));
 
     for (requested_ids) |requested_id| {
         var found = false;
@@ -1478,10 +1512,7 @@ fn selectRuntimes(allocator: std.mem.Allocator, manifest: json.Value, requested_
             }
         }
 
-        if (!found) {
-            std.debug.print("Unknown runtime: {s}\n", .{requested_id});
-            return error.UnknownRuntime;
-        }
+        if (!found) return error.UnknownRuntime;
     }
 
     var selected: std.ArrayList(Runtime) = .empty;
@@ -1497,9 +1528,7 @@ fn selectRuntimes(allocator: std.mem.Allocator, manifest: json.Value, requested_
             }
         }
 
-        if (include) {
-            try selected.append(allocator, runtime);
-        }
+        if (include) try selected.append(allocator, runtime);
     }
 
     if (selected.items.len == 0) return error.NoRuntimes;
@@ -1558,7 +1587,21 @@ fn executeMain(init: std.process.Init) !u8 {
 
     if (schema_version != 1) return error.UnsupportedManifestVersion;
 
-    const selected_runtimes = try selectRuntimes(allocator, manifest, options.runtimes.items);
+    const selected_runtimes = selectRuntimes(allocator, manifest, options.runtimes.items) catch |err| switch (err) {
+        error.UnknownRuntime => {
+            const records = json.field(manifest, "runtimes").array.items;
+            for (options.runtimes.items) |requested_id| {
+                for (records) |record| {
+                    if (std.mem.eql(u8, requested_id, try json.requireString(record, "id"))) break;
+                } else {
+                    std.debug.print("Unknown runtime: {s}\n", .{requested_id});
+                    break;
+                }
+            }
+            return err;
+        },
+        else => return err,
+    };
 
     try context.makeDir(context.run_dir);
     _ = context.runCommand(&.{ "docker", "info", "--format", "{{.OSType}}/{{.Architecture}}" }, .{ .timeout_ms = 20_000 }) catch {
@@ -1598,9 +1641,7 @@ pub fn main(init: std.process.Init) void {
         std.process.exit(2);
     };
 
-    if (exit_code != 0) {
-        std.process.exit(exit_code);
-    }
+    if (exit_code != 0) std.process.exit(exit_code);
 }
 
 test {

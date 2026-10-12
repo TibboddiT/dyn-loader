@@ -1,3 +1,7 @@
+//! Verifies host TLS before migration, after library loads, and after teardown.
+//! Existing main-thread mutations must survive, while both direct Zig workers
+//! and native-API workers must receive the original executable TLS template.
+
 const std = @import("std");
 
 const dll = @import("dll");
@@ -16,7 +20,11 @@ extern fn __tls_get_addr(index: *const HostTlsIndex) callconv(.c) *anyopaque;
 const HostTlsContext = struct {
     read: ReadState,
     set: SetTls,
-    completed: bool = false,
+    completed: bool,
+
+    fn init(read: ReadState, set: SetTls) HostTlsContext {
+        return .{ .read = read, .set = set, .completed = false };
+    }
 };
 
 threadlocal var host_initialized: usize = 17;
@@ -26,6 +34,7 @@ threadlocal var host_buffer: [65536]u8 align(4096) = @splat(0);
 pub fn run(init: std.process.Init, fixtures: support.SpecificContext) !void {
     try expectInitialHostTls();
     mutateHostTls();
+
     {
         const thread = try std.Thread.spawn(.{}, hostTlsThread, .{});
         thread.join();
@@ -52,7 +61,7 @@ pub fn run(init: std.process.Init, fixtures: support.SpecificContext) !void {
         thread.join();
     }
 
-    var context: HostTlsContext = .{ .read = read, .set = set };
+    var context = HostTlsContext.init(read, set);
     var handle: usize = undefined;
     try std.testing.expectEqual(@as(c_int, 0), bridge.startThread(&handle, &hostTlsCallback, &context));
     try std.testing.expectEqual(@as(c_int, 0), bridge.joinThread(handle));
@@ -64,6 +73,7 @@ pub fn run(init: std.process.Init, fixtures: support.SpecificContext) !void {
 
     dll.deinit();
     try checkMutatedHostTls();
+
     {
         const thread = try std.Thread.spawn(.{}, hostTlsThread, .{});
         thread.join();
@@ -73,6 +83,8 @@ pub fn run(init: std.process.Init, fixtures: support.SpecificContext) !void {
     try std.testing.expectError(error.ReinitializationUnsupported, initHostTlsLoader(init));
 }
 
+/// Independently derive module 1's base from executable PT_TLS and compare the
+/// exported TLS accessor with addresses emitted by the compiler for host variables.
 fn checkHostTlsAccessor() !void {
     const phdrs: [*]const std.elf.ElfN.Phdr = @ptrFromInt(std.os.linux.getauxval(std.elf.AT.PHDR));
     var executable_tp_offset: usize = 0;

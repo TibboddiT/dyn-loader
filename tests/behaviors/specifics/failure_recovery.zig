@@ -1,3 +1,6 @@
+//! Injects allocation failures after successful loader bootstrap. Every operation
+//! is followed by recovery checks so a reported error cannot hide damaged state.
+
 const std = @import("std");
 
 const dll = @import("dll");
@@ -5,7 +8,7 @@ const support = @import("behavior_support");
 
 const Allocator = std.mem.Allocator;
 const FailingAllocator = std.testing.FailingAllocator;
-const malloc_alignment: std.mem.Alignment = .@"16";
+const backing_alignment: std.mem.Alignment = .@"16";
 
 const DlInfo = extern struct {
     name: [*:0]const u8,
@@ -14,6 +17,9 @@ const DlInfo = extern struct {
     symbol_address: ?*anyopaque,
 };
 
+/// Offsets byte-aligned metadata storage to expose assumptions beyond the requested
+/// alignment. Explicitly aligned requests, including intercepted payload allocations,
+/// pass through unchanged. Free reverses the offset for byte-aligned storage.
 const OffsetAllocator = struct {
     failing: FailingAllocator,
 
@@ -32,8 +38,9 @@ const OffsetAllocator = struct {
     fn alloc(context: *anyopaque, length: usize, alignment: std.mem.Alignment, return_address: usize) ?[*]u8 {
         const self: *OffsetAllocator = @ptrCast(@alignCast(context));
         if (alignment != .@"1") return self.failing.allocator().rawAlloc(length, alignment, return_address);
+
         const total = std.math.add(usize, length, 1) catch return null;
-        const memory = self.failing.allocator().rawAlloc(total, malloc_alignment, return_address) orelse return null;
+        const memory = self.failing.allocator().rawAlloc(total, backing_alignment, return_address) orelse return null;
         return memory + 1;
     }
 
@@ -52,7 +59,8 @@ const OffsetAllocator = struct {
     fn free(context: *anyopaque, memory: []u8, alignment: std.mem.Alignment, return_address: usize) void {
         const self: *OffsetAllocator = @ptrCast(@alignCast(context));
         if (alignment != .@"1") return self.failing.allocator().rawFree(memory, alignment, return_address);
-        self.failing.allocator().rawFree((memory.ptr - 1)[0 .. memory.len + 1], malloc_alignment, return_address);
+
+        self.failing.allocator().rawFree((memory.ptr - 1)[0 .. memory.len + 1], backing_alignment, return_address);
     }
 
     fn failAfter(self: *OffsetAllocator, count: usize) void {
@@ -95,7 +103,7 @@ pub fn run(init: std.process.Init, fixtures: support.SpecificContext) !void {
         .log_level = .none,
     });
     defer dll.deinit();
-    defer memory.recover();
+    defer memory.recover(); // Runs before loader teardown, which may allocate.
 
     const bridge = try support.Bridge.init(fixtures.bridge_path, fixtures.bridge_symbols);
     _ = try dll.load(fixtures.target_path);
@@ -144,11 +152,15 @@ pub fn run(init: std.process.Init, fixtures: support.SpecificContext) !void {
     memory.failAfter(0);
     try std.testing.expect(realloc(pointer, 1024) == null);
     memory.recover();
-    for (@as([*]const u8, @ptrCast(pointer))[0..37]) |byte| try std.testing.expectEqual(@as(u8, 0xa7), byte);
+    for (@as([*]const u8, @ptrCast(pointer))[0..37]) |byte| {
+        try std.testing.expectEqual(@as(u8, 0xa7), byte);
+    }
 
     try std.testing.expect(malloc(std.math.maxInt(usize)) == null);
     pointer = realloc(pointer, 128) orelse return error.AllocationFailed;
-    for (@as([*]const u8, @ptrCast(pointer))[0..37]) |byte| try std.testing.expectEqual(@as(u8, 0xa7), byte);
+    for (@as([*]const u8, @ptrCast(pointer))[0..37]) |byte| {
+        try std.testing.expectEqual(@as(u8, 0xa7), byte);
+    }
 
     memory.failAfter(0);
     try std.testing.expect(dlsym(null, "dynloader_missing_symbol_for_failure_test") == null);
@@ -259,5 +271,7 @@ pub fn runReallocarray(init: std.process.Init, fixtures: support.SpecificContext
     memory.recover();
     try std.testing.expectEqual(@as(c_int, @backingInt(std.os.linux.E.NOMEM)), errno_location().*);
     try std.testing.expect(reallocarray(pointer, std.math.maxInt(usize), 2) == null);
-    for (@as([*]const u8, @ptrCast(pointer))[0..37]) |byte| try std.testing.expectEqual(@as(u8, 0xa7), byte);
+    for (@as([*]const u8, @ptrCast(pointer))[0..37]) |byte| {
+        try std.testing.expectEqual(@as(u8, 0xa7), byte);
+    }
 }

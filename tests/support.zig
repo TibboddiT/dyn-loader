@@ -1,3 +1,7 @@
+//! Host-side matrix I/O and subprocess support. `Context.allocator` is normally
+//! the run arena: returned paths, captured text, and parsed JSON share its lifetime.
+//! Command logs remain on disk even when capture is disabled or truncated.
+
 const std = @import("std");
 
 const json = @import("json.zig");
@@ -58,9 +62,7 @@ pub const Context = struct {
     }
 
     pub fn writeFile(context: *Context, path: []const u8, bytes: []const u8) !void {
-        if (std.fs.path.dirname(path)) |parent| {
-            try context.makeDir(parent);
-        }
+        if (std.fs.path.dirname(path)) |parent| try context.makeDir(parent);
 
         try std.Io.Dir.cwd().writeFile(context.io, .{
             .sub_path = path,
@@ -68,6 +70,8 @@ pub const Context = struct {
         });
     }
 
+    /// Publish only a complete serialization by renaming a sibling partial file.
+    /// Failure can leave the partial file; the previous final file stays available.
     pub fn saveJson(context: *Context, path: []const u8, data: anytype) !void {
         const temporary_path = try std.fmt.allocPrint(context.allocator, "{s}.partial", .{path});
 
@@ -127,9 +131,7 @@ pub const Context = struct {
         defer output.deinit();
 
         for (argv, 0..) |arg, index| {
-            if (index != 0) {
-                try output.writer.writeByte(' ');
-            }
+            if (index != 0) try output.writer.writeByte(' ');
 
             try output.writer.writeByte('\'');
             for (arg) |byte| {
@@ -165,6 +167,9 @@ pub const Context = struct {
         return buffer[0..bytes_read];
     }
 
+    /// Spawns argv directly, without shell evaluation. Race child completion with
+    /// a deadline and save full output to files to avoid pipe backpressure. Timeout
+    /// kills this process; container descendants are removed by the matrix layer.
     pub fn runCommand(context: *Context, argv: []const []const u8, options: CommandOptions) !CommandResult {
         context.command_index += 1;
 
@@ -173,9 +178,7 @@ pub const Context = struct {
             context.command_index,
         });
 
-        if (std.fs.path.dirname(log_prefix)) |parent| {
-            try context.makeDir(parent);
-        }
+        if (std.fs.path.dirname(log_prefix)) |parent| try context.makeDir(parent);
 
         const stdout_path = try std.fmt.allocPrint(context.allocator, "{s}.stdout", .{log_prefix});
         const stderr_path = try std.fmt.allocPrint(context.allocator, "{s}.stderr", .{log_prefix});
@@ -242,10 +245,10 @@ pub const Context = struct {
             },
         }
 
+        // Stop the losing wait before killing or reading child output. A timer
+        // win is retained separately from the synthetic signal-like exit code.
         wait.cancelDiscard();
-        if (result.timed_out) {
-            child.kill(context.io);
-        }
+        if (result.timed_out) child.kill(context.io);
 
         if (options.capture or result.exit_code != 0) {
             result.stdout_text = try context.readLogPrefix(stdout_path, &result.truncated);
@@ -313,6 +316,7 @@ pub const Context = struct {
     }
 };
 
+/// Uses shell-style `128 + signal` codes; 125 denotes an unknown launch outcome.
 pub fn terminationCode(termination: std.process.Child.Term) i64 {
     return switch (termination) {
         .exited => |code| code,

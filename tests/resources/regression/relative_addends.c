@@ -1,3 +1,5 @@
+/* The runner rewrites `relative_slot`'s RELATIVE addend to zero or -8. Compare
+ * integer addresses without dereferencing the deliberately out-of-image pointer. */
 #include <stdint.h>
 
 static int state = 21;

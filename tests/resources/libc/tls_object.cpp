@@ -1,3 +1,6 @@
+// Two function-local TLS objects exercise lazy construction and reverse-order
+// destruction. Calling `touchTlsObjects` again on one thread must not reconstruct
+// either object or replace the event storage captured by its first call.
 #include "tls_object.h"
 #include <cstdio>
 #include <cstdlib>
@@ -41,6 +44,8 @@ extern "C" void touchTlsObjects(tls_object_events *events, unsigned value) {
 }
 
 extern "C" void prepareTlsProcessExit(unsigned case_id) {
+    // Register the observer before constructing TLS objects. Normal exit should
+    // destroy both TLS objects before the observer checks their shared counters.
     process_case = case_id;
     if (std::atexit(checkProcessExit) != 0) std::abort();
     touchTlsObjects(&process_events, 23);

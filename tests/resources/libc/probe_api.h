@@ -1,5 +1,8 @@
 #ifndef DYNLOADER_PROBE_API_H
 #define DYNLOADER_PROBE_API_H
+/* Shared ABI for the native C reference and the static Zig worker. Keep field
+ * order and widths synchronized with `tests/workers/libc.zig`. Exported size/version
+ * functions are checked before either host passes these records to `probe_run`. */
 #include <stdint.h>
 
 #define PROBE_ABI_VERSION 1u
@@ -34,5 +37,7 @@ uint32_t probe_result_size(void);
 uint32_t probe_case_info_size(void);
 uint32_t probe_host_api_size(void);
 int probe_describe(uint32_t index, struct probe_case_info *out);
+/* A zero return means the ABI call succeeded; `out->status` is the test outcome.
+ * `host` and `out` remain caller-owned for the case, including joined callbacks. */
 int probe_run(uint32_t id, const struct probe_host_api *host, struct probe_result *out);
 #endif

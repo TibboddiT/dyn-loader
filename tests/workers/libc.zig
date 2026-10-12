@@ -1,6 +1,15 @@
+//! Static host for the C probe ABI in `tests/resources/libc/probe_api.h`. Size and
+//! version exports are checked before passing structs across the language boundary.
+//! Each invocation runs one case and exits directly: a failed case may leave
+//! native workers alive, so loader teardown would not be a valid cleanup path.
+
 const std = @import("std");
 
 const dll = @import("dll");
+
+// Keep detailed diagnostics available in optimized workers too. Normal matrix
+// runs retain `.err`; append `--debug` when reproducing one case manually.
+pub const std_options: std.Options = .{ .log_level = .debug };
 
 pub const debug = struct {
     pub const SelfInfo = dll.CustomSelfInfo;
@@ -8,10 +17,19 @@ pub const debug = struct {
 
 const abi_version = 1;
 const HostApi = extern struct {
-    abi_version: u32 = abi_version,
-    struct_size: u32 = @sizeOf(HostApi),
+    abi_version: u32,
+    struct_size: u32,
     callback: *const fn (context: ?*anyopaque, value: u32) callconv(.c) u32,
     context: ?*anyopaque,
+
+    fn init(context: *CallbackContext) HostApi {
+        return .{
+            .abi_version = abi_version,
+            .struct_size = @sizeOf(HostApi),
+            .callback = &hostCallback,
+            .context = context,
+        };
+    }
 };
 
 const CaseInfo = extern struct {
@@ -36,6 +54,8 @@ const ReadU32 = *const fn () callconv(.c) u32;
 const DescribeCase = *const fn (case_id: u32, info: *CaseInfo) callconv(.c) c_int;
 const RunCase = *const fn (case_id: u32, host: *const HostApi, result: *ProbeResult) callconv(.c) c_int;
 
+// Main sets 41 before loading; a newly spawned callback thread must see 17.
+// The callback's write to 99 must affect neither library TLS nor the main thread.
 threadlocal var host_tls: u32 = 17;
 
 fn hostCallback(argument: ?*anyopaque, value: u32) callconv(.c) u32 {
@@ -56,9 +76,7 @@ fn writeAllTo(fd: i32, bytes: []const u8) void {
         const write_result = std.os.linux.write(fd, remaining.ptr, remaining.len);
         switch (std.os.linux.errno(write_result)) {
             .SUCCESS => {
-                if (write_result == 0) {
-                    std.process.exit(3);
-                }
+                if (write_result == 0) std.process.exit(3);
 
                 remaining = remaining[write_result..];
             },
@@ -119,7 +137,9 @@ pub fn main(init: std.process.Init) void {
 
     const args = init.minimal.args.toSlice(init.arena.allocator()) catch fail(allocator, "arguments", "argument allocation failed");
 
-    if (args.len != 3) fail(allocator, "arguments", "usage: libc-runner LIBRARY --list|CASE_ID");
+    if (args.len < 3 or args.len > 4 or (args.len == 4 and !std.mem.eql(u8, args[3], "--debug"))) {
+        fail(allocator, "arguments", "usage: libc-runner LIBRARY --list|CASE_ID [--debug]");
+    }
 
     std.posix.setrlimit(.CORE, .{ .cur = 0, .max = 0 }) catch {};
 
@@ -132,7 +152,7 @@ pub fn main(init: std.process.Init) void {
         .io = init.io,
         .args = init.minimal.args,
         .environ = init.minimal.environ,
-        .log_level = .err,
+        .log_level = if (args.len == 4) .debug else .err,
     }) catch |err| fail(allocator, "init", @errorName(err));
 
     emit(allocator, .{ .event = "stage", .stage = "load" });
@@ -177,24 +197,17 @@ pub fn main(init: std.process.Init) void {
     }
 
     const case_id = std.fmt.parseInt(u32, args[2], 10) catch fail(allocator, "arguments", "invalid case ID");
-    if (case_id >= case_count) {
-        fail(allocator, "arguments", "invalid case ID");
-    }
+    if (case_id >= case_count) fail(allocator, "arguments", "invalid case ID");
 
     var callback_context: CallbackContext = .{};
 
-    const host: HostApi = .{
-        .callback = &hostCallback,
-        .context = &callback_context,
-    };
+    const host = HostApi.init(&callback_context);
 
     var result: ProbeResult = .{};
 
     emit(allocator, .{ .event = "stage", .stage = "run" });
 
-    if (run_case(case_id, &host, &result) != 0) {
-        fail(allocator, "abi", "probe_run failed");
-    }
+    if (run_case(case_id, &host, &result) != 0) fail(allocator, "abi", "probe_run failed");
 
     const host_callback_case_id = 10;
     const callback_count_valid = case_id != host_callback_case_id or callback_context.calls == 1;

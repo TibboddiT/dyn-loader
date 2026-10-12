@@ -1,3 +1,5 @@
+/* A DT_NEEDED consumer that must retain its provider after the provider's direct
+ * handle closes. Its finalizer observes whether the provider finalized too early. */
 #include "abi.h"
 
 extern void readState(struct LibraryState *);

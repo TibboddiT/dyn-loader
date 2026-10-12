@@ -1,4 +1,7 @@
 //! Adds a 4 KiB file prefix without changing mapped addresses or relocations.
+//! The resulting fixture forces the loader to distinguish ELF virtual addresses
+//! from file offsets. It is derived from SDK output rather than a synthetic ABI.
+
 const std = @import("std");
 const elf = std.elf;
 
@@ -9,6 +12,9 @@ const elf_header_size = @sizeOf(elf.Elf64_Ehdr);
 const program_header_size = @sizeOf(elf.Elf64.Phdr);
 const section_header_size = @sizeOf(elf.Elf64.Shdr);
 
+/// Returns an owned transformed copy; the source stays untouched on success or
+/// failure. Load-segment alignments must divide the prefix to preserve congruence
+/// between each segment's file offset and virtual address.
 pub fn createNonIdentityLayout(allocator: std.mem.Allocator, source_bytes: []const u8) ![]u8 {
     if (source_bytes.len < elf_header_size) return error.InvalidFixtureElf;
 

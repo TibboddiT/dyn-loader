@@ -1,4 +1,6 @@
 ARG BASE
+# Build a runtime target with C++ support, then extend that exact image with the
+# compiler. Both targets must retain identical musl and loader bytes.
 FROM ${BASE} AS runtime
 ARG LIBC_PACKAGE_VERSION
 ARG LLVM_PACKAGE_VERSION

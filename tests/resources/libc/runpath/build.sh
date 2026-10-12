@@ -1,8 +1,12 @@
 #!/bin/sh
 set -eu
 
+# Prevent the Nix compiler wrapper from adding search paths that mask the test.
 export NIX_DONT_SET_RPATH=1
 
+# Both graphs are top -> middle -> leaf. In chain, each object finds its direct
+# dependency; in scope, only top can find leaf, exposing RUNPATH inheritance rules.
+# Single quotes keep `$ORIGIN` for the loader rather than expanding it in this shell.
 for variant in chain scope; do
     directory="runpath/$variant"
     mkdir -p "$directory/middle" "$directory/leaf"
@@ -28,6 +32,7 @@ for variant in chain scope; do
         -Wl,--enable-new-dtags -Wl,-rpath,"$top_runpath" \
         -Wl,-soname,libmatrix_top.so -o "$directory/top.so"
 
+    # Verify actual tags: older RPATH semantics would test a different contract.
     top_dynamic=$(readelf -d "$directory/top.so")
     middle_dynamic=$(readelf -d "$directory/middle/libmatrix_middle.so")
     printf '%s\n' "$top_dynamic" | grep -F '(RUNPATH)' | grep -F "[$top_runpath]"

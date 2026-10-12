@@ -3,6 +3,8 @@ FROM ${BASE}
 ARG SUITE
 ARG SNAPSHOT
 ARG LIBC_PACKAGE_VERSION
+# Snapshot repositories supply matching development packages without upgrading
+# the runtime libc. The matrix also compares libc/loader hashes with the base image.
 RUN rm -f /etc/apt/sources.list.d/* && \
     printf 'deb [check-valid-until=no] http://snapshot.debian.org/archive/debian/%s/ %s main\n' "$SNAPSHOT" "$SUITE" > /etc/apt/sources.list && \
     case "$SUITE" in \

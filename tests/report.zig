@@ -1,3 +1,7 @@
+//! Persistent matrix report schema and text rendering. Records borrow run-arena
+//! data; rendering allocates output with the supplied allocator. Validate stored
+//! reports before accessing union payloads or generating reproduction commands.
+
 const std = @import("std");
 const builtin = @import("builtin");
 
@@ -70,9 +74,7 @@ pub fn validate(allocator: std.mem.Allocator, report: json.Value) !void {
         }
 
         const bootstrap = json.field(runtime, "bootstrap");
-        if (bootstrap != .null) {
-            try validateOutcomes(bootstrap);
-        }
+        if (bootstrap != .null) try validateOutcomes(bootstrap);
 
         for (json.field(runtime, "cases").array.items) |row| {
             json.requireAllFields(Row, row) catch return error.InvalidReport;
@@ -216,9 +218,7 @@ fn reproductionCommand(
 
         // Float parsing can round a millisecond down.
         const seconds = @as(f64, @floatFromInt(timeout_ms)) / 1000;
-        if (@as(u64, @intFromFloat(seconds * 1000)) < timeout_ms) {
-            try writer.writeByte('1');
-        }
+        if (@as(u64, @intFromFloat(seconds * 1000)) < timeout_ms) try writer.writeByte('1');
     }
 
     if (json.asString(json.field(report, "cache_dir"))) |cache_dir| {
@@ -229,6 +229,8 @@ fn reproductionCommand(
     return output.toOwnedSlice();
 }
 
+/// Shell quoting is already applied. This second layer protects Markdown table
+/// separators and selects a code-span delimiter longer than any embedded run.
 fn writeCommandCell(writer: *std.Io.Writer, command: []const u8) !void {
     var longest_run: usize = 0;
     var current_run: usize = 0;
@@ -238,9 +240,7 @@ fn writeCommandCell(writer: *std.Io.Writer, command: []const u8) !void {
     }
 
     const delimiter_length = longest_run + 1;
-    for (0..delimiter_length) |_| {
-        try writer.writeByte('`');
-    }
+    for (0..delimiter_length) |_| try writer.writeByte('`');
     try writer.writeByte(' ');
 
     for (command) |byte| {
@@ -252,9 +252,7 @@ fn writeCommandCell(writer: *std.Io.Writer, command: []const u8) !void {
     }
 
     try writer.writeByte(' ');
-    for (0..delimiter_length) |_| {
-        try writer.writeByte('`');
-    }
+    for (0..delimiter_length) |_| try writer.writeByte('`');
 }
 
 pub fn markdown(allocator: std.mem.Allocator, report: json.Value) ![]const u8 {

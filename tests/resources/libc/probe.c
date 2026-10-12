@@ -1,3 +1,7 @@
+/* One native behavior per process, executed by both the reference and Zig hosts.
+ * `EXPECT` records a mismatch and returns from the current helper. A failed
+ * case can leave resources or workers alive; the host exits directly afterward.
+ * Waiting loops are bounded externally by the matrix's per-process timeout. */
 #include "probe_api.h"
 #include "tls_object.h"
 #include <dlfcn.h>
@@ -48,6 +52,7 @@ static void recordFailure(struct probe_result *result, unsigned line, const char
     copyText(result->detail, sizeof result->detail, detail);
 }
 
+/* Evaluate expressions once and save `errno` before diagnostics can change it. */
 #define EXPECT(result, actual, wanted) do { \
     int64_t observed_ = (int64_t)(actual); \
     int64_t expected_ = (int64_t)(wanted); \
@@ -82,6 +87,8 @@ static void runpathChain(const struct probe_host_api *host, struct probe_result 
 }
 
 static void runpathScope(const struct probe_host_api *host, struct probe_result *result) {
+    // Only the top object's RUNPATH finds the leaf in this variant. The native
+    // references differ: glibc limits RUNPATH to direct dependencies, musl inherits it.
     UNUSED_HOST();
     void *library = dlopen("/fixtures/runpath/scope/top.so", RTLD_NOW | RTLD_LOCAL);
 #ifdef __GLIBC__
@@ -138,6 +145,8 @@ static void *errnoThread(void *argument) {
 }
 
 static void errnoIsolation(const struct probe_host_api *host, struct probe_result *result) {
+    // Both workers set `errno` before either observes it. One uses an allocator
+    // failure, checking that allocation substitutes write the native thread's `errno`.
     UNUSED_HOST();
     static atomic_int arrived;
     static struct ErrnoWorker workers[2] = {
@@ -201,7 +210,7 @@ static void allocationOverflow(const struct probe_host_api *host, struct probe_r
     EXPECT(result, returned_null, 1);
     EXPECT(result, saved_errno, ENOMEM);
 
-    // The product fits, but adding allocator alignment padding does not.
+    // The product fits size_t, but exceeds the supported allocation size.
     volatile size_t oversized = SIZE_MAX;
     errno = 0;
     buffer = calloc(1, oversized);
@@ -270,6 +279,8 @@ static void *tlsThread(void *argument) {
 }
 
 static void tlsIsolation(const struct probe_host_api *host, struct probe_result *result) {
+    // Mutate main-thread data before creation. A worker must receive initializer
+    // bytes and zero-filled TLS, not a copy of the main thread's current values.
     UNUSED_HOST();
     EXPECT(result, tls_initialized, 11);
     EXPECT(result, tls_zeroed, 0);
@@ -408,6 +419,8 @@ static void *conditionThread(void *argument) {
 }
 
 static void conditionSignal(const struct probe_host_api *host, struct probe_result *result) {
+    // The mutex makes readiness and signal delivery one protocol; the atomic
+    // marker only tells the creator when it can start acquiring that mutex.
     UNUSED_HOST();
     static struct ConditionState state = {
         .mutex = PTHREAD_MUTEX_INITIALIZER,
@@ -584,6 +597,8 @@ static void *cppThread(void *argument) {
 }
 
 static void cppCleanup(struct probe_result *result, int explicit_exit, int close_pending) {
+    // Closing while destructors are pending must retain their defining DSO.
+    // Event storage belongs to this frame and stays alive through both joins.
     void *library = dlopen("/fixtures/libtls_object.so", RTLD_NOW | RTLD_LOCAL);
     EXPECT(result, library != NULL, 1);
     TouchTlsObjects touch = (TouchTlsObjects)dlsym(library, "touchTlsObjects");
@@ -606,7 +621,9 @@ static void cppCleanup(struct probe_result *result, int explicit_exit, int close
     }
 
     int close_error = close_pending ? dlclose(library) : 0;
-    for (unsigned index = 0; index < 2; ++index) atomic_store(&workers[index].release, 1);
+    for (unsigned index = 0; index < 2; ++index) {
+        atomic_store(&workers[index].release, 1);
+    }
     int join_errors[2];
     void *returned[2] = {NULL, NULL};
     for (unsigned index = 0; index < 2; ++index) {
@@ -939,6 +956,9 @@ static void localeThreadIsolation(const struct probe_host_api *host, struct prob
 }
 
 static void checkFork(struct probe_result *result) {
+    // The child uses only descriptor I/O and `_exit`. This probes native fork
+    // recovery and child execution, not a complete post-fork loader lifecycle.
+    // Verify both the pipe marker and wait status so either failure is visible.
     const unsigned char marker[] = {0x46, 0x4f, 0x52, 0x4b};
     const int child_exit_status = 37;
     int descriptors[2];
@@ -1044,6 +1064,8 @@ static void processFork(const struct probe_host_api *host, struct probe_result *
 }
 
 static void processForkWithWorker(const struct probe_host_api *host, struct probe_result *result) {
+    // Keep a registered worker asleep across fork. Release and join it before
+    // reporting the fork result, including when child-side verification failed.
     UNUSED_HOST();
     static struct ForkWaitingWorker state = {
         .mutex = PTHREAD_MUTEX_INITIALIZER,
@@ -1152,6 +1174,8 @@ static void *churnForFork(void *argument) {
 }
 
 static void processForkDuringWorkerChurn(const struct probe_host_api *host, struct probe_result *result) {
+    // Overlap fork with native list insertion/removal; repeat from both the
+    // initial thread and a worker. Stop the churn before inspecting its counters.
     static struct ForkChurn state;
     atomic_store(&state.started, 0);
     atomic_store(&state.stop, 0);
@@ -1188,6 +1212,8 @@ static void *readInheritedSignalMask(void *argument) {
 }
 
 static void threadSignalMaskInheritance(const struct probe_host_api *host, struct probe_result *result) {
+    // Inspect the creator before restoring its original mask. This distinguishes
+    // correct child inheritance from accidentally leaving creator signals blocked.
     UNUSED_HOST();
     sigset_t original, requested, after_create;
     EXPECT(result, pthread_sigmask(SIG_SETMASK, NULL, &original), 0);
@@ -1214,6 +1240,370 @@ static void threadSignalMaskInheritance(const struct probe_host_api *host, struc
     EXPECT(result, sigismember(&state.mask, SIGUSR2), 0);
 }
 
+struct FirstWorkerKey {
+    pthread_key_t key;
+    atomic_int ready;
+    atomic_int release;
+    int value;
+    int create_error;
+    int set_error;
+    int isolated;
+};
+
+static void *createFirstWorkerKey(void *argument) {
+    struct FirstWorkerKey *state = argument;
+    state->create_error = pthread_key_create(&state->key, NULL);
+    if (!state->create_error) {
+        state->set_error = pthread_setspecific(state->key, &state->value);
+    }
+
+    atomic_store(&state->ready, 1);
+    while (!atomic_load(&state->release)) sched_yield();
+
+    if (!state->create_error && !state->set_error) {
+        state->isolated = pthread_getspecific(state->key) == &state->value;
+    }
+    return argument;
+}
+
+static void keyCreateFromWorker(const struct probe_host_api *host, struct probe_result *result) {
+    UNUSED_HOST();
+    static struct FirstWorkerKey state;
+    static int main_value;
+    pthread_t thread;
+    EXPECT(result, pthread_create(&thread, NULL, &createFirstWorkerKey, &state), 0);
+    while (!atomic_load(&state.ready)) sched_yield();
+
+    int fresh = 0;
+    int set_error = 0;
+    if (!state.create_error) {
+        fresh = pthread_getspecific(state.key) == NULL;
+        set_error = pthread_setspecific(state.key, &main_value);
+    }
+
+    atomic_store(&state.release, 1);
+    EXPECT(result, pthread_join(thread, NULL), 0);
+
+    int preserved = state.create_error ? 0 : pthread_getspecific(state.key) == &main_value;
+    int delete_error = state.create_error ? 0 : pthread_key_delete(state.key);
+
+    EXPECT(result, state.create_error, 0);
+    EXPECT(result, state.set_error, 0);
+    EXPECT(result, set_error, 0);
+    EXPECT(result, fresh, 1);
+    EXPECT(result, state.isolated, 1);
+    EXPECT(result, preserved, 1);
+    EXPECT(result, delete_error, 0);
+}
+
+enum KeyDeletionPhase {
+    key_deletion_waiting,
+    key_replacement_ready,
+    key_deletion_aborted,
+};
+
+struct LiveKeyDeletion {
+    pthread_key_t key;
+    pthread_key_t replacement;
+    atomic_int ready;
+    atomic_int phase;
+};
+
+struct LiveKeyWorker {
+    struct LiveKeyDeletion *state;
+    int value;
+    int error;
+    int fresh;
+};
+
+static void *waitForKeyDeletion(void *argument) {
+    struct LiveKeyWorker *worker = argument;
+    struct LiveKeyDeletion *state = worker->state;
+    worker->error = pthread_setspecific(state->key, &worker->value);
+
+    atomic_fetch_add(&state->ready, 1);
+    int phase;
+    while ((phase = atomic_load(&state->phase)) == key_deletion_waiting) sched_yield();
+
+    if (phase == key_replacement_ready && !worker->error) {
+        worker->fresh = pthread_getspecific(state->replacement) == NULL;
+        worker->error = pthread_setspecific(state->replacement, &worker->value);
+    }
+    return argument;
+}
+
+static void keyDeleteLiveWorkers(const struct probe_host_api *host, struct probe_result *result) {
+    // Publish replacement only after deletion/creation completes. An aborted
+    // setup still releases every created worker, without exposing an invalid key.
+    UNUSED_HOST();
+    static struct LiveKeyDeletion state;
+    static struct LiveKeyWorker workers[2];
+    static int main_value;
+    EXPECT(result, pthread_key_create(&state.key, NULL), 0);
+
+    pthread_t threads[2];
+    unsigned created = 0;
+    int create_error = 0;
+    for (; created < 2; ++created) {
+        workers[created].state = &state;
+        create_error = pthread_create(&threads[created], NULL, &waitForKeyDeletion, &workers[created]);
+        if (create_error) break;
+    }
+
+    int delete_error = 0;
+    int key_error = 0;
+    int set_error = 0;
+    int fresh = 0;
+    int deleted = 0;
+    int replaced = 0;
+    if (!create_error) {
+        while (atomic_load(&state.ready) != 2) sched_yield();
+
+        delete_error = pthread_key_delete(state.key);
+        deleted = !delete_error;
+        if (deleted) {
+            key_error = pthread_key_create(&state.replacement, NULL);
+            replaced = !key_error;
+
+            if (replaced) {
+                fresh = pthread_getspecific(state.replacement) == NULL;
+                set_error = pthread_setspecific(state.replacement, &main_value);
+            }
+        }
+    }
+
+    atomic_store(&state.phase, replaced ? key_replacement_ready : key_deletion_aborted);
+    int join_error = 0;
+    for (unsigned index = 0; index < created; ++index) {
+        int error_code = pthread_join(threads[index], NULL);
+        if (error_code) {
+            join_error = error_code;
+        }
+    }
+    EXPECT(result, join_error, 0);
+
+    int preserved = replaced && pthread_getspecific(state.replacement) == &main_value;
+    int cleanup_error = 0;
+    if (replaced) {
+        cleanup_error = pthread_key_delete(state.replacement);
+    } else if (!deleted) {
+        cleanup_error = pthread_key_delete(state.key);
+    }
+
+    EXPECT(result, create_error, 0);
+    EXPECT(result, delete_error, 0);
+    EXPECT(result, key_error, 0);
+    EXPECT(result, set_error, 0);
+    EXPECT(result, cleanup_error, 0);
+    EXPECT(result, fresh, 1);
+    EXPECT(result, preserved, 1);
+    for (unsigned index = 0; index < 2; ++index) {
+        EXPECT(result, workers[index].error, 0);
+        EXPECT(result, workers[index].fresh, 1);
+    }
+}
+
+struct FreshWorkerKey {
+    pthread_key_t key;
+    int value;
+    int fresh;
+    int error;
+};
+
+static void *setFreshWorkerKey(void *argument) {
+    struct FreshWorkerKey *state = argument;
+    state->fresh = pthread_getspecific(state->key) == NULL;
+    state->error = pthread_setspecific(state->key, &state->value);
+    return argument;
+}
+
+static void keyFreshWorkers(const struct probe_host_api *host, struct probe_result *result) {
+    UNUSED_HOST();
+    static struct FreshWorkerKey state;
+    EXPECT(result, pthread_key_create(&state.key, NULL), 0);
+
+    int error_code = 0;
+    int fresh = 1;
+    for (unsigned iteration = 0; iteration < 16; ++iteration) {
+        pthread_t thread;
+        error_code = pthread_create(&thread, NULL, &setFreshWorkerKey, &state);
+        if (error_code) break;
+        EXPECT(result, pthread_join(thread, NULL), 0);
+
+        error_code = state.error;
+        fresh = fresh && state.fresh;
+        if (error_code || !fresh) break;
+    }
+
+    int delete_error = pthread_key_delete(state.key);
+
+    EXPECT(result, error_code, 0);
+    EXPECT(result, fresh, 1);
+    EXPECT(result, delete_error, 0);
+}
+
+enum WorkerKeyLoadStage {
+    worker_key_waiting,
+    worker_key_initialized,
+    worker_key_library_loaded,
+    worker_key_library_closed,
+};
+
+struct WorkerKeyLoad {
+    pthread_key_t key;
+    atomic_int requested_stage;
+    atomic_int completed_stage;
+    int value;
+    int error;
+    int preserved;
+};
+
+static void *keepKeyAcrossLoad(void *argument) {
+    struct WorkerKeyLoad *state = argument;
+    state->error = pthread_setspecific(state->key, &state->value);
+    state->preserved = !state->error;
+    atomic_store(&state->completed_stage, worker_key_initialized);
+
+    const enum WorkerKeyLoadStage checkpoints[] = {worker_key_library_loaded, worker_key_library_closed};
+    for (unsigned index = 0; index < sizeof checkpoints / sizeof checkpoints[0]; ++index) {
+        int stage = checkpoints[index];
+        while (atomic_load(&state->requested_stage) < stage) sched_yield();
+
+        state->preserved = state->preserved && pthread_getspecific(state->key) == &state->value;
+        atomic_store(&state->completed_stage, stage);
+    }
+    return argument;
+}
+
+static void keyWorkerSurvivesLoad(const struct probe_host_api *host, struct probe_result *result) {
+    // Check a live worker's pthread-key storage at separate load and close
+    // checkpoints. ELF TLS growth must not reset this independently owned array.
+    UNUSED_HOST();
+    static struct WorkerKeyLoad state;
+    EXPECT(result, pthread_key_create(&state.key, NULL), 0);
+
+    pthread_t thread;
+    int create_error = pthread_create(&thread, NULL, &keepKeyAcrossLoad, &state);
+    if (create_error) {
+        pthread_key_delete(state.key);
+        EXPECT(result, create_error, 0);
+    }
+    while (atomic_load(&state.completed_stage) < worker_key_initialized) sched_yield();
+
+    void *library = dlopen("/fixtures/libtls_object.so", RTLD_NOW | RTLD_LOCAL);
+    int loaded = library != NULL;
+    atomic_store(&state.requested_stage, worker_key_library_loaded);
+    while (atomic_load(&state.completed_stage) < worker_key_library_loaded) sched_yield();
+
+    int close_error = loaded ? dlclose(library) : 0;
+    atomic_store(&state.requested_stage, worker_key_library_closed);
+    EXPECT(result, pthread_join(thread, NULL), 0);
+
+    int delete_error = pthread_key_delete(state.key);
+
+    EXPECT(result, loaded, 1);
+    EXPECT(result, close_error, 0);
+    EXPECT(result, state.error, 0);
+    EXPECT(result, state.preserved, 1);
+    EXPECT(result, delete_error, 0);
+}
+
+struct StreamWorker {
+    FILE *stream;
+    atomic_int *ready;
+    unsigned char byte;
+    int error;
+};
+
+static void *writeSharedStream(void *argument) {
+    struct StreamWorker *worker = argument;
+    unsigned char record[64];
+    memset(record, worker->byte, sizeof record);
+
+    atomic_fetch_add(worker->ready, 1);
+    while (atomic_load(worker->ready) < 2) sched_yield();
+
+    for (unsigned index = 0; index < 1000; ++index) {
+        if (fwrite(record, 1, sizeof record, worker->stream) != sizeof record) {
+            worker->error = 1;
+        }
+    }
+    return argument;
+}
+
+static void workerStreamLocking(const struct probe_host_api *host, struct probe_result *result) {
+    UNUSED_HOST();
+
+    // Open before the first worker: musl's threaded transition must enable locks
+    // on already existing streams. Each `fwrite` record must remain indivisible.
+    FILE *stream = tmpfile();
+    EXPECT(result, stream != NULL, 1);
+
+    static atomic_int ready;
+    static struct StreamWorker workers[2];
+    pthread_t threads[2];
+    unsigned created = 0;
+    int create_error = 0;
+    for (; created < 2; ++created) {
+        workers[created] = (struct StreamWorker){
+            .stream = stream,
+            .ready = &ready,
+            .byte = (unsigned char)('A' + created),
+            .error = 0,
+        };
+        create_error = pthread_create(&threads[created], NULL, &writeSharedStream, &workers[created]);
+        if (create_error) break;
+    }
+    if (create_error) {
+        atomic_store(&ready, 2);
+    }
+
+    int join_error = 0;
+    for (unsigned index = 0; index < created; ++index) {
+        int error_code = pthread_join(threads[index], NULL);
+        if (error_code) {
+            join_error = error_code;
+        }
+    }
+    EXPECT(result, join_error, 0);
+
+    int seek_error = fseek(stream, 0, SEEK_SET);
+    unsigned counts[2] = {0};
+    int malformed = 0;
+    unsigned char record[64];
+    if (!seek_error) {
+        size_t count;
+        while ((count = fread(record, 1, sizeof record, stream)) != 0) {
+            if (count != sizeof record || (record[0] != 'A' && record[0] != 'B')) {
+                malformed = 1;
+                break;
+            }
+
+            ++counts[record[0] - 'A'];
+            for (unsigned index = 1; index < sizeof record; ++index) {
+                if (record[index] != record[0]) {
+                    malformed = 1;
+                }
+            }
+        }
+    }
+
+    int read_error = ferror(stream);
+    int close_error = fclose(stream);
+
+    EXPECT(result, create_error, 0);
+    EXPECT(result, workers[0].error, 0);
+    EXPECT(result, workers[1].error, 0);
+    EXPECT(result, seek_error, 0);
+    EXPECT(result, read_error, 0);
+    EXPECT(result, close_error, 0);
+    EXPECT(result, malformed, 0);
+    EXPECT(result, counts[0], 1000);
+    EXPECT(result, counts[1], 1000);
+}
+
+/* Indices are protocol case IDs. Append cases to preserve established IDs;
+ * both hosts also use the fixed ID of `thread.host_callback` for extra validation. */
 static const struct {
     const char *name;
     void (*run)(const struct probe_host_api *, struct probe_result *);
@@ -1256,6 +1646,11 @@ static const struct {
     {"process.fork_after_worker_exit", processForkAfterWorkerExit},
     {"process.fork_during_worker_churn", processForkDuringWorkerChurn},
     {"thread.signal_mask_inheritance", threadSignalMaskInheritance},
+    {"thread.key_create_from_worker", keyCreateFromWorker},
+    {"thread.key_delete_live_workers", keyDeleteLiveWorkers},
+    {"thread.key_fresh_workers", keyFreshWorkers},
+    {"thread.key_worker_survives_load", keyWorkerSurvivesLoad},
+    {"thread.stream_locking", workerStreamLocking},
 };
 
 uint32_t probe_abi_version(void) { return PROBE_ABI_VERSION; }

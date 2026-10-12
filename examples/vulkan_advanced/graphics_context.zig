@@ -66,9 +66,7 @@ pub const GraphicsContext = struct {
         self.allocator = allocator;
         self.vkb = BaseWrapper.load(&VulkanProcResolver.resolver);
 
-        if (try checkLayerSupport(&self.vkb, self.allocator) == false) {
-            return error.MissingLayer;
-        }
+        if (try checkLayerSupport(&self.vkb, self.allocator) == false) return error.MissingLayer;
 
         var extension_names: std.ArrayList([*:0]const u8) = .empty;
         defer extension_names.deinit(allocator);
@@ -276,9 +274,7 @@ fn pickPhysicalDevice(
     defer allocator.free(pdevs);
 
     for (pdevs) |pdev| {
-        if (try checkSuitable(instance, pdev, allocator, surface)) |candidate| {
-            return candidate;
-        }
+        if (try checkSuitable(instance, pdev, allocator, surface)) |candidate| return candidate;
     }
 
     return error.NoSuitableDevice;
@@ -290,13 +286,9 @@ fn checkSuitable(
     allocator: Allocator,
     surface: vk.SurfaceKHR,
 ) !?DeviceCandidate {
-    if (!try checkExtensionSupport(instance, pdev, allocator)) {
-        return null;
-    }
+    if (!try checkExtensionSupport(instance, pdev, allocator)) return null;
 
-    if (!try checkSurfaceSupport(instance, pdev, surface)) {
-        return null;
-    }
+    if (!try checkSurfaceSupport(instance, pdev, surface)) return null;
 
     if (try allocateQueues(instance, pdev, allocator, surface)) |allocation| {
         const props = instance.getPhysicalDeviceProperties(pdev);

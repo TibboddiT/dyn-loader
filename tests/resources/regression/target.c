@@ -1,3 +1,6 @@
+/* Reload fixture with initialized globals, BSS, initialized TLS, and a scalable
+ * TLS reservation. Exporting `largeTlsAddress` keeps the reservation observable
+ * even in the optimized fixture. */
 #include "abi.h"
 
 #ifndef TLS_BYTES
@@ -31,6 +34,7 @@ void readState(struct LibraryState *out) {
 }
 
 void mutate(struct FinalizationEvents *out) {
+    // Borrow the observer until finalization; the caller keeps it outside the DSO.
     events = out;
     initialized = 42;
     zeroed = 99;

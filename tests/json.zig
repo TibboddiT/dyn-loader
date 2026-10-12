@@ -1,7 +1,13 @@
+//! JSON helpers for arena-owned matrix metadata. Parsed trees allocate all text;
+//! field access and constructed string values borrow their underlying storage.
+//! Callers keep the arena and borrowed strings alive through report serialization.
+
 const std = @import("std");
 
 pub const Value = std.json.Value;
 
+/// Requires presence even for fields with Zig defaults. Type validation is a
+/// separate step; persisted records must not silently inherit missing defaults.
 pub fn requireAllFields(comptime T: type, value: Value) !void {
     if (value != .object) return error.InvalidData;
 
@@ -10,6 +16,8 @@ pub fn requireAllFields(comptime T: type, value: Value) !void {
     }
 }
 
+/// Permissive lookup for optional metadata: missing keys and non-objects return
+/// JSON null. Use explicit validators at boundaries where absence is an error.
 pub fn field(value: Value, key: []const u8) Value {
     if (value != .object) return .null;
 
@@ -57,6 +65,8 @@ pub fn putField(allocator: std.mem.Allocator, value: *Value, key: []const u8, it
     try value.object.put(allocator, key, item);
 }
 
+/// The allocator owns the entire result and partial allocations on parse failure;
+/// this leaky parser is intended for the matrix's lifetime-scoped arena.
 pub fn parse(allocator: std.mem.Allocator, bytes: []const u8) !Value {
     return std.json.parseFromSliceLeaky(Value, allocator, bytes, .{ .allocate = .alloc_always });
 }
@@ -68,6 +78,8 @@ pub fn cloneViaSerialization(allocator: std.mem.Allocator, data: anytype) !Value
     return parse(allocator, bytes);
 }
 
+/// Structural cache-key equality. Object order is irrelevant; array order and
+/// numeric tags are significant, so integer `1` and floating-point `1.0` differ.
 pub fn eql(left: Value, right: Value) bool {
     if (std.meta.activeTag(left) != std.meta.activeTag(right)) return false;
 

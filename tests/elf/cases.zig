@@ -1,3 +1,7 @@
+//! Declarative loader checks: each mutation changes one relevant ELF property
+//! and records the required error or successful symbol result. Catalog order
+//! determines worker case IDs; fixture validation runs before any mutation test.
+
 const std = @import("std");
 const elf = std.elf;
 
@@ -17,6 +21,16 @@ pub const cases: []const runner.Case = &.{
     .{
         .name = "non-identity-layout",
         .expect = .{ .loaded = &.{expectOutParam(LibraryState, "readState", initial_state)} },
+    },
+    .{
+        .name = "symbol-entry-zero",
+        .mutation = .{ .tag_value = .{ .tag = elf.DT_SYMENT, .value = 0 } },
+        .expect = .{ .load_error = error.InvalidSymbolEntrySize },
+    },
+    .{
+        .name = "symbol-entry-wrong",
+        .mutation = .{ .tag_value = .{ .tag = elf.DT_SYMENT, .value = 8 } },
+        .expect = .{ .load_error = error.InvalidSymbolEntrySize },
     },
     .{
         .name = "rela-entry-zero",

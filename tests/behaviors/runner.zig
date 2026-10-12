@@ -1,3 +1,7 @@
+//! Runs lifecycle scenarios through a loaded C bridge. Each process initializes
+//! the singleton once. Specialized cases own that lifecycle themselves; generic
+//! reload/dependency cases use the setup in `runCase`.
+
 const std = @import("std");
 
 const dll = @import("dll");
@@ -70,18 +74,26 @@ pub const DependencyLifetime = struct {
 };
 
 const Worker = struct {
-    phase: std.atomic.Value(enum(u32) { idle, work, done, stop }) = .init(.idle),
-    readState: ReadState = undefined,
-    setTls: SetTls = undefined,
+    phase: std.atomic.Value(enum(u32) { idle, work, done, stop }),
+    readState: ReadState,
+    setTls: SetTls,
     tls_value: u32,
-    observed_state: LibraryState = undefined,
+    observed_state: LibraryState,
+
+    fn init(tls_value: u32) Worker {
+        return .{
+            .phase = .init(.idle),
+            .readState = undefined, // Installed for each load before publishing .work.
+            .setTls = undefined,
+            .tls_value = tls_value,
+            .observed_state = undefined, // Published by the worker before .done.
+        };
+    }
 
     fn exercise(worker: *Worker) void {
         // The worker reads callbacks after .work and writes results before .done.
         worker.phase.store(.work, .release);
-        while (worker.phase.load(.acquire) != .done) {
-            std.atomic.spinLoopHint();
-        }
+        while (worker.phase.load(.acquire) != .done) std.atomic.spinLoopHint();
         worker.phase.store(.idle, .release);
     }
 
@@ -102,7 +114,7 @@ fn workerRoutine(argument: ?*anyopaque) callconv(.c) *anyopaque {
                 worker.phase.store(.done, .release);
             },
             .stop => return argument.?,
-            else => std.atomic.spinLoopHint(),
+            .idle, .done => std.atomic.spinLoopHint(),
         }
     }
 }
@@ -151,7 +163,7 @@ pub fn runCase(init: std.process.Init, cases: []const Case, name: []const u8, re
     const bridge = try Bridge.init(bridge_path, case.bridge_symbols);
 
     switch (case.behavior) {
-        .specific => unreachable,
+        .specific => unreachable, // Dispatched before the runner initialized the loader.
         .reload_cycles => |options| try reloadCycles(bridge, target_path, options),
         .dependency_lifetime => |options| {
             const consumer_path = try std.fmt.allocPrintSentinel(init.gpa, "{s}/{s}", .{ resources_dir, options.consumer }, 0);
@@ -206,11 +218,14 @@ fn expectedFinalization(state: LibraryState, count: u32) FinalizationEvents {
     };
 }
 
+/// Keep one worker alive across unload/reload cycles. It calls the current
+/// library only after `.work` publication; `.done` makes its observations visible
+/// before closing handles. Each cycle supplies fresh function pointers.
 fn reloadCycles(bridge: Bridge, path: [:0]const u8, options: ReloadCycles) !void {
     try std.testing.expect(options.cycles > 0);
 
     var events: FinalizationEvents = .{};
-    var worker: Worker = .{ .tls_value = options.worker_tls_value };
+    var worker = Worker.init(options.worker_tls_value);
     var thread: usize = undefined;
 
     var running = false;
@@ -269,6 +284,8 @@ fn reloadCycles(bridge: Bridge, path: [:0]const u8, options: ReloadCycles) !void
     running = false;
 }
 
+/// Closing a direct provider handle must not unload it while the consumer still
+/// binds to it. The consumer finalizer observes the provider before its teardown.
 fn sharedDependency(bridge: Bridge, target_path: [:0]const u8, consumer_path: [:0]const u8, options: DependencyLifetime) !void {
     const target = try bridge.open(target_path);
 

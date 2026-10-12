@@ -1,3 +1,5 @@
+/* Call native APIs from a loaded DSO so tests exercise relocation substitution
+ * and caller-address-based scope resolution. Zig invokes these typed wrappers. */
 #include <dlfcn.h>
 #include <pthread.h>
 

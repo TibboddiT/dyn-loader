@@ -151,20 +151,14 @@ pub fn main(init: std.process.Init) !void {
     std.log.info("initializing EGL...", .{});
 
     const egl_display: EGL.EGLDisplay = eglGetDisplay(display);
-    if (egl_display == EGL.EGL_NO_DISPLAY) {
-        return error.EGLGetDisplayError;
-    }
+    if (egl_display == EGL.EGL_NO_DISPLAY) return error.EGLGetDisplayError;
 
     const init_status = eglInitialize(egl_display, null, null);
-    if (init_status == 0) {
-        return error.EGLInitializeError;
-    }
+    if (init_status == 0) return error.EGLInitializeError;
     defer _ = eglTerminate(egl_display);
 
     const bind_api_status = eglBindAPI(.EGL_OPENGL_ES_API);
-    if (bind_api_status == 0) {
-        return error.EGLBindAPIError;
-    }
+    if (bind_api_status == 0) return error.EGLBindAPIError;
 
     const config_attribs: []const EGL.EGLint = &.{
         EGL.EGL_RENDERABLE_TYPE, EGL.EGL_OPENGL_ES2_BIT,
@@ -179,14 +173,10 @@ pub fn main(init: std.process.Init) !void {
     var configs: [1]EGL.EGLConfig = undefined;
     var num_configs: EGL.EGLint = undefined;
     const choose_config_status = eglChooseConfig(egl_display, config_attribs.ptr, &configs, 1, &num_configs);
-    if (choose_config_status == 0 or num_configs != 1) {
-        return error.EGLChooseConfigError;
-    }
+    if (choose_config_status == 0 or num_configs != 1) return error.EGLChooseConfigError;
 
     const surface: EGL.EGLSurface = eglCreateWindowSurface(egl_display, configs[0], @intCast(window), null);
-    if (surface == EGL.EGL_NO_SURFACE) {
-        return error.EGLCreateWindowError;
-    }
+    if (surface == EGL.EGL_NO_SURFACE) return error.EGLCreateWindowError;
     defer _ = eglDestroySurface(egl_display, surface);
 
     const context_attribs: []const EGL.EGLint = &.{
@@ -195,15 +185,11 @@ pub fn main(init: std.process.Init) !void {
     };
 
     const context: EGL.EGLContext = eglCreateContext(egl_display, configs[0], EGL.EGL_NO_CONTEXT, context_attribs.ptr);
-    if (context == EGL.EGL_NO_CONTEXT) {
-        return error.EGLCreateContextError;
-    }
+    if (context == EGL.EGL_NO_CONTEXT) return error.EGLCreateContextError;
     defer _ = eglDestroyContext(egl_display, context);
 
     const make_current_status = eglMakeCurrent(egl_display, surface, surface, context);
-    if (make_current_status == 0) {
-        return error.EGLMakeCurrentError;
-    }
+    if (make_current_status == 0) return error.EGLMakeCurrentError;
 
     std.log.info("executing GL commands...", .{});
 

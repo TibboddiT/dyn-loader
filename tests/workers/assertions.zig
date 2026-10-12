@@ -1,3 +1,7 @@
+//! Static worker for one ELF/lifecycle assertion per process. Catalog mode can
+//! run without fixtures, or validate SDK fixtures before reporting readiness.
+//! IDs index the ELF catalog followed by the lifecycle catalog in that order.
+
 const std = @import("std");
 
 const dll = @import("dll");

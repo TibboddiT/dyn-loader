@@ -28,9 +28,7 @@ pub const Swapchain = struct {
     pub fn initRecycle(gc: *const GraphicsContext, allocator: Allocator, extent: vk.Extent2D, old_handle: vk.SwapchainKHR) !Swapchain {
         const caps = try gc.instance.getPhysicalDeviceSurfaceCapabilitiesKHR(gc.pdev, gc.surface);
         const actual_extent = findActualExtent(caps, extent);
-        if (actual_extent.width == 0 or actual_extent.height == 0) {
-            return error.InvalidSurfaceDimensions;
-        }
+        if (actual_extent.width == 0 or actual_extent.height == 0) return error.InvalidSurfaceDimensions;
 
         const surface_format = try findSurfaceFormat(gc, allocator);
         const present_mode = try findPresentMode(gc, allocator);
@@ -86,9 +84,7 @@ pub const Swapchain = struct {
         // if we error even for .suboptimal_khr the example will crash and segfault
         // on resize, since even the recreated swapchain can be suboptimal during a
         // resize.
-        if (result.result == .not_ready or result.result == .timeout) {
-            return error.ImageAcquireFailed;
-        }
+        if (result.result == .not_ready or result.result == .timeout) return error.ImageAcquireFailed;
 
         std.mem.swap(vk.Semaphore, &swap_images[result.image_index].image_acquired, &next_image_acquired);
         return Swapchain{
@@ -304,9 +300,7 @@ fn findSurfaceFormat(gc: *const GraphicsContext, allocator: Allocator) !vk.Surfa
     defer allocator.free(surface_formats);
 
     for (surface_formats) |sfmt| {
-        if (std.meta.eql(sfmt, preferred)) {
-            return preferred;
-        }
+        if (std.meta.eql(sfmt, preferred)) return preferred;
     }
 
     return surface_formats[0]; // There must always be at least one supported surface format

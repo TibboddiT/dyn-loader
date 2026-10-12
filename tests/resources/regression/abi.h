@@ -1,5 +1,7 @@
 #ifndef DYNLOADER_REGRESSION_ABI_H
 #define DYNLOADER_REGRESSION_ABI_H
+/* Shared with `abi.zig`: fixed-width, caller-owned snapshots. They deliberately
+ * expose observed state instead of the loader's private object representation. */
 #include <stdint.h>
 
 struct LibraryState {

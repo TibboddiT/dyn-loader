@@ -1,3 +1,6 @@
+//! C layouts from `abi.h`. Records cross native function calls and remain owned
+//! by the Zig test; finalization records must outlive every handle using them.
+
 pub const LibraryState = extern struct {
     initialized_global: u32,
     zeroed_global: u32,

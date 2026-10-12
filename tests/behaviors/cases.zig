@@ -1,3 +1,7 @@
+//! Lifecycle scenarios share observable C structs with the regression fixtures.
+//! Expected values are independent of loader internals: constructors initialize
+//! once per load, mutations survive extra references, and reload starts fresh.
+
 const runner = @import("lifecycle_runner");
 const LibraryState = @import("regression_abi").LibraryState;
 

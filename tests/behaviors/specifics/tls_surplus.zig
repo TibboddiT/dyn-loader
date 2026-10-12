@@ -1,3 +1,7 @@
+//! Exhausted static TLS surplus must reject a load without changing live host
+//! TLS or the template used for subsequent workers. Repeating the rejected load
+//! also checks that failure does not consume the remaining capacity.
+
 const std = @import("std");
 
 const dll = @import("dll");

@@ -44,7 +44,7 @@ pub fn main(init: std.process.Init) !void {
     const args = init.minimal.args;
     const environ = init.minimal.environ;
 
-    try dll.init(.{ .allocator = allocator, .io = io, .args = args, .environ = environ, .log_level = .info });
+    try dll.init(.{ .allocator = allocator, .io = io, .args = args, .environ = environ });
     defer dll.deinit();
 
     std.log.info("loading 'libgstreamer-1.0.so.0'...", .{});

@@ -1,3 +1,7 @@
+//! Typed access to the C bridge used by lifecycle tests. Calls originate inside
+//! a loaded DSO, exercising substituted `dlopen`/pthread entry points and caller
+//! scope handling rather than only the Zig-facing loader API.
+
 const std = @import("std");
 
 const dll = @import("dll");
@@ -18,6 +22,8 @@ pub const SpecificContext = struct {
 
 const ThreadRoutine = *const fn (argument: ?*anyopaque) callconv(.c) *anyopaque;
 
+/// Borrowed function pointers, valid until loader teardown. Opened native handles
+/// are separate references and must be closed after all borrowed symbols are used.
 pub const Bridge = struct {
     openLibrary: *const fn (path: [*:0]const u8) callconv(.c) ?*anyopaque,
     resolveSymbol: *const fn (handle: *anyopaque, name: [*:0]const u8) callconv(.c) ?*anyopaque,

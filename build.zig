@@ -18,9 +18,15 @@ pub fn build(b: *std.Build) void {
     const use_llvm = b.option(bool, "llvm", "Use LLVM and LLD for loader hosts");
 
     const dll_mod = b.addModule("dll", .{
-        .root_source_file = b.path("src/dynamic_library_loader.zig"),
+        .root_source_file = b.path("src/dll.zig"),
         .target = target,
         .optimize = optimize,
+    });
+
+    const dll_tests = b.addTest(.{
+        .root_module = dll_mod,
+        .use_llvm = use_llvm,
+        .use_lld = use_llvm,
     });
 
     const resources_dir = b.addInstallDirectory(.{
@@ -29,9 +35,14 @@ pub fn build(b: *std.Build) void {
         .install_subdir = "resources",
     });
 
-    const check_step = b.step("check", "Check");
+    const run_dll_tests = b.addRunArtifact(dll_tests);
 
-    addTestMatrix(b, check_step, dll_mod, target, optimize, use_llvm);
+    const test_step = b.step("test", "Run module tests");
+    test_step.dependOn(&run_dll_tests.step);
+
+    const check_step = b.step("check", "Check that everything compiles");
+
+    addTestMatrix(b, check_step, &run_dll_tests.step, dll_mod, target, optimize, use_llvm);
 
     const examples = [_]Example{
         .{ .source_path = "examples/load_lib.zig" },
@@ -111,7 +122,7 @@ fn addExample(
     check_step.dependOn(&check.step);
 }
 
-fn addTestMatrix(b: *std.Build, check_step: *std.Build.Step, dll_mod: *std.Build.Module, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, use_llvm: ?bool) void {
+fn addTestMatrix(b: *std.Build, check_step: *std.Build.Step, dll_tests_step: *std.Build.Step, dll_mod: *std.Build.Module, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, use_llvm: ?bool) void {
     const regression_abi = b.createModule(.{
         .root_source_file = b.path("tests/resources/regression/abi.zig"),
         .target = target,
@@ -221,6 +232,8 @@ fn addTestMatrix(b: *std.Build, check_step: *std.Build.Step, dll_mod: *std.Build
     const unit_tests = b.addTest(.{ .root_module = matrix_module });
     const run_unit_tests = b.addRunArtifact(unit_tests);
     run_matrix.step.dependOn(&run_unit_tests.step);
+
+    run_matrix.step.dependOn(dll_tests_step);
 
     const run_matrix_step = b.step("run-tests_matrix", "Run ELF, lifecycle, and libc tests (uses docker)");
     run_matrix_step.dependOn(&run_matrix.step);

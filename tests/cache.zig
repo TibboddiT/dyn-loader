@@ -1,3 +1,7 @@
+//! Schemas for persisted fixture preparation. An obsolete version is a cache miss;
+//! a malformed record claiming the current version is an error. Validators use
+//! the caller's arena for temporary typed views and preserve allocation failures.
+
 const std = @import("std");
 
 const json = @import("json.zig");
@@ -60,6 +64,9 @@ const AssertionsPrepared = struct {
     fixture_origin: []const u8,
 };
 
+/// Returns the original borrowed tree or JSON null for a version mismatch.
+/// Schema validity alone does not establish artifact freshness; the matrix also
+/// checks input keys, image identities, archives, and individual fixture hashes.
 pub fn preparedForReuse(allocator: std.mem.Allocator, value: json.Value) !json.Value {
     if (json.asInteger(json.field(value, "schema_version")) != prepared_version) return .null;
 

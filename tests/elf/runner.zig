@@ -1,3 +1,7 @@
+//! Applies bounded mutations to SDK-built ELF fixtures, then tests the loader's
+//! public API. The source fixtures stay read-only; each case writes its own copy
+//! to the container's executable temporary directory before loading it.
+
 const std = @import("std");
 const elf = std.elf;
 
@@ -193,6 +197,9 @@ pub fn runCase(init: std.process.Init, cases: []const Case, name: []const u8, re
     try case.expect.checkLoad(mutated_path);
 }
 
+/// Mutable borrowed file view. All pointers into headers/tables share `bytes`'
+/// lifetime. Translation uses program headers so non-identity layouts exercise
+/// file-coordinate checks independently of the loader's own implementation.
 const ElfImage = struct {
     bytes: []u8,
     header: *align(1) elf.Elf64_Ehdr,
@@ -352,10 +359,14 @@ const ElfImage = struct {
         return error.MissingReferenceRelocation;
     }
 
+    /// Assumes the original fixture layout was checked. Mutations deliberately
+    /// invalidate that layout, so later code must not revalidate before loading.
     fn mutate(image: ElfImage, mutation: Mutation) !void {
         switch (mutation) {
             .none => {},
             .tag_value => |value| (try image.tag(value.tag)).d_val = value.value,
+            // Use a harmless ignored tag, not `DT_NULL`, which would hide all
+            // following entries and test a different failure condition.
             .remove_tag => |value| (try image.tag(value)).d_tag = elf.DT_DEBUG,
             .rela_file_end => |distance_from_end_bytes| {
                 const segment = try image.bssSegment();
@@ -363,7 +374,9 @@ const ElfImage = struct {
             },
             .rela_type => |value| {
                 (try image.relativeRelocation()).r_info = value;
-                if (try image.findTag(elf.DT_RELACOUNT)) |count| count.d_val = 0;
+                if (try image.findTag(elf.DT_RELACOUNT)) |count| {
+                    count.d_val = 0;
+                }
             },
             .rela_symbol => |value| {
                 const entry = try image.relativeRelocation();
@@ -374,7 +387,9 @@ const ElfImage = struct {
                 const entry = try image.relativeRelocation();
                 entry.r_info = @backingInt(elf.R_X86_64.IRELATIVE);
                 entry.r_addend = @intCast((try image.bssSegment()).vaddr);
-                if (try image.findTag(elf.DT_RELACOUNT)) |count| count.d_val = 0;
+                if (try image.findTag(elf.DT_RELACOUNT)) |count| {
+                    count.d_val = 0;
+                }
             },
             .ordinary_rel => (try image.tag(elf.DT_RELA)).d_tag = elf.DT_REL,
             .dynamic_unterminated => {
@@ -387,6 +402,8 @@ const ElfImage = struct {
             .dynamic_address => (try image.dynamicHeader()).vaddr += 8,
             .phdr_outside => image.header.e_phoff = std.math.maxInt(u64) - 15,
             .dynamic_first => {
+                // Reorder headers without changing their contents. Dynamic
+                // address translation must work before iteration reaches LOAD.
                 const headers = try image.programHeaders();
 
                 const dynamic_index = for (headers, 0..) |header, index| {

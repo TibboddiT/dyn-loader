@@ -1,3 +1,6 @@
+/* Native-linker reference for the same probe and event protocol as the Zig host.
+ * Cases run in separate processes; stage events are flushed before native calls
+ * so a crash still identifies the last completed setup phase. */
 #include "probe_api.h"
 #include <dlfcn.h>
 #include <stdio.h>
@@ -6,7 +9,9 @@
 #include <unistd.h>
 
 static _Thread_local uint32_t host_tls = 17;
-struct CallbackContext { unsigned calls; };
+struct CallbackContext {
+    unsigned calls;
+};
 
 static uint32_t hostCallback(void *argument, uint32_t value) {
     struct CallbackContext *context = argument;
@@ -30,10 +35,12 @@ static void printJsonString(const char *value) {
     }
     putchar('"');
 }
+
 static void emitStage(const char *name) {
     printf("{\"event\":\"stage\",\"stage\":\"%s\"}\n", name);
     fflush(stdout);
 }
+
 static void fail(const char *name, const char *message) {
     printf("{\"event\":\"error\",\"stage\":\"%s\",\"message\":", name);
     printJsonString(message);
@@ -49,9 +56,11 @@ static void fail(const char *name, const char *message) {
 int main(int argc, char **argv) {
     if (argc != 3) fail("arguments", "usage: reference LIBRARY --list|CASE_ID");
     host_tls = 41;
+
     emitStage("load");
     void *library = dlopen(argv[1], RTLD_NOW | RTLD_LOCAL);
     if (!library) fail("load", dlerror());
+
     emitStage("abi");
     typedef uint32_t (*ReadU32)(void);
     typedef int (*DescribeCase)(uint32_t, struct probe_case_info *);
@@ -63,11 +72,13 @@ int main(int argc, char **argv) {
     RESOLVE(ReadU32, probe_host_api_size);
     RESOLVE(DescribeCase, probe_describe);
     RESOLVE(RunCase, probe_run);
+
     if (probe_abi_version() != PROBE_ABI_VERSION || probe_result_size() != sizeof(struct probe_result) ||
         probe_case_info_size() != sizeof(struct probe_case_info) || probe_host_api_size() != sizeof(struct probe_host_api)) {
         fail("abi", "ABI layout/version mismatch");
     }
     uint32_t case_count = probe_case_count();
+
     if (strcmp(argv[2], "--list") == 0) {
         FILE *maps = fopen("/proc/self/maps", "r");
         if (maps) {
@@ -91,9 +102,11 @@ int main(int argc, char **argv) {
         fflush(stdout);
         _exit(0);
     }
+
     char *parse_end;
     unsigned long case_id = strtoul(argv[2], &parse_end, 10);
     if (!argv[2][0] || *parse_end || case_id >= case_count) fail("arguments", "invalid case ID");
+
     struct CallbackContext context = {0};
     struct probe_host_api host = {
         .abi_version = PROBE_ABI_VERSION,
@@ -104,10 +117,12 @@ int main(int argc, char **argv) {
     struct probe_result result = {.struct_size = sizeof result};
     emitStage("run");
     if (probe_run((uint32_t)case_id, &host, &result) != 0) fail("abi", "probe_run failed");
+
     const unsigned long host_callback_case_id = 10;
     if (host_tls != 41 || (case_id == host_callback_case_id && context.calls != 1)) {
         fail("run", "host TLS/callback validation failed");
     }
+
     printf("{\"event\":\"result\",\"id\":%lu,\"status\":%u,\"line\":%u,\"saved_errno\":%d,"
            "\"expected\":%lld,\"observed\":%lld,\"detail\":", case_id, result.status, result.line, result.saved_errno,
            (long long)result.expected, (long long)result.observed);

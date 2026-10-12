@@ -1,3 +1,5 @@
+// Adjacent pointer initializers give the linker a RELR address plus bitmap.
+// Fixture validation checks the emitted table rather than assuming flag support.
 static int state = 21;
 // The overflow test needs a writable segment with BSS after its file data.
 char relr_bss[16];

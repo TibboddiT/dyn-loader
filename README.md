@@ -6,7 +6,7 @@ Loading system dynamic libraries from non libc static executables.
 
 All executable artifacts produced by the included examples are static executables that load dynamic libraries without using libc's `dlopen`.
 
-*Warning: prototype quality: can contain bugs, lots of TODOs remaining.*
+*Warning: can contain bugs, lots of TODOs remaining.*
 
 See [this thread](https://ziggit.dev/t/dynamic-linking-without-libc-adventures) for further information.
 
@@ -66,8 +66,8 @@ pub fn main(init: std.process.Init) !void {
 ## Current known limitations
 
 - Initializing the loader and loading libraries should be done before starting any thread.
-- Dirty tricks are used to accommodate patched libc versions from various distros.
-- Some libc functions that need to be implemented in zig are not yet implemented.
+- Dirty tricks are used to manually initialize the supported libc (glibc and musl).
+- Some libc functions that need to be implemented in Zig are not yet implemented.
 
 ## How it works
 
@@ -85,7 +85,7 @@ Here is a simplified overview of what is done when loading a dynamic library:
   - libc-specific patches are applied if needed
   - TLS offsets are computed
   - "normal" relocations are processed
-    - dl, malloc, and thread functions are "redirected" to zig code
+    - dl, malloc, and thread functions are "redirected" to Zig code
   - TLS is set up
   - `IRELATIVE` relocations are processed
 - then for each newly loaded library:
@@ -128,7 +128,7 @@ The following example will intentionally trigger a segfault to demonstrate stack
 zig build run-segfault
 ```
 
-The following example will only work on glibc-based systems (because it uses libraries compiled against glibc):
+The following example will only work on glibc-based systems (because it uses provided libraries compiled against glibc):
 
 ```sh
 zig build run-raylib

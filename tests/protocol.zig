@@ -1,3 +1,8 @@
+//! Classifies newline-delimited worker events together with process termination.
+//! A result event alone cannot establish success: case identity, event counts,
+//! exit status, and unavailable reasons must agree. Returned text and trees use
+//! the caller's arena, including allocations from ignored diagnostic lines.
+
 const std = @import("std");
 
 const json = @import("json.zig");
@@ -76,10 +81,21 @@ pub fn assertion(status: Status) Comparison {
         .pass => .pass,
         .unavailable => .unavailable,
         .not_run => .blocked,
-        else => .assertion_failure,
+        .failure,
+        .load_failure,
+        .abi_failure,
+        .crash,
+        .timeout,
+        .resource_limit,
+        .infrastructure_failure,
+        .protocol_failure,
+        .not_applicable,
+        => .assertion_failure,
     };
 }
 
+/// A compatibility gap requires a passing native reference. Reference failure
+/// prevents attributing the result to the loader, even if both workers fail alike.
 pub fn compare(reference: Status, loader: Status) Comparison {
     if (reference == .unavailable) return .unavailable;
     if (reference != .pass) return .reference_failure;
@@ -88,6 +104,8 @@ pub fn compare(reference: Status, loader: Status) Comparison {
     return if (loader == .pass) .pass else .compatibility_gap;
 }
 
+/// `case_id = null` requests catalog validation. Otherwise require exactly one
+/// result for that ID. Timeout/crash takes priority over previously emitted success.
 pub fn classify(
     allocator: std.mem.Allocator,
     exit_code: i64,
