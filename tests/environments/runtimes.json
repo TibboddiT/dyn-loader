@@ -17,6 +17,19 @@
       "sdk_args": {"SUITE": "bullseye", "SNAPSHOT": "20261007T000000Z"}
     },
     {
+      "id": "ubuntu2204-glibc235",
+      "distribution": "Ubuntu 22.04 (jammy)",
+      "libc_family": "glibc",
+      "libc_version": "2.35",
+      "package_version": "2.35-0ubuntu3.15",
+      "image": "ubuntu@sha256:5ec03bb3441e8b0bf3b4f9cd4629a1ae763010dc3035bb8da3ae6cf026486401",
+      "discovery_tag": "ubuntu:22.04",
+      "libc_path": "/lib/x86_64-linux-gnu/libc.so.6",
+      "loader_path": "/lib64/ld-linux-x86-64.so.2",
+      "sdk_recipe": "ubuntu",
+      "sdk_args": {"SUITE": "jammy", "SNAPSHOT": "20261007T000000Z"}
+    },
+    {
       "id": "debian12-glibc236",
       "distribution": "Debian 12 (bookworm)",
       "libc_family": "glibc",

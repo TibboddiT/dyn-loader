@@ -715,19 +715,32 @@ fn analyzeGlibc(allocator: std.mem.Allocator, object: *DynObject, code: CodeView
         .thread_self_offsets = &.{ 0, 16 },
         .external_exit_context = object,
         .validateExternalExit = &validateColdExit,
-        .borrowsStackArguments = &borrowsStackArguments,
+        .borrowStackArgument = &borrowStackArgument,
         .preserve_syscall_arguments = true,
     };
+
+    try setGlibcNoReturnTargets(object, code, &options, false);
+
+    return InstructionFlow.initWithOptions(allocator, code, options) catch |err| {
+        logger.err("glibc inspection failed for ELF code 0x{x}, {d} bytes: {s}", .{ code.address, code.bytes.len, @errorName(err) });
+        return err;
+    };
+}
+
+fn setGlibcNoReturnTargets(object: *DynObject, code: CodeView, options: *InstructionFlow.Options, inspect_private_helpers: bool) !void {
     var count: usize = 0;
     var offset: usize = 0;
 
     // Identify terminal PLT calls before following control flow. In particular,
     // the private legacy callback ends an assertion path with `__assert_fail`,
     // followed in memory by a different function, not a return instruction.
+    // Snapshot windows also need private fatal helpers used by newer glibc.
     while (offset < code.bytes.len) {
         const instruction = InstructionFlow.decode(code, offset) catch break;
         if (instruction.op == .call and instruction.target != null) {
-            if (try callsSymbol(object, instruction.target.?, "__assert_fail") or try callsSymbol(object, instruction.target.?, "__stack_chk_fail")) {
+            if (try callsSymbol(object, instruction.target.?, "__assert_fail") or try callsSymbol(object, instruction.target.?, "__stack_chk_fail") or
+                (inspect_private_helpers and try terminalPath(object, instruction.target.?, 2)))
+            {
                 if (std.mem.indexOfScalar(?usize, &options.noreturn_targets, instruction.target) == null) {
                     if (count == options.noreturn_targets.len) return error.InstructionAnalysisLimit;
                     options.noreturn_targets[count] = instruction.target;
@@ -737,11 +750,6 @@ fn analyzeGlibc(allocator: std.mem.Allocator, object: *DynObject, code: CodeView
         }
         offset = instruction.end;
     }
-
-    return InstructionFlow.initWithOptions(allocator, code, options) catch |err| {
-        logger.err("glibc inspection failed for ELF code 0x{x}, {d} bytes: {s}", .{ code.address, code.bytes.len, @errorName(err) });
-        return err;
-    };
 }
 
 /// Accepts a direct symbol entry or a PLT stub for that symbol. All addresses
@@ -758,29 +766,41 @@ fn callsSymbol(object: *DynObject, target: usize, name: []const u8) !bool {
 
 /// GCC may put abort/assertion paths outside a function's exported symbol size.
 /// Follow those small blocks separately and authorize an external edge only if
-/// every explored path ends in a trap or a recognized non-returning call.
+/// no explored path returns (including traps, fatal calls, and closed cycles).
 fn terminalColdPath(object: *DynObject, entry: usize) !bool {
-    // Both sides of a conditional branch must terminate. The shared instruction
-    // budget also makes cycles fail without requiring a separate visited set.
+    return terminalPath(object, entry, 0);
+}
+
+/// Proves absence of a returning path, including bounded-depth private fatal
+/// helpers. Closed cycles cannot return; visited addresses avoid unfolding them.
+/// This also recognizes hidden assertion handlers without assuming their offsets.
+fn terminalPath(object: *DynObject, entry: usize, call_depth: u8) !bool {
     var pending: [32]usize = undefined;
     var count: usize = 1;
     pending[0] = entry;
-    var steps: usize = 0;
+    var visited: [256]usize = undefined;
+    var visited_count: usize = 0;
+
     while (count != 0) {
         count -= 1;
         var address = pending[count];
         while (true) {
-            steps += 1;
-            if (steps > 128) return false;
+            if (std.mem.indexOfScalar(usize, visited[0..visited_count], address) != null) break;
+            if (visited_count == visited.len) return false;
+
+            visited[visited_count] = address;
+            visited_count += 1;
+
             // Fifteen bytes is the architectural maximum instruction length.
-            const code = try CodeView.fromDynObject(object, address, 15);
+            const code = CodeView.fromDynObject(object, address, 15) catch return false;
             const instruction = InstructionFlow.decode(code, 0) catch return false;
             if (instruction.trap) break;
             if (instruction.op == .ret) return false;
             if (instruction.op == .call and instruction.target != null and
                 (try callsSymbol(object, instruction.target.?, "__assert_fail") or
                     try callsSymbol(object, instruction.target.?, "__stack_chk_fail") or
-                    try callsSymbol(object, instruction.target.?, "abort"))) break;
+                    try callsSymbol(object, instruction.target.?, "abort") or
+                    (call_depth != 0 and try terminalPath(object, instruction.target.?, call_depth - 1)))) break;
             if (instruction.op == .jump or instruction.op == .branch) {
                 const target = instruction.target orelse return false;
                 if (instruction.op == .jump) {
@@ -802,50 +822,73 @@ fn validateColdExit(context: *anyopaque, entry: usize) !bool {
 }
 
 /// The fork helpers read or write a caller-owned snapshot. Prove that its
-/// pointer is neither retained nor returned before allowing later private spills
-/// to survive unrelated native stores. Unknown pointer uses reject this proof;
+/// pointer is neither retained nor returned and bound writes through it before
+/// preserving unrelated private spills. Unknown pointer uses reject this proof;
 /// the analyzer then keeps its conservative escaped-frame behavior.
 /// The NSS snapshot contract is illustrated by these two helpers:
 /// https://github.com/bminor/glibc/blob/glibc-2.39/nss/nss_database.c#L505-L538
-fn borrowsStackArguments(context: *anyopaque, allocator: std.mem.Allocator, entry: usize, mask: u16) !bool {
-    if (mask != 1 << Register.rdi) return false; // Only the first ABI argument.
+fn borrowStackArgument(context: *anyopaque, allocator: std.mem.Allocator, entry: usize, argument_register: u4) !?usize {
+    if (argument_register != Register.rdi) return null;
     const object: *DynObject = @ptrCast(@alignCast(context));
-    const code = CodeView.fromDynObject(object, entry, 512) catch return false;
+    const code = CodeView.fromDynObject(object, entry, 512) catch return null;
     var options: InstructionFlow.Options = .{ .log_errors = false };
+    try setGlibcNoReturnTargets(object, code, &options, true);
+
     // A synthetic call origin stands for the caller's snapshot pointer. Negative
     // identity cannot collide with a real nonnegative call-site byte offset.
     options.initial_registers[Register.rdi] = .{ .kind = .call, .a = -1, .tainted = true };
     var flow = InstructionFlow.initWithOptions(allocator, code, options) catch |err| switch (err) {
         error.OutOfMemory => return err,
-        else => return false,
+        else => return null,
     };
     defer flow.deinit();
-    return borrowsFirstArgument(flow, object);
+
+    const write_size = try firstArgumentWriteSize(flow, object);
+    logger.debug("glibc.snapshot: helper_elf=0x{x} write_size={any}", .{ entry, write_size });
+    return write_size;
 }
 
 /// Checks a restricted helper body for use without pointer retention. Reads or
 /// writes of snapshot contents are allowed; publishing the snapshot's address,
 /// returning it, or passing it to an unknown callee is not. `object = null` lets
 /// fixtures run without native symbol lookup and disables lock-helper exceptions.
-fn borrowsFirstArgument(flow: InstructionFlow, object: ?*DynObject) !bool {
+/// Returns the exclusive upper bound of writes relative to the first argument,
+/// or null when either non-retention or the write extent cannot be proved.
+fn firstArgumentWriteSize(flow: InstructionFlow, object: ?*DynObject) !?usize {
     var argument_used = false;
+    var write_size: usize = 0;
     for (flow.nodes.items) |node| {
         if (!node.reached) continue;
 
         const instruction = node.instruction;
         const source = flow.value(node, instruction.src);
         const destination = flow.destination(node);
-        if (instruction.op == .ret and node.state.registers[Register.rax].tainted) return false;
-        if (instruction.op == .jump and (instruction.target == null or instruction.target.? < flow.code.address or instruction.target.? >= flow.code.address + flow.code.bytes.len)) return false;
-        if (instruction.op == .call or instruction.op == .syscall) {
+        if (node.state.registers[Register.rsp].tainted) return null;
+        if (instruction.op == .string_store) return null; // Implicit, potentially repeated writes.
+        if (instruction.op == .leave and node.state.registers[Register.rbp].tainted) return null;
+        if ((instruction.op == .divide or instruction.op == .multiply) and
+            (node.state.registers[Register.rax].tainted or node.state.registers[Register.rdx].tainted)) return null;
+        if (instruction.end == flow.code.bytes.len and instruction.op != .ret and instruction.op != .jump) return null;
+        if (instruction.op == .ret and node.state.registers[Register.rax].tainted) return null;
+
+        const tail_call = instruction.op == .jump and
+            (instruction.target == null or instruction.target.? < flow.code.address or instruction.target.? >= flow.code.address + flow.code.bytes.len);
+        if (instruction.op == .call or instruction.op == .syscall or tail_call) {
             // Include function argument registers and Linux's fourth syscall
             // argument (`R10`). Recognized one-argument lock helpers consume only
             // `RDI`; stale values in other volatile registers are not arguments.
             const one_argument_lock = object != null and instruction.target != null and
                 (try callsSymbol(object.?, instruction.target.?, "__lll_lock_wait_private") or try callsSymbol(object.?, instruction.target.?, "__lll_lock_wake_private"));
+            if (tail_call and !one_argument_lock) return null;
             for ([_]u4{ 7, 6, 2, 1, 8, 9, 10 }) |reg| {
                 if (one_argument_lock and reg != 7) continue;
-                if (node.state.registers[reg].tainted) return false;
+                if (node.state.registers[reg].tainted) return null;
+            }
+            if (!one_argument_lock) {
+                // An unknown callee may consume stack-passed arguments too.
+                for (node.state.slots) |slot| {
+                    if (slot.used and slot.value.tainted) return null;
+                }
             }
         }
 
@@ -853,34 +896,53 @@ fn borrowsFirstArgument(flow: InstructionFlow, object: ?*DynObject) !bool {
         // Scalar private spills are allowed; packed pointer stores are rejected
         // conservatively because this proof does not track their escape by lane.
         if (source.is(.call_field, -1)) argument_used = true;
-        if (source.tainted and instruction.dst == .memory and destination.kind != .stack) return false;
+        if (source.tainted and instruction.dst == .memory and destination.kind != .stack) return null;
+        if (instruction.dst == .memory and instruction.op != .compare and destination.kind == .unknown) return null;
         if (instruction.op == .vector_move and instruction.dst == .memory) {
             for (flow.sourceLanes(node)) |lane| {
-                if (lane.tainted) return false;
+                if (lane.tainted) return null;
             }
         }
-        if (source.tainted or flow.value(node, instruction.dst).tainted) {
-            if (instruction.op != .mov and instruction.op != .lea and instruction.op != .compare) return false;
-            if (instruction.op != .compare and instruction.width != 64) return false;
+
+        // Replacing a saved pointer does not use its previous value. In
+        // particular, epilogue pops restore callee-saved argument registers.
+        if (instruction.dst == .reg and instruction.width < 32 and node.state.registers[instruction.dst.reg].tainted) return null;
+        const reads_destination = instruction.op != .mov and instruction.op != .lea and instruction.op != .pop and instruction.op != .setcc;
+        if (source.tainted or (reads_destination and flow.value(node, instruction.dst).tainted)) {
+            if (instruction.op != .mov and instruction.op != .lea and instruction.op != .compare) return null;
+            if (instruction.op != .compare and instruction.width != 64) return null;
         }
-        if (instruction.op == .lea and instruction.src == .memory) {
-            const memory = instruction.src.memory;
+
+        // A join can leave a tainted but unknown base. Do not silently lose
+        // writes through that base, or through indexed/segment-relative aliases.
+        for ([_]InstructionFlow.Operand{ instruction.src, instruction.dst }) |operand| {
+            if (operand == .high and node.state.registers[operand.high].tainted) return null;
+            if (operand != .memory) continue;
+
+            const memory = operand.memory;
             if (memory.index) |reg| {
-                if (node.state.registers[reg].tainted) return false;
+                if (node.state.registers[reg].tainted) return null;
             }
             if (memory.base) |reg| {
                 const base = node.state.registers[reg];
-                if (base.tainted and (memory.index != null or (base.kind != .call and base.kind != .call_address))) return false;
+                if (base.tainted and (memory.index != null or memory.fs or memory.rip or
+                    (!base.is(.call, -1) and !base.is(.call_address, -1)))) return null;
             }
         }
+
         if (destination.is(.call_address, -1)) {
             // Accept only bounded, simple accesses to the snapshot. This limit
             // is a recognition constraint, not a discovered allocation size.
-            if (destination.b < 0 or destination.b > 256 or (instruction.op != .mov and instruction.op != .vector_move and instruction.op != .compare)) return false;
+            if (destination.b < 0 or destination.b > 256 or (instruction.op != .mov and instruction.op != .vector_move and instruction.op != .compare)) return null;
             argument_used = true;
+            if (instruction.op != .compare) {
+                const end = @as(usize, @intCast(destination.b)) + instruction.width / 8;
+                write_size = @max(write_size, end);
+            }
         }
     }
-    return argument_used;
+
+    return if (argument_used) write_size else null;
 }
 
 /// Finds the GOT slot containing a relocated global pointer. Its ELF address
@@ -1335,6 +1397,128 @@ test "snapshot borrowing proof rejects retained returned or obscured pointers" {
         options.initial_registers[7] = .{ .kind = .call, .a = -1, .tainted = true };
         var flow = try InstructionFlow.initWithOptions(std.testing.allocator, CodeView.fromBytes(case[0], 0), options);
         defer flow.deinit();
-        try std.testing.expectEqual(case[1], try borrowsFirstArgument(flow, null));
+        try std.testing.expectEqual(case[1], (try firstArgumentWriteSize(flow, null)) != null);
     }
+}
+
+test "snapshot borrowing bounds writes and preserves callee-saved pointer handling" {
+    // xor eax, eax
+    // ret
+    const finish = "\x31\xc0\xc3";
+    const Case = struct {
+        bytes: []const u8,
+        write_size: ?usize,
+    };
+    const cases = [_]Case{
+        // Reading contents does not write the buffer.
+        // mov rax, [rdi]
+        // ret
+        .{ .bytes = "\x48\x8b\x07\xc3", .write_size = 0 },
+        // push rbx
+        // mov rbx, rdi
+        // movups [rbx+16], xmm0
+        // pop rbx
+        // Followed by finish.
+        .{ .bytes = "\x53\x48\x89\xfb\x0f\x11\x43\x10\x5b" ++ finish, .write_size = 32 },
+        // je second
+        // mov byte ptr [rdi], 0
+        // ret
+        // second:
+        // mov byte ptr [rdi+31], 0
+        // ret
+        .{ .bytes = "\x74\x04\xc6\x07\x00\xc3\xc6\x47\x1f\x00\xc3", .write_size = 32 },
+        // Negative output offsets are not supported.
+        // mov byte ptr [rdi-1], 0
+        // Followed by finish.
+        .{ .bytes = "\xc6\x47\xff\x00" ++ finish, .write_size = null },
+        // An unknown index cannot bound the output.
+        // mov byte ptr [rdi+rax], 0
+        // Followed by finish.
+        .{ .bytes = "\xc6\x04\x07\x00" ++ finish, .write_size = null },
+        // Implicit output is not a bounded scalar/vector store.
+        // mov rax, [rdi]
+        // rep stosq
+        // Followed by finish.
+        .{ .bytes = "\x48\x8b\x07\xf3\x48\xab" ++ finish, .write_size = null },
+        // Upper pointer bits survive the partial overwrite.
+        // mov rax, [rdi]
+        // mov dil, 0
+        // Followed by finish.
+        .{ .bytes = "\x48\x8b\x07\x40\xc6\xc7\x00" ++ finish, .write_size = null },
+        // je store
+        // mov rdi, rsi
+        // store:
+        // mov byte ptr [rdi], 0
+        // Followed by finish.
+        .{ .bytes = "\x74\x03\x48\x89\xf7\xc6\x07\x00" ++ finish, .write_size = null },
+        // Writes through buffer contents cannot establish a bound relative to
+        // the buffer itself.
+        // mov rax, [rdi]
+        // mov byte ptr [rax], 0
+        // Followed by finish.
+        .{ .bytes = "\x48\x8b\x07\xc6\x00\x00" ++ finish, .write_size = null },
+        // mov byte ptr [rdi], 0
+        // jmp unknown external helper
+        .{ .bytes = "\xc6\x07\x00\xe9\x00\x01\x00\x00", .write_size = null },
+        // A truncated body does not prove what the remaining instructions do.
+        // mov byte ptr [rdi], 0
+        .{ .bytes = "\xc6\x07\x00", .write_size = null },
+    };
+
+    for (cases) |case| {
+        var options: InstructionFlow.Options = .{};
+        options.initial_registers[Register.rdi] = .{ .kind = .call, .a = -1, .tainted = true };
+        var flow = try InstructionFlow.initWithOptions(std.testing.allocator, CodeView.fromBytes(case.bytes, 0), options);
+        defer flow.deinit();
+
+        try std.testing.expectEqual(case.write_size, try firstArgumentWriteSize(flow, null));
+    }
+}
+
+test "private terminal helpers require every path to be non-returning within the depth bound" {
+    var bytes: [64]u8 = @splat(0x90);
+    // call 8
+    // ret
+    @memcpy(bytes[0..6], "\xe8\x03\x00\x00\x00\xc3");
+    // call 16
+    // ret
+    @memcpy(bytes[8..14], "\xe8\x03\x00\x00\x00\xc3");
+    // je 20
+    // ud2
+    // jmp 20
+    @memcpy(bytes[16..22], "\x74\x02\x0f\x0b\xeb\xfe");
+
+    var object = DynObject.init(.{ .ino = 0 }, "terminal-fixture", "");
+    defer object.segments.deinit(std.testing.allocator);
+    const flags: DynObject.LoadSegmentFlags = .{
+        .read = true,
+        .write = false,
+        .exec = true,
+        .mem_offset = 0,
+        .mem_size = bytes.len,
+    };
+    try object.segments.put(std.testing.allocator, 0, .{
+        .file_offset = 0,
+        .file_size = bytes.len,
+        .mem_offset = 0,
+        .mem_size = bytes.len,
+        .mem_align = 1,
+        .mapped_from_file = false,
+        .flags_first = flags,
+        .flags_last = flags,
+        .loaded_at = @intFromPtr(&bytes),
+    });
+
+    try std.testing.expect(try terminalPath(&object, 0, 2));
+    try std.testing.expect(!try terminalPath(&object, 0, 1));
+
+    // A returning conditional arm invalidates the whole proof.
+    // ret
+    bytes[20] = 0xc3;
+    try std.testing.expect(!try terminalPath(&object, 0, 2));
+
+    // Unknown destination.
+    // jmp rax
+    @memcpy(bytes[16..18], "\xff\xe0");
+    try std.testing.expect(!try terminalPath(&object, 0, 2));
 }

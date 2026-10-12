@@ -184,6 +184,7 @@ pub fn runCase(init: std.process.Init, cases: []const Case, name: []const u8, re
     defer init.gpa.free(mutated_path);
 
     try std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = mutated_path, .data = bytes });
+    defer std.Io.Dir.cwd().deleteFile(init.io, mutated_path) catch {};
 
     try dll.init(.{
         .allocator = init.gpa,

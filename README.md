@@ -143,6 +143,7 @@ Tested environments:
 | OS                                 | libc                       | Toolchain         |
 | ---                                | ---                        | ---               |
 | Debian 11 (bullseye)               | glibc 2.31                 | GCC 10.2.1        |
+| Ubuntu 22.04 (jammy)               | glibc 2.35                 | GCC 11.4.0        |
 | Debian 12 (bookworm)               | glibc 2.36                 | GCC 12.2.0        |
 | Debian testing (forky), 2026-10-07 | glibc 2.43                 | GCC 16.2.0        |
 | Arch Linux, 2026-10-07             | glibc 2.44                 | GCC 16.2.1        |

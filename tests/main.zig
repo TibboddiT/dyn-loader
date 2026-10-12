@@ -218,7 +218,7 @@ const Runtime = struct {
     // manifest fields such as `discovery_tag` remain in `metadata` for provenance;
     // they do not replace pinned image selection. Native paths refer to the image,
     // while SDK recipe paths are resolved inside the project.
-    const SdkRecipe = enum { debian, arch, alpine, chimera, nixos };
+    const SdkRecipe = enum { debian, ubuntu, arch, alpine, chimera, nixos };
     const LibcFamily = enum { glibc, musl };
 
     id: []const u8,
@@ -235,7 +235,7 @@ const Runtime = struct {
     fn buildsRuntime(runtime: Runtime) bool {
         return switch (runtime.sdk_recipe) {
             .chimera, .nixos => true,
-            .debian, .arch, .alpine => false,
+            .debian, .ubuntu, .arch, .alpine => false,
         };
     }
 
@@ -273,7 +273,7 @@ const Runtime = struct {
             .cpp_libraries = switch (sdk_recipe) {
                 .chimera => &.{ "libc++.so.1", "libc++abi.so.1", "libunwind.so.1" },
                 .nixos => &.{},
-                .debian, .arch, .alpine => &.{ "libstdc++.so.6", "libgcc_s.so.1" },
+                .debian, .ubuntu, .arch, .alpine => &.{ "libstdc++.so.6", "libgcc_s.so.1" },
             },
         };
     }
@@ -358,7 +358,7 @@ const Matrix = struct {
         }
 
         const packages = switch (runtime.sdk_recipe) {
-            .debian => try matrix.queryImage(image, &.{ "dpkg-query", "-W", "-f=${binary:Package}\t${Version}\n" }),
+            .debian, .ubuntu => try matrix.queryImage(image, &.{ "dpkg-query", "-W", "-f=${binary:Package}\t${Version}\n" }),
             .arch => try matrix.queryImage(image, &.{ "pacman", "-Q" }),
             .alpine, .chimera => try matrix.queryImage(image, &.{ "apk", "list", "--installed" }),
             .nixos => try matrix.queryImage(image, &.{ "sh", "-ec", "getconf GNU_LIBC_VERSION; nix-store -qR /opt/runtime" }),

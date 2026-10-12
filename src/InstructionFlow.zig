@@ -255,7 +255,7 @@ pub const State = struct {
         // An untracked spill cannot supply evidence later.
     }
 
-    fn invalidateStack(state: *State, offset: i64, size: u8) void {
+    fn invalidateStack(state: *State, offset: i64, size: usize) void {
         // A partial overwrite destroys the whole eight-byte fact. Widen the
         // interval arithmetic so extreme signed offsets cannot wrap the bounds.
         for (&state.slots) |*slot| {
@@ -288,16 +288,16 @@ pub const Options = struct {
     /// External conditional edges are rejected unless explicitly authorized.
     /// The validator is called only for reachable edges during construction.
     external_exits: [16]?usize = @splat(null),
-    /// Borrowed context shared by both callbacks; required when either is used.
+    /// Borrowed context shared by the callbacks; required when any is used.
     external_exit_context: ?*anyopaque = null,
     validateExternalExit: ?*const fn (context: *anyopaque, address: usize) anyerror!bool = null,
     /// Known entry values. Unknown entries leave defaults intact, including `RSP`.
     initial_registers: [16]Value = @splat(.{}),
-    /// A successful proof excludes retention, not writes through the argument.
-    /// Existing spills are still invalidated; later spills remain private.
-    /// Mask bits are register indices, not argument positions. For example,
-    /// the first System V argument (`RDI`) sets bit 7.
-    borrowsStackArguments: ?*const fn (context: *anyopaque, allocator: std.mem.Allocator, address: usize, argument_mask: u16) anyerror!bool = null,
+    /// Proves that a callee neither retains the sole stack argument nor writes to
+    /// the caller's frame outside [argument, argument + returned_size). Zero means read-only;
+    /// null means unproved. The register is an index, not an ABI argument number.
+    /// Calls with multiple stack arguments retain conservative invalidation.
+    borrowStackArgument: ?*const fn (context: *anyopaque, allocator: std.mem.Allocator, address: usize, argument_register: u4) anyerror!?usize = null,
     /// Retain the registers Linux preserves across `syscall`. The default drops
     /// volatile argument facts as well, to avoid attributing stale arguments to
     /// a subsequent call when no callee argument contract is available.
@@ -670,17 +670,21 @@ fn execute(self: Self, state: *State, instruction: Instruction) anyerror!void {
                 }
             }
 
-            var borrowed = false;
-            if (stack_arguments != 0 and instruction.target != null) {
-                if (self.options.borrowsStackArguments) |prove| {
-                    borrowed = try prove(self.options.external_exit_context.?, self.allocator, instruction.target.?, stack_arguments);
+            var write_size: ?usize = null;
+            if (@popCount(stack_arguments) == 1 and instruction.target != null) {
+                if (self.options.borrowStackArgument) |prove| {
+                    write_size = try prove(self.options.external_exit_context.?, self.allocator, instruction.target.?, @intCast(@ctz(stack_arguments)));
                 }
             }
-            if (stack_arguments != 0 and !borrowed) state.stack_exposed = true;
 
-            // Even a non-retaining callee can modify its output buffer.
-            if (stack_arguments != 0) state.slots = @splat(.{});
-            if (state.stack_exposed) state.slots = @splat(.{});
+            if (stack_arguments != 0 and write_size == null) state.stack_exposed = true;
+            if (state.stack_exposed) {
+                state.slots = @splat(.{});
+            } else if (write_size) |size| {
+                const reg: u4 = @intCast(@ctz(stack_arguments));
+                if (size != 0) state.invalidateStack(state.registers[reg].a, size);
+            }
+
             for (caller_saved_registers) |reg| {
                 state.registers[reg] = .{};
             }
@@ -1269,6 +1273,16 @@ fn allocationFailureProbe(allocator: std.mem.Allocator) !void {
     defer flow.deinit();
 }
 
+const StackBorrowFixture = struct {
+    write_size: ?usize,
+
+    fn prove(context: *anyopaque, _: std.mem.Allocator, _: usize, argument_register: u4) !?usize {
+        const fixture: *const StackBorrowFixture = @ptrCast(@alignCast(context));
+        try std.testing.expectEqual(Register.rdi, argument_register);
+        return fixture.write_size;
+    }
+};
+
 test "state merge detects unchanged facts and contained ranges" {
     var state: State = .{};
     state.registers[0] = .{ .kind = .range, .a = 2, .b = 3 };
@@ -1415,6 +1429,60 @@ test "stack spills preserve pointer provenance until an overlapping write" {
     var overwritten = try Self.init(std.testing.allocator, CodeView.fromBytes(prefix ++ "\xc6\x44\x24\x01\x00" ++ suffix, 0));
     defer overwritten.deinit();
     try std.testing.expectEqual(Value{}, overwritten.nodes.items[4].state.registers[3]);
+}
+
+test "bounded stack borrowing preserves only non-overlapping scalar and SIMD spills" {
+    // mov rax, fs:[0]
+    // movq xmm0, rax
+    // punpcklqdq xmm0, xmm0
+    // movups [rsp], xmm0
+    // mov [rsp+16], rax
+    // lea rdi, [rsp+8]
+    const prefix = "\x64\x48\x8b\x04\x25\x00\x00\x00\x00\x66\x48\x0f\x6e\xc0\x66\x0f\x6c\xc0" ++
+        "\x0f\x11\x04\x24\x48\x89\x44\x24\x10\x48\x8d\x7c\x24\x08";
+    // call helper
+    // movdqu xmm1, [rsp]
+    // mov rbx, [rsp+16]
+    // ret
+    const suffix = "\xe8\x00\x01\x00\x00\xf3\x0f\x6f\x0c\x24\x48\x8b\x5c\x24\x10\xc3";
+    const bytes = prefix ++ suffix;
+
+    for ([_]?usize{ 0, 1, 8, 9, 256, null }) |write_size| {
+        var fixture: StackBorrowFixture = .{ .write_size = write_size };
+        const options: Options = .{
+            .external_exit_context = &fixture,
+            .borrowStackArgument = &StackBorrowFixture.prove,
+        };
+        var flow = try Self.initWithOptions(std.testing.allocator, CodeView.fromBytes(bytes, 0), options);
+        defer flow.deinit();
+
+        const state = flow.nodes.items[flow.nodes.items.len - 1].state;
+        try std.testing.expectEqual(write_size != null, state.vectors[1][0].kind == .thread);
+        try std.testing.expectEqual(write_size != null and write_size.? == 0, state.vectors[1][1].kind == .thread);
+        try std.testing.expectEqual(write_size != null and write_size.? <= 8, state.registers[Register.rbx].kind == .thread);
+    }
+
+    // Publishing a frame pointer prevents a later bounded borrow from restoring
+    // privacy. Multiple stack arguments likewise remain outside this contract.
+    const unproved_uses = .{
+        // mov [rip], rdi
+        "\x48\x89\x3d\x00\x00\x00\x00",
+        // mov rsi, rsp
+        "\x48\x89\xe6",
+    };
+    inline for (unproved_uses) |use| {
+        var fixture: StackBorrowFixture = .{ .write_size = 0 };
+        var flow = try Self.initWithOptions(std.testing.allocator, CodeView.fromBytes(prefix ++ use ++ suffix, 0), .{
+            .external_exit_context = &fixture,
+            .borrowStackArgument = &StackBorrowFixture.prove,
+        });
+        defer flow.deinit();
+
+        const state = flow.nodes.items[flow.nodes.items.len - 1].state;
+        try std.testing.expect(state.stack_exposed);
+        try std.testing.expectEqual([2]Value{ .{}, .{} }, state.vectors[1]);
+        try std.testing.expectEqual(Value{}, state.registers[Register.rbx]);
+    }
 }
 
 test "instruction bytes embedded in an immediate are not decoded as instructions" {
