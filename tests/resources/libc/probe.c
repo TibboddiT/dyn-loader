@@ -9,6 +9,7 @@
 #include <fcntl.h>
 #include <iconv.h>
 #include <locale.h>
+#include <malloc.h>
 #include <mqueue.h>
 #include <pthread.h>
 #include <sched.h>
@@ -255,6 +256,79 @@ static void allocationLibcBuffer(const struct probe_host_api *host, struct probe
     EXPECT(result, buffer != NULL, 1);
     EXPECT(result, strcmp(buffer, "libc-created buffer"), 0);
     free(buffer);
+}
+
+static void allocationUsableSize(const struct probe_host_api *host, struct probe_result *result) {
+    UNUSED_HOST();
+    errno = EDOM;
+    size_t usable_size = malloc_usable_size(NULL);
+    int saved_errno = errno;
+    EXPECT(result, usable_size, 0);
+    EXPECT(result, saved_errno, EDOM);
+
+    const size_t sizes[] = {0, 1, 73, 4097};
+    for (size_t index = 0; index < sizeof sizes / sizeof sizes[0]; ++index) {
+        void *buffer = malloc(sizes[index]);
+        EXPECT(result, buffer != NULL, 1);
+        errno = ERANGE;
+        usable_size = malloc_usable_size(buffer);
+        saved_errno = errno;
+        free(buffer);
+        // Zero-size capacity and allocator rounding can differ between runtimes.
+        EXPECT(result, usable_size >= sizes[index], 1);
+        EXPECT(result, saved_errno, ERANGE);
+    }
+
+    void *buffers[4] = {calloc(19, 7), aligned_alloc(64, 320), NULL,
+                        strdup("libc-created buffer")};
+    EXPECT(result, posix_memalign(&buffers[2], 64, 257), 0);
+    const size_t minimum_sizes[] = {19 * 7, 320, 257, sizeof "libc-created buffer"};
+    for (size_t index = 0; index < sizeof buffers / sizeof buffers[0]; ++index) {
+        EXPECT(result, buffers[index] != NULL, 1);
+        errno = EDOM;
+        usable_size = malloc_usable_size(buffers[index]);
+        saved_errno = errno;
+        free(buffers[index]);
+        EXPECT(result, usable_size >= minimum_sizes[index], 1);
+        EXPECT(result, saved_errno, EDOM);
+    }
+
+    unsigned char *buffer = malloc(73);
+    EXPECT(result, buffer != NULL, 1);
+    memset(buffer, 0x5a, 73);
+    const size_t resized_sizes[] = {4097, 31};
+    for (size_t index = 0; index < sizeof resized_sizes / sizeof resized_sizes[0]; ++index) {
+        unsigned char *resized_buffer = realloc(buffer, resized_sizes[index]);
+        if (!resized_buffer) {
+            free(buffer);
+            EXPECT(result, resized_buffer != NULL, 1);
+        }
+        buffer = resized_buffer;
+        errno = ERANGE;
+        usable_size = malloc_usable_size(buffer);
+        saved_errno = errno;
+        EXPECT(result, usable_size >= resized_sizes[index], 1);
+        EXPECT(result, saved_errno, ERANGE);
+        for (size_t byte = 0; byte < 31; ++byte) EXPECT(result, buffer[byte], 0x5a);
+    }
+
+    const size_t previous_size = usable_size;
+    volatile size_t oversized = SIZE_MAX;
+    errno = 0;
+    void *failed_buffer = realloc(buffer, oversized);
+    saved_errno = errno;
+    if (failed_buffer) {
+        free(failed_buffer);
+        EXPECT(result, failed_buffer == NULL, 1);
+    }
+    EXPECT(result, saved_errno, ENOMEM);
+
+    usable_size = malloc_usable_size(buffer);
+    saved_errno = errno;
+    for (size_t byte = 0; byte < 31; ++byte) EXPECT(result, buffer[byte], 0x5a);
+    free(buffer);
+    EXPECT(result, usable_size, previous_size);
+    EXPECT(result, saved_errno, ENOMEM);
 }
 
 static _Thread_local int tls_initialized = 11;
@@ -1651,6 +1725,7 @@ static const struct {
     {"thread.key_fresh_workers", keyFreshWorkers},
     {"thread.key_worker_survives_load", keyWorkerSurvivesLoad},
     {"thread.stream_locking", workerStreamLocking},
+    {"allocation.usable_size", allocationUsableSize},
 };
 
 uint32_t probe_abi_version(void) { return PROBE_ABI_VERSION; }

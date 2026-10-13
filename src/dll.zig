@@ -3913,7 +3913,7 @@ const substitutes = std.StaticStringMap(*const anyopaque).initComptime([_]struct
     .{ "cfree", @ptrCast(&unsubstitutedTrap) },
     .{ "valloc", @ptrCast(&unsubstitutedTrap) },
     .{ "pvalloc", @ptrCast(&unsubstitutedTrap) },
-    .{ "malloc_usable_size", @ptrCast(&unsubstitutedTrap) },
+    .{ "malloc_usable_size", @ptrCast(&mallocUsableSizeSubstitute) },
 
     // Dynamic loading and TLS
     .{ "dlopen", @ptrCast(&dlopenSubstitute) },
@@ -4156,6 +4156,36 @@ fn freeSubstitute(p: ?*anyopaque) callconv(.c) void {
     }
 
     logger.debug("intercepted call: success: free(0x{x}) [{d} allocs remaining]", .{ @intFromPtr(p), state.extra_allocations.count() });
+}
+
+/// Reports only recorded backing storage; allocator-internal spare capacity is
+/// unknown. Non-null zero-size allocations have one byte of backing storage.
+fn mallocUsableSizeSubstitute(p: ?*anyopaque) callconv(.c) usize {
+    const errno_location = state.libc_runtime.?.getErrnoLocation();
+    const entry_errno = errno_location.*;
+    defer errno_location.* = entry_errno;
+
+    logger.debug("intercepted call: malloc_usable_size(0x{x})", .{@intFromPtr(p)});
+
+    var size: usize = 0;
+    if (p) |pointer| {
+        const allocation = lookup: {
+            state.alloc_mutex.lockUncancelable(state.io);
+            defer state.alloc_mutex.unlock(state.io);
+
+            break :lookup state.extra_allocations.get(@intFromPtr(pointer));
+        };
+
+        const tracked = allocation orelse {
+            logger.err("intercepted call: failed: malloc_usable_size(0x{x}): externally allocated memory", .{@intFromPtr(pointer)});
+            @panic("malloc_usable_size failed: externally allocated memory");
+        };
+        size = tracked.storage_size;
+    }
+
+    logger.debug("intercepted call: success: malloc_usable_size(0x{x}) = {d}", .{ @intFromPtr(p), size });
+
+    return size;
 }
 
 fn callocSubstitute(n: usize, size: usize) callconv(.c) ?*anyopaque {
