@@ -3,7 +3,7 @@ const std = @import("std");
 const Example = struct {
     source_path: []const u8,
     force_unstripped: bool = false,
-    optimize: ?std.builtin.OptimizeMode = null,
+    optimize: ?std.lang.Optimize = null,
 };
 
 pub fn build(b: *std.Build) void {
@@ -72,7 +72,7 @@ fn addExample(
     check_step: *std.Build.Step,
     dyn_loader_module: *std.Build.Module,
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
+    optimize: ?std.lang.Optimize,
     example: Example,
     use_llvm: ?bool,
 ) void {
@@ -122,7 +122,15 @@ fn addExample(
     check_step.dependOn(&check.step);
 }
 
-fn addTestMatrix(b: *std.Build, check_step: *std.Build.Step, dyn_loader_tests_step: *std.Build.Step, dyn_loader_mod: *std.Build.Module, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, use_llvm: ?bool) void {
+fn addTestMatrix(
+    b: *std.Build,
+    check_step: *std.Build.Step,
+    dyn_loader_tests_step: *std.Build.Step,
+    dyn_loader_mod: *std.Build.Module,
+    target: std.Build.ResolvedTarget,
+    optimize: ?std.lang.Optimize,
+    use_llvm: ?bool,
+) void {
     const regression_abi = b.createModule(.{
         .root_source_file = b.path("tests/resources/regression/abi.zig"),
         .target = target,

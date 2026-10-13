@@ -1,21 +1,6 @@
-//! Bounded integer dataflow for native code inspection on x86-64 Linux.
-//! The project uses a statically linked host and loads 64-bit ELF libraries.
-//! Native function calls follow the System V AMD64 ABI; `syscall` instructions
-//! use the separate Linux syscall convention. Pointers are 64 bits.
-//!
-//! Decode from instruction boundaries and merge facts at control-flow joins.
-//! Unknown reachable instructions reject inspection; unknown values cannot prove a fact.
-//! This is not an emulator. Calls preserve only ABI callee-saved register facts,
-//! and memory tracking is restricted to fixed stack slots and symbolic addresses.
-//!
-//! Construction first decodes reachable instructions, then propagates symbolic
-//! states along both sides of conditional branches. At a join, only compatible
-//! facts survive. Repeated propagation stops when no incoming state changes.
-//! Branch conditions are recorded for backend inspection, not used to select a
-//! path. A fact therefore describes the modeled paths, not one execution trace.
-//!
-//! The result owns its node array and borrows `CodeView` bytes and option context.
-//! Copies of the result share that allocation; only its owner calls `deinit`.
+//! Bounded x86-64 instruction decoding and symbolic dataflow analysis.
+//! Tracks register values and stack spills across control-flow paths.
+//! Rejects unsupported reachable instructions.
 
 const std = @import("std");
 
@@ -28,7 +13,8 @@ const Self = @This();
 // ------------------------------------------------
 
 /// Register indices use the x86 encoding order, including the REX extension bit.
-/// These names distinguish ABI-required registers from compiler-selected ones.
+/// Native calls use the System V AMD64 ABI; syscalls use the Linux convention.
+/// Pointers are 64 bits.
 pub const Register = struct {
     pub const rax: u4 = 0;
     pub const rcx: u4 = 1;
@@ -44,12 +30,8 @@ pub const Register = struct {
 const function_arguments = [_]u4{ Register.rdi, Register.rsi, Register.rdx, Register.rcx, 8, 9 };
 const caller_saved_registers = [_]u4{ Register.rax, Register.rcx, Register.rdx, Register.rsi, Register.rdi, 8, 9, 10, 11 };
 
-/// Symbolic values, not values read from the loaded process. `address` names an
-/// ELF virtual address; `global` means the contents of that address. `thread`
-/// originates at a configured `FS` self-pointer offset. `call` identifies one
-/// return value by call-site offset.
-/// Field values retain that origin, so two unrelated pointer registers cannot
-/// establish a descriptor copy merely because their offsets happen to match.
+/// Symbolic values with tracked origins. Equal field offsets do not imply
+/// related pointers. `thread` originates at a configured `FS` self-pointer offset.
 ///
 /// Payload convention (`load` below denotes a symbolic read, not a host read):
 /// - `unknown`: no usable value; `constant`: integer `a`; `range`: inclusive `[a,b]`.
@@ -63,8 +45,6 @@ const caller_saved_registers = [_]u4{ Register.rax, Register.rcx, Register.rdx, 
 /// - `call`: return from call-site byte offset `a`, with ELF target in `b`;
 ///   `call_address`: that return value plus `b`; `call_field`: contents there.
 ///
-/// For example, loading a GOT slot produces `global`, adding a structure offset
-/// produces `global_address`, and loading that field produces `global_field`.
 /// Unused payload fields stay zero because equality compares the whole value.
 pub const Value = struct {
     kind: enum {
@@ -90,8 +70,7 @@ pub const Value = struct {
     c: i64 = 0, // Second field in a sum, or displacement through a field's pointer.
     bias: i64 = 0, // Constant term in a sum of two fields.
     bits: u8 = 0, // Nonzero for a narrow field value; it cannot establish a full pointer.
-    // Marks a pointer whose escape the caller is checking. Losing its exact
-    // origin at a join must not make the pointer appear safe to retain elsewhere.
+    // Pointer escape remains possible even if a join loses the exact origin.
     tainted: bool = false,
 
     /// Tests only the kind and primary payload, not full symbolic equality.
@@ -200,10 +179,8 @@ pub const State = struct {
     slots: [32]Slot = @splat(.{}),
     stack_exposed: bool = false, // Sticky once an unproved callee/store can retain a frame pointer.
 
-    /// Merges incoming facts into state. Returns true if any fact or the
-    /// stack-exposure flag changes; false if state is unchanged.
-    /// Borrows incoming facts for this call. Every fact is merged even after a
-    /// change is detected; only further change-detection comparisons are skipped.
+    /// Merges all incoming facts into this state.
+    /// Returns `true` if any fact or the stack-exposure flag changes.
     fn merge(state: *State, incoming: *const State) bool {
         var changed = !state.stack_exposed and incoming.stack_exposed;
         state.stack_exposed = state.stack_exposed or incoming.stack_exposed;
@@ -293,12 +270,13 @@ pub const Options = struct {
     validateExternalExit: ?*const fn (context: *anyopaque, address: usize) anyerror!bool = null,
     /// Known entry values. Unknown entries leave defaults intact, including `RSP`.
     initial_registers: [16]Value = @splat(.{}),
-    /// Proves that a callee neither retains the sole stack argument nor writes to
-    /// the caller's frame outside [argument, argument + returned_size). Zero means read-only;
-    /// null means unproved. The register is an index, not an ABI argument number.
-    /// Calls with multiple stack arguments retain conservative invalidation.
+    /// Checks that a callee does not retain its sole stack argument or write
+    /// outside `[argument, argument + returned_size)` in the caller's frame.
+    /// Returns zero for read-only access and `null` when the check fails.
+    /// The register is an index, not an ABI argument number. Calls with multiple
+    /// stack arguments still invalidate private spill facts.
     borrowStackArgument: ?*const fn (context: *anyopaque, allocator: std.mem.Allocator, address: usize, argument_register: u4) anyerror!?usize = null,
-    /// Retain the registers Linux preserves across `syscall`. The default drops
+    /// Retains the registers Linux preserves across `syscall`. The default drops
     /// volatile argument facts as well, to avoid attributing stale arguments to
     /// a subsequent call when no callee argument contract is available.
     preserve_syscall_arguments: bool = false,
@@ -315,9 +293,10 @@ pub fn init(allocator: std.mem.Allocator, code: CodeView) !Self {
     return initWithOptions(allocator, code, .{});
 }
 
-/// Builds the complete analysis or frees partial allocations on failure. Limits
-/// bound code size, external exits, and propagation work; exceeding one rejects
-/// inspection rather than returning a partially converged result.
+/// Builds a complete analysis, freeing partial allocations on failure.
+/// Exceeding inspection limits returns an error, never a partial result.
+/// The result owns its node array and borrows `code` bytes and option context.
+/// Copies share the allocation; only its owner may call `deinit`.
 pub fn initWithOptions(allocator: std.mem.Allocator, code: CodeView, options: Options) !Self {
     logger.debug("instruction.analysis: code_elf=0x{x} size={d} action=begin log_errors={}", .{ code.address, code.bytes.len, options.log_errors });
     errdefer logger.debug("instruction.analysis: code_elf=0x{x} size={d} action=rejected", .{ code.address, code.bytes.len });
@@ -391,8 +370,8 @@ pub fn initWithOptions(allocator: std.mem.Allocator, code: CodeView, options: Op
         }
     }
 
-    // A first visit copies the predecessor state. Subsequent visits merge it;
-    // loops require another pass whenever any successor loses or gains a fact.
+    // Follow both sides of branches until states stop changing. Conditions are
+    // recorded, not evaluated. Only compatible facts survive a join.
     var changed = true;
     var iterations: usize = 0;
     while (changed) {
@@ -447,9 +426,9 @@ pub fn deinit(self: *Self) void {
     self.nodes.deinit(self.allocator);
 }
 
-/// Bounds a private helper without a symbol size. A return before a known
-/// forward branch target does not end the helper. The caller supplies a maximum
-/// readable window; an incomplete body is rejected rather than guessed.
+/// Finds the extent of a private helper without a symbol size.
+/// A return before a known forward branch target does not end the helper.
+/// The caller supplies the maximum readable window. Rejects incomplete bodies.
 pub fn functionPrefix(code: CodeView) !CodeView {
     var offset: usize = 0;
     var last_target: usize = 0;
@@ -547,9 +526,7 @@ fn address(self: Self, state: *const State, instruction: Instruction, memory: Me
 }
 
 fn read(self: Self, state: *const State, instruction: Instruction, operand: Operand) Value {
-    // Native memory reads retain a location's identity. Only private stack reads
-    // recover previously stored values; this analyzer does not dereference ELF
-    // addresses in the host process.
+    // Native reads are symbolic. Only private stack reads recover stored values.
     return switch (operand) {
         .none => .{},
         .reg => |reg| if (state.registers[reg].bits == 0 or state.registers[reg].bits == instruction.width) state.registers[reg] else .{},
@@ -632,8 +609,7 @@ fn execute(self: Self, state: *State, instruction: Instruction) anyerror!void {
             self.write(state, instruction, value_);
         },
         .sbb => {
-            // Carry is not tracked. Subtract-with-borrow therefore has two
-            // possible results, differing by one, when both inputs are known.
+            // Unknown carry gives two possible results, differing by one.
             const fits_range = dst.kind == .constant and src.kind == .constant and
                 @as(i128, dst.a) - src.a - 1 >= std.math.minInt(i64) and
                 @as(i128, dst.a) - src.a <= std.math.maxInt(i64);
@@ -775,8 +751,7 @@ fn execute(self: Self, state: *State, instruction: Instruction) anyerror!void {
             state.registers[Register.rsp] = .{ .kind = .stack, .a = stack_offset };
         },
         .divide, .multiply => {
-            // Backends inspect incoming operands. The quotient/product is not
-            // needed as evidence, so both implicit result registers are forgotten.
+            // Backends need the operands, not the quotient or product.
             state.registers[Register.rax] = .{};
             state.registers[Register.rdx] = .{};
         },
@@ -875,8 +850,8 @@ const Reader = struct {
         return self.bytes[self.cursor];
     }
 
-    /// Reads a signed little-endian operand. The decoder supplies widths from
-    /// the encoding (1, 2, 4, or 8 bytes); no other size is an internal valid call.
+    /// Reads a signed little-endian operand.
+    /// The decoder must supply a width of 1, 2, 4, or 8 bytes.
     fn integer(self: *Reader, size: usize) !i64 {
         if (size > self.bytes.len - self.cursor) return error.TruncatedInstruction;
         defer self.cursor += size;
@@ -891,9 +866,8 @@ const Reader = struct {
 };
 
 /// Decodes the integer and legacy SIMD forms used by the inspected functions.
-/// Selected packed integer operations retain two 64-bit lane facts; other known
-/// operations may only invalidate their destinations. Unsupported encodings fail
-/// instead of resynchronizing at an arbitrary byte that resembles an opcode.
+/// Tracks two 64-bit lanes for supported packed operations.
+/// Other known operations may only clobber destinations. Unsupported encodings fail.
 pub fn decode(code: CodeView, offset: usize) !Instruction {
     var r: Reader = .{ .bytes = code.bytes, .cursor = offset };
     var rex: u8 = 0;
@@ -904,9 +878,8 @@ pub fn decode(code: CodeView, offset: usize) !Instruction {
     var repeat: u8 = 0;
     var opcode = try r.byte();
 
-    // Prefixes affect operand width, register extension, address interpretation,
-    // and SIMD opcode selection. Here `short` records `0x66`; for SIMD that byte
-    // can select an instruction rather than request a 16-bit operand.
+    // `short` records `0x66`, which selects an opcode for some SIMD instructions
+    // rather than requesting a 16-bit operand.
     while (true) {
         switch (opcode) {
             0x40...0x4f => rex = opcode,
@@ -1184,9 +1157,8 @@ pub fn decode(code: CodeView, offset: usize) !Instruction {
                 if (opcode & 1 == 0) instruction.width = 8;
             },
             0xff => {
-                // Indirect calls can invalidate state without a known target.
-                // Indirect jumps decode here but control-flow construction
-                // rejects them because their successors cannot be enumerated.
+                // Indirect calls clobber state. Indirect jumps are rejected
+                // during flow construction because their successors are unknown.
                 instruction.op = switch (group) {
                     0 => .add,
                     1 => .sub,
@@ -1297,7 +1269,7 @@ test "state merge detects unchanged facts and contained ranges" {
     try std.testing.expectEqualDeep(before, state);
 }
 
-test "state merge updates every fact after detecting an early change" {
+test "state merge updates all facts after an early change" {
     var state: State = .{};
     state.registers[0] = .{ .kind = .constant, .a = 2 };
     state.registers[15] = .{ .kind = .address, .a = 0x1000 };
@@ -1326,7 +1298,7 @@ test "state merge updates every fact after detecting an early change" {
     try std.testing.expectEqualDeep(expected, state);
 }
 
-test "state merge stack exposure is a sticky change" {
+test "state merge preserves stack exposure" {
     var state: State = .{};
     try std.testing.expect(state.merge(&.{ .stack_exposed = true }));
     try std.testing.expect(state.stack_exposed);
@@ -1334,7 +1306,7 @@ test "state merge stack exposure is a sticky change" {
     try std.testing.expect(state.stack_exposed);
 }
 
-test "state merge detects changes confined to one fact category" {
+test "state merge detects changes in each fact category" {
     const Field = enum { register, vector, spill };
     for ([_]Field{ .register, .vector, .spill }) |field| {
         var state: State = .{};
@@ -1353,7 +1325,7 @@ test "state merge detects changes confined to one fact category" {
     }
 }
 
-test "main TSD assignment follows renamed registers, copies, and a lazy branch" {
+test "main TSD assignment follows register copies and lazy branching" {
     // mov rax, fs:[0]
     // test rax, rax
     // je assign
@@ -1373,7 +1345,7 @@ test "main TSD assignment follows renamed registers, copies, and a lazy branch" 
     try std.testing.expect(flow.value(store, store.instruction.src).is(.address, 0x1016));
 }
 
-test "an overwritten pointer cannot establish an assignment" {
+test "assignment rejects overwritten pointers" {
     // lea rbx, [rip]
     // xor ebx, ebx
     // mov [rax+128], rbx
@@ -1385,7 +1357,7 @@ test "an overwritten pointer cannot establish an assignment" {
     try std.testing.expect(!flow.value(store, store.instruction.src).is(.address, 7));
 }
 
-test "conflicting branch definitions do not become an address fact" {
+test "conflicting branches discard address facts" {
     // je alternate
     // lea rbx, [rip]
     // jmp assign
@@ -1485,7 +1457,7 @@ test "bounded stack borrowing preserves only non-overlapping scalar and SIMD spi
     }
 }
 
-test "instruction bytes embedded in an immediate are not decoded as instructions" {
+test "instruction decoding respects boundaries and rejects invalid encodings" {
     // mov rax, 0x1d8d48 (the immediate contains bytes resembling lea rbx, [rip])
     // ret
     const bytes = "\x48\xb8\x48\x8d\x1d\x00\x00\x00\x00\x00\xc3";
@@ -1506,7 +1478,7 @@ test "inspection allocation failures release partial state" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, allocationFailureProbe, .{});
 }
 
-test "a private helper includes forward branches beyond an early return" {
+test "private helper bounds include branches beyond an early return" {
     // je alternate
     // ret
     // alternate:
@@ -1521,7 +1493,7 @@ test "a private helper includes forward branches beyond an early return" {
     try std.testing.expectError(error.InvalidInstructionBranch, functionPrefix(CodeView.fromBytes("\x74\x7f\xc3", 0)));
 }
 
-test "syscall argument registers do not expose a private spill to a later call" {
+test "stale syscall arguments do not expose spills to later calls" {
     // Clang spills the parent thread pointer before the first-thread transition.
     // The signal-mask syscall reads another stack slot. Its stale `RSI` must
     // not be interpreted as an argument to the later no-argument native helper.
@@ -1583,7 +1555,7 @@ test "FS-relative RIP access is not the thread-pointer load" {
     try std.testing.expectEqual(Value{}, flow.nodes.items[1].state.registers[0]);
 }
 
-test "legacy high-byte operands invalidate their actual parent register" {
+test "high-byte writes invalidate the containing register" {
     // test ah, 8
     const instruction = try decode(CodeView.fromBytes("\xf6\xc4\x08", 0), 0);
     try std.testing.expectEqual(Operand{ .high = 0 }, instruction.dst);
@@ -1596,7 +1568,7 @@ test "legacy high-byte operands invalidate their actual parent register" {
     try std.testing.expectEqual(Value{}, flow.nodes.items[2].state.registers[0]);
 }
 
-test "glibc self pointer and hardware-preserved syscall registers are explicit" {
+test "inspection options preserve glibc self pointers across syscalls" {
     // mov rdx, fs:[16]
     // mov eax, 186
     // syscall
@@ -1655,7 +1627,7 @@ test "SIMD lane operations retain field origins and arithmetic bias" {
     }
 }
 
-test "packed pointer lanes survive spills and are replaced by zeroing" {
+test "packed pointer lanes survive spills but not zeroing" {
     // movq xmm5, r10
     // punpcklqdq xmm5, xmm5
     // movdqu [rsp], xmm5

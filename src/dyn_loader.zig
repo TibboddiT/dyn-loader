@@ -1,14 +1,5 @@
-//! Process-wide ELF loader for a statically linked x86-64 Linux host.
-//!
-//! This module owns object discovery, mappings, relocation, TLS, and native API
-//! substitution. `DynObject` holds object-local metadata; `libc` owns the native
-//! runtime contract. Registry indices identify objects across array reallocations,
-//! whereas pointers into the registry are temporary borrows.
-//!
-//! Loading has separate mapping, relocation, and initialization phases. Native
-//! resolvers and constructors can call back into the loader, so iteration orders
-//! are copied before invoking them. Lifecycle operations require caller-side
-//! serialization; the allocation and worker locks do not protect the whole loader.
+//! Process-wide ELF loader for statically linked x86-64 Linux hosts.
+//! Callers must serialize loader lifecycle operations.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -84,9 +75,8 @@ const InitOptions = struct {
 
 const DynObjectList = std.AutoArrayHashMapUnmanaged(DynObjectId, DynObject);
 
-/// Process-wide loader ownership. This value stays at a stable address: workers
-/// borrow `libc_runtime`, and the registries and mutexes must not be copied live.
-/// `init`/`deinit` update fields in place; `deinitialized` remains terminal.
+/// Process-wide state. Must remain at a stable address while active.
+/// Workers borrow `libc_runtime`. Teardown is terminal.
 const State = struct {
     // Lifecycle and borrowed host context.
     initialized: bool = false,
@@ -97,7 +87,8 @@ const State = struct {
     args: std.process.Args = undefined,
     environ: std.process.Environ = undefined,
 
-    // Object registry, load ordering, handles, and resolution caches.
+    // Object registry and lookup state.
+    // Indices survive array reallocations; pointers into the registry do not.
     dyn_objects: DynObjectList = .empty,
     dyn_objects_sorted_indices: std.ArrayList(usize) = .empty,
     dyn_objects_init_indices: std.ArrayList(usize) = .empty,
@@ -121,7 +112,8 @@ const State = struct {
     normal_current_tls_area_desc: ?ElfTlsRuntime.AreaDesc = null,
     loader_thread_pointer: usize = 0,
 
-    // Thread registry, retained thread allocations, and synchronization.
+    // Worker state.
+    // Worker and allocation locks do not serialize the loader lifecycle.
     thread_mutex: std.Io.Mutex = .init,
     thread_infos: ThreadInfosMap = .empty,
     thread_current_idx: usize = 1,
@@ -143,10 +135,9 @@ var state: State = .{};
 
 // TODO synchronize loader lifecycle, registry mutation, and lookup while allowing
 // constructor and resolver callbacks to reenter the loader.
-/// Initializes the singleton using borrowed host arguments, environment, and I/O.
-/// Call on the initial thread before loading libraries or starting workers. The
-/// allocator and host context must remain valid through `deinit`; reinitializing
-/// after teardown is unsupported.
+/// Initializes the loader on the initial thread, before loading or spawning.
+/// Borrows the host context and allocator through `deinit`.
+/// Reinitialization after teardown is unsupported.
 pub fn init(options: InitOptions) !void {
     if (state.deinitialized) return error.ReinitializationUnsupported;
     if (state.initialized) return error.AlreadyInitialized;
@@ -167,9 +158,9 @@ pub fn init(options: InitOptions) !void {
     logger.info("loader.init: action=ready log_level={t}", .{logger.level});
 }
 
-/// Runs finalizers before releasing mappings and runtime state. The caller must
-/// have joined all workers and stopped native calls; this does not join workers.
-/// Recursive teardown from a finalizer is ignored, and cleanup errors are logged.
+/// Runs finalizers, then releases mappings and runtime state.
+/// The caller must first join all workers and stop native calls.
+/// Ignores recursive teardown and logs cleanup errors.
 pub fn deinit() void {
     if (!state.initialized or state.deinitializing) return;
     logger.info("loader.deinit: action=begin objects={d} workers={d}", .{ state.dyn_objects.count(), state.thread_infos.count() });
@@ -287,9 +278,9 @@ pub fn deinit() void {
     logger.info("loader.deinit: action=complete", .{});
 }
 
-/// Searches for a supported ELF library without loading it. A successful path is
-/// allocated with the initialization allocator and must be freed by the caller.
-/// A missing candidate returns `null`; other errors remain errors.
+/// Searches for a supported ELF library without loading it.
+/// The caller must free the returned path with the initialization allocator.
+/// Returns `null` if no candidate is found and propagates other errors.
 pub fn resolve(name: []const u8) !?[]const u8 {
     if (!state.initialized) return error.Uninitialized;
 
@@ -299,8 +290,7 @@ pub fn resolve(name: []const u8) !?[]const u8 {
     };
 }
 
-/// Loads the first discoverable backend libc candidate. Once a path is found,
-/// incompatibility is reported by `load` rather than hidden by trying another ABI.
+/// Loads the first libc candidate found. Does not retry with another ABI on failure.
 pub fn loadSystemLibC() !DynamicLibrary {
     if (!state.initialized) return error.Uninitialized;
 
@@ -321,9 +311,9 @@ pub fn loadSystemLibC() !DynamicLibrary {
     return error.SystemLibcNotFound;
 }
 
-/// Loads a name or path, its dependencies, and required runtime state; returns
-/// after constructors finish. Failure attempts to release unreferenced objects, but native
-/// callback side effects and process-wide runtime initialization are not undone.
+/// Loads a library and its dependencies, returning after constructors finish.
+/// On failure, attempts to release unreferenced objects. Callback side effects and
+/// process-wide runtime initialization are not undone.
 pub fn load(f_path: []const u8) !DynamicLibrary {
     return loadWithRootResolveContext(f_path, null, null);
 }
@@ -413,8 +403,8 @@ fn appendLdExpansions(list: *std.ArrayList([]const u8), value: []const u8, origi
     }
 }
 
-/// Processes `LD_PRELOAD` once. Mark it processed before recursive `load` calls;
-/// a missing preload is diagnosed but does not abort the requested root load.
+/// Processes `LD_PRELOAD` once, marking it processed before recursive `load` calls.
+/// Reports missing preloads without aborting the requested root load.
 fn loadPreloads() void {
     if (state.preloads_processed) return;
     state.preloads_processed = true;
@@ -484,8 +474,7 @@ fn loadPreloads() void {
     }
 }
 
-// Keep this wrapper to log the exact error after the inner function's cleanup,
-// including failures from its initial guards.
+// Log every error after cleanup, including failures from the initial guards.
 fn loadWithRootResolveContext(f_path: []const u8, root_runpath: ?[]const u8, root_origin_dir: ?[]const u8) !DynamicLibrary {
     return loadWithRootResolveContextInner(f_path, root_runpath, root_origin_dir) catch |err| {
         logger.err("load: request={s} error={t}", .{ f_path, err });
@@ -540,8 +529,7 @@ fn loadWithRootResolveContextInner(f_path: []const u8, root_runpath: ?[]const u8
 
     logSummary("before_preparation", true);
 
-    // Snapshot indices rather than registry pointers: IFUNC resolvers may load
-    // another object and move the registry's backing array.
+    // IFUNC resolvers may grow the registry. Snapshot indices, not pointers.
     phase = "relocation_order";
     const relocation_order = try state.allocator.dupe(usize, state.dyn_objects_sorted_indices.items);
     defer state.allocator.free(relocation_order);
@@ -742,7 +730,7 @@ fn resolvePath(requested_path: []const u8, check_mode: bool, requester_name: ?[]
     }
 
     if (requester_name) |name| {
-        // Prefer the loader beside its requesting libc to avoid mixing a custom libc with the system loader.
+        // Keep a custom libc paired with its own loader.
         if (libc.searchBesideRequester(name, requested_path)) {
             if (origin_dir) |dir| {
                 const a_path = try std.fmt.bufPrint(&buf, "{s}/{s}", .{ dir, requested_path });
@@ -1000,8 +988,7 @@ fn elfDynamicEntries(bytes: []const u8, phdrs: []align(1) const std.elf.Elf64.Ph
 }
 
 fn appendRelaRelocations(relocs: *RelocList, entries: []align(1) const std.elf.Elf64_Rela, phdrs: []align(1) const std.elf.Elf64.Phdr, sym_count: usize) !void {
-    // Each table contributes at most one record per entry; NONE entries are
-    // skipped. Reserve once, including any records from earlier tables.
+    // Reserve for at most one record per entry, preserving earlier tables.
     try relocs.ensureUnusedCapacity(state.allocator, entries.len);
 
     for (entries) |entry| {
@@ -1074,8 +1061,8 @@ fn appendRelrTarget(relocs: *RelocList, phdrs: []align(1) const std.elf.Elf64.Ph
     try relocs.append(state.allocator, .{ .type = .RELATIVE, .is_relr = true, .sym_idx = 0, .offset = address, .addend = 0 });
 }
 
-/// Parses and maps one object when its dependencies are ready. A successful
-/// return can also denote a registered, deferred object with `mapped_at == 0`;
+/// Parses and maps one object when its dependencies are ready.
+/// May return successfully with `mapped_at == 0` if mapping is deferred.
 /// `loadDepTree` repeats the pass until all requested dependencies are mapped.
 fn loadDso(o_path: []const u8, root_runpath: ?[]const u8, root_origin_dir: ?[]const u8) !usize {
     const path: []const u8 = if (std.mem.findScalar(u8, o_path, '/') != null)
@@ -1835,8 +1822,7 @@ fn loadDso(o_path: []const u8, root_runpath: ?[]const u8, root_origin_dir: ?[]co
         };
     }
 
-    // Ownership has moved into the registry entry. Empty local containers so
-    // their error guards cannot release the same allocations a second time.
+    // Ownership moved to the registry. Prevent local error guards from freeing it.
     segments = .empty;
     dependencies = .empty;
     relocs = .empty;
@@ -2241,7 +2227,7 @@ const ElfTlsRuntime = struct {
         @disableInstrumentation();
 
         // This is only used for the main executable.
-        // Loaded libraries will use the `__tls_get_addr` substitute we provide
+        // Loaded libraries use the `__tls_get_addr` substitute.
         if (index.module != 1) @trap();
 
         const thread_pointer = asm ("movq %%fs:0, %[result]"
@@ -2252,8 +2238,8 @@ const ElfTlsRuntime = struct {
     }
 };
 
-/// Assigns a positive distance below TP for x86-64 variant-II TLS. Reuse a retired
-/// slot only when both its capacity and alignment satisfy the new object.
+/// Assigns a positive distance below TP for x86-64 variant-II TLS.
+/// Reuses a retired slot only if its capacity and alignment satisfy the new object.
 fn computeTcbOffset(dyn_object: *DynObject) void {
     logger.debug("computing tcb offset of library {s}", .{dyn_object.name});
 
@@ -2283,8 +2269,8 @@ fn computeTcbOffset(dyn_object: *DynObject) void {
 
 /// Adds TLS below the established thread pointer. The first load migrates host
 /// TLS; later loads consume reserved surplus so existing TP-relative pointers
-/// remain valid. Rebuild the template from original initializers, not live thread
-/// values, so new workers start with fresh TLS rather than another thread's state.
+/// remain valid. Rebuilds the template from original initializers so new workers
+/// start with fresh TLS rather than another thread's state.
 fn mapTlsBlock(dyn_object: *DynObject) !void {
     errdefer logger.err("tls.map: object={s} size={d} alignment={d} surplus={d} action=failed", .{ dyn_object.name, dyn_object.tls_init_mem_size, dyn_object.tls_align, state.current_surplus_size });
     logger.debug("mapping tls block of library {s}", .{dyn_object.name});
@@ -2645,7 +2631,7 @@ fn processRelocations(dyn_object: *DynObject) !void {
     var reloc_count: usize = 0;
 
     for (dyn_object.relocs.items) |reloc| {
-        if (reloc.type == .RELATIVE) continue; // applied by processRelativeRelocationsFast() after mapping
+        if (reloc.type == .RELATIVE) continue; // Applied by `processRelativeRelocationsFast` after mapping.
 
         logger.debug("reloc: object={s} type={t} target_elf=0x{x} symbol_index={d} addend={d}", .{ dyn_object.name, reloc.type, reloc.offset, reloc.sym_idx, reloc.addend });
         errdefer logger.err("reloc: object={s} type={t} target_elf=0x{x} symbol_index={d} action=failed", .{ dyn_object.name, reloc.type, reloc.offset, reloc.sym_idx });
@@ -2760,7 +2746,7 @@ fn processRelocations(dyn_object: *DynObject) !void {
             },
             .IRELATIVE => {
                 // R_X86_64_IRELATIVE: indirect relative (function pointer)
-                // Will be handled in a second pass
+                // Handled in a second pass.
                 continue;
             },
             else => {
@@ -2845,9 +2831,8 @@ fn processRelocations(dyn_object: *DynObject) !void {
     logger.debug("processed {d} relocations for {s}", .{ reloc_count, dyn_object.name });
 }
 
-/// Runs native resolvers only after ordinary relocation and TLS setup. Cache the
-/// returned address and retain any managed object containing the implementation,
-/// which need not be the object containing the resolver itself.
+/// Runs native resolvers after ordinary relocation and TLS setup.
+/// Caches results and retains their owners, which may differ from the resolver's.
 fn processIRelativeRelocations(dyn_object: *DynObject) !void {
     logger.debug("processing IRELATIVE relocations for {s}", .{dyn_object.name});
 
@@ -3332,9 +3317,9 @@ fn getResolvedSymbolByNameAndVersion(maybe_dyn_object: ?*DynObject, sym_name: []
     return error.UnresolvedSymbol;
 }
 
-/// Relocation lookup searches self and declared dependencies. Preserve whether
-/// the final address came from that scope or from a resolver/cache redirection;
-/// only the latter can require retaining a different implementation owner.
+/// A relocation binding from this object or its declared dependencies.
+/// Records whether a resolver or cache redirected the result. A redirected
+/// address may require retaining an owner outside the declared dependencies.
 const ResolvedBinding = struct {
     symbol: ResolvedSymbol,
     provenance: enum { declared_scope, redirected_address, unresolved_weak },
@@ -3659,10 +3644,9 @@ fn callFiniFunctions(dyn_obj: *DynObject) !void {
     }
 }
 
-/// Computes reachability from explicit references, pinned runtime objects, active
-/// finalization, and pending TLS destructors. Binding edges also retain objects
-/// selected by IFUNCs or preloads outside the declared dependency graph.
-/// Run all retiring finalizers before removing any of their mappings.
+/// Unloads objects unreachable through live references and dependency edges.
+/// Binding edges retain redirected implementations outside declared dependencies.
+/// Runs all retiring finalizers before removing any of their mappings.
 fn unloadUnreferencedObjects() !void {
     const keep = try state.allocator.alloc(bool, state.dyn_objects.count());
     defer state.allocator.free(keep);
@@ -3745,9 +3729,8 @@ fn unloadUnreferencedObjects() !void {
     if (fini_error) |err| return err;
 }
 
-/// Invalidates debug/cache/handle references before discarding mapped contents.
-/// Retain the address reservation and TLS capacity for a later compatible load;
-/// the epoch distinguishes that load from handles issued for this one.
+/// Invalidates references and discards mapped contents.
+/// Keeps the address reservation and TLS capacity for reuse under a new epoch.
 fn retireObject(idx: usize) !void {
     const dyn_object = &state.dyn_objects.values()[idx];
     logger.debug("unload.retire: object={s} object_index={d} epoch={d} action=begin", .{ dyn_object.name, idx, dyn_object.current_epoch });
@@ -3972,9 +3955,8 @@ const substitutes = std.StaticStringMap(*const anyopaque).initComptime([_]struct
     .{ "getaddrinfo_a", @ptrCast(&unsubstitutedTrap) },
 });
 
-/// Chooses a preload override, backend wrapper, or common host substitute. A
-/// preload's own lookup suppresses recursive override so it can reach the next
-/// implementation. `null` means to keep the resolved native address.
+/// Chooses a native symbol substitute. Returns `null` to keep the native address.
+/// A preload's own lookup skips recursive overrides to reach the next implementation.
 fn getSubstituteAddress(sym: ResolvedSymbol, for_obj: *DynObject, allow_preload_override: bool) anyerror!?usize {
     if (sym.dyn_object_idx == std.math.maxInt(usize)) return null;
 
@@ -4036,8 +4018,8 @@ const TrackedAllocation = struct {
     alignment: std.mem.Alignment,
 };
 
-/// Requires `alloc_mutex`. Reserve registry capacity before acquiring payload
-/// storage so publication cannot fail after the allocation succeeds.
+/// Allocates tracked storage while the caller holds `alloc_mutex`.
+/// Reserves registry capacity first so registration cannot fail after allocation.
 fn allocateTracked(alignment: usize, requested_size: usize) !*anyopaque {
     if (requested_size > std.math.maxInt(isize)) return error.OutOfMemory;
 
@@ -4227,8 +4209,8 @@ fn reallocSubstitute(p: ?*anyopaque, size: usize) callconv(.c) ?*anyopaque {
     return result;
 }
 
-/// Remap backing storage when supported; otherwise allocate before freeing so
-/// failure preserves the original allocation. Only requested payload is copied.
+/// Resizes tracked storage, preserving the original allocation on failure.
+/// Falls back to copying only the requested payload when remapping is unavailable.
 fn reallocateTracked(p: ?*anyopaque, requested_size: usize) !*anyopaque {
     state.alloc_mutex.lockUncancelable(state.io);
     defer state.alloc_mutex.unlock(state.io);
@@ -4247,8 +4229,7 @@ fn reallocateTracked(p: ?*anyopaque, requested_size: usize) !*anyopaque {
         if (state.alloc_allocator.rawRemap(old_storage, allocation.alignment, new_storage_size, @returnAddress())) |new_storage| {
             const address = @intFromPtr(new_storage);
 
-            // Replacing one entry needs no capacity growth. Nothing after a
-            // successful remap may fail: the old storage may already be gone.
+            // Registry replacement cannot fail: remap may have freed the old storage.
             _ = state.extra_allocations.swapRemove(old_address);
             state.extra_allocations.putAssumeCapacity(address, .{
                 .storage_size = new_storage_size,
@@ -4356,8 +4337,8 @@ fn dlerrorSubstitute() callconv(.c) ?[*:0]const u8 {
     return err;
 }
 
-/// Borrows this thread's diagnostic buffer until the next formatted error. Use
-/// scratch storage because formatting arguments can refer to the previous error.
+/// Returns this thread's diagnostic buffer, borrowed until the next formatted error.
+/// Formats into scratch storage because arguments can refer to the previous error.
 fn formatDlError(comptime format: []const u8, args: anytype) [:0]const u8 {
     dlerror_cleared = false;
     var scratch: [2048]u8 = undefined;
@@ -4635,10 +4616,10 @@ fn lookupDlSymbol(lib_handle: ?*anyopaque, sym_name: []const u8, version: ?[]con
 }
 
 const DlInfo = extern struct {
-    dli_fname: [*:0]const u8, // Pathname of shared object that contains address
-    dli_fbase: *anyopaque, // Base address at which shared object is loaded
-    dli_fsname: ?[*:0]const u8, // Name of symbol whose definition overlaps addr
-    dli_fsaddr: ?*anyopaque, // Exact address of symbol named in dli_sname
+    dli_fname: [*:0]const u8, // Path of the shared object containing the address.
+    dli_fbase: *anyopaque, // Base address of the loaded shared object.
+    dli_fsname: ?[*:0]const u8, // Name of the symbol containing the address.
+    dli_fsaddr: ?*anyopaque, // Address of the symbol named by `dli_fsname`.
 };
 
 const DlLinkMap = extern struct {
@@ -4993,9 +4974,8 @@ fn cxaThreadAtExitSubstitute(function: *const fn (?*anyopaque) callconv(.c) void
     return 0;
 }
 
-/// Removes callbacks in reverse registration order for this TP. Unlock before
-/// invoking native code: a destructor can register another destructor or reenter
-/// loader services. Keep its defining object retained until the callback returns.
+/// Runs this thread's destructors in reverse registration order.
+/// Unlocks for reentrant callbacks, retaining each owner until its callback returns.
 fn runThreadDestructors(tp: usize) void {
     while (true) {
         state.thread_mutex.lockUncancelable(state.io);
@@ -5018,8 +4998,7 @@ fn runThreadDestructors(tp: usize) void {
     }
 }
 
-/// Child-side lifecycle: establish libc visibility, enter user code, run TLS
-/// destructors, retire native visibility, then publish the result for Zig join.
+/// Runs user code within the native worker lifecycle and publishes the join result.
 fn threadRoutine(ctx: ThreadRoutineContext) void {
     const new_tp = libc.currentThreadPointer();
 
@@ -5246,8 +5225,7 @@ const NotificationEvent = libc.NotificationEvent;
 
 // Each index selects a native timer_create symbol-version binding, not a timer.
 // Separate C entry points preserve the selected ABI when forwarding the call.
-// Slots follow libc/glibc.zig's timerBindingIndex: 0 is the fallback,
-// 1 is GLIBC_2.2.5, 2 is GLIBC_2.3.3, and 3 is GLIBC_2.34.
+// Slot assignments follow `glibc.timerBindingIndex`.
 fn TimerCreateSubstitute(comptime binding_index: usize) type {
     return struct {
         fn call(clock: c_int, event: ?*const NotificationEvent, timer_id: *anyopaque) callconv(.c) c_int {
@@ -5452,8 +5430,7 @@ fn logDepTreeInner(dyn_object: *const DynObject, level: usize, already_visited: 
         }
     }
 
-    // Keep completed nodes in the visited set: shared dependencies should be
-    // expanded only once, not once for each path from the root.
+    // Retain visited nodes so shared dependencies expand only once.
 }
 
 fn dumpSegments(dyn_obj: *DynObject) !void {
@@ -5688,7 +5665,7 @@ test "tracked realloc accepts null and rejects external pointers" {
     try std.testing.expectError(error.ExternalAllocation, reallocateTracked(&external, 64));
 }
 
-test "dl symbol lookup preserves versions, caller scopes, and handle validation" {
+test "dl symbol lookup respects versions, caller scopes, and handle validity" {
     // Invalid lookups below deliberately exercise warning-producing paths.
     const previous_log_level = logger.level;
     logger.level = .err;

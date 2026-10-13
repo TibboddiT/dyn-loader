@@ -1,8 +1,6 @@
-//! Borrowed instruction bytes with an explicit address origin.
-//! Object-backed views use ELF virtual addresses, not mapped host addresses.
-//! The mapping owner must keep the object loaded for the entire view lifetime.
-//! Byte-pattern searches do not establish instruction boundaries. Callers use
-//! complete known encodings or `InstructionFlow` when decoded evidence is needed.
+//! Borrowed code bytes with an address origin.
+//! Object-backed views use ELF virtual addresses.
+//! Byte-pattern searches do not establish instruction boundaries.
 
 const std = @import("std");
 
@@ -13,18 +11,19 @@ const CodeView = @This();
 bytes: []const u8,
 address: usize,
 
-/// Borrows bytes without validating their provenance. Relative targets use `address`.
+/// Borrows unchecked bytes. Relative targets use `address`.
 pub fn fromBytes(bytes: []const u8, address: usize) CodeView {
     return .{ .bytes = bytes, .address = address };
 }
 
 /// Borrows a readable, executable range from the supplied mapped object.
+/// The object must remain loaded for the lifetime of the view.
 pub fn fromDynObject(dyn_object: *const DynObject, virtual_address: usize, size_bytes: usize) !CodeView {
     return fromBytes(try dyn_object.mappedCodeBytes(virtual_address, size_bytes), virtual_address);
 }
 
-/// Resolves a symbol through the object's inspection scope. A definition in a
-/// different object is rejected; neither lookup nor failure consumes the borrow.
+/// Borrows a symbol's code, rejecting definitions in another object.
+/// Does not consume the inspection. The object must outlive the view.
 pub fn fromSymbol(object: DynObject.Inspection, name: []const u8) !CodeView {
     const definition = try object.lookup(object.object, name);
     if (definition.object != object.object) return error.InvalidCodeAddress;
@@ -32,7 +31,7 @@ pub fn fromSymbol(object: DynObject.Inspection, name: []const u8) !CodeView {
     return fromDynObject(object.object, definition.symbol.value, definition.symbol.size);
 }
 
-/// Borrows a subrange and advances its address origin by the same byte offset.
+/// Borrows a subrange with its address advanced by `offset`.
 pub fn slice(code: CodeView, offset: usize, size: usize) !CodeView {
     if (offset > code.bytes.len or size > code.bytes.len - offset) return error.TruncatedCodePattern;
 
@@ -48,14 +47,16 @@ pub fn readI32(code: CodeView, offset: usize) !i32 {
     return std.mem.readInt(i32, operand.bytes[0..4], .little);
 }
 
-/// Advances `cursor` only after this complete byte sequence matches.
+/// Matches `bytes` at `cursor` and advances it by `bytes.len` on success.
+/// Leaves `cursor` unchanged on failure.
+/// Use complete known encodings or `InstructionFlow` when decoding is required.
 pub fn expectBytes(code: CodeView, cursor: *usize, bytes: []const u8) !void {
     if (!std.mem.eql(u8, (try code.slice(cursor.*, bytes.len)).bytes, bytes)) return error.CodePatternMismatch;
     cursor.* += bytes.len;
 }
 
-/// Matches a prefix then a signed operand. A later operand failure leaves the
-/// cursor after the matched prefix; this compound check is not transactional.
+/// Matches `prefix` followed by a signed 32-bit operand equal to `expected`.
+/// If the operand check fails, `cursor` remains after the matched prefix.
 pub fn expectI32Operand(code: CodeView, cursor: *usize, prefix: []const u8, expected: i64) !void {
     try code.expectBytes(cursor, prefix);
     if (try code.readI32(cursor.*) != expected) return error.CodePatternMismatch;
@@ -81,7 +82,7 @@ pub fn requireUniqueI32Operand(code: CodeView, prefix: []const u8, expected: i64
     if (!found) return error.CodePatternMismatch;
 }
 
-/// Find a RIP-relative reference or rel32 branch to a virtual address.
+/// Finds a RIP-relative reference or `rel32` branch to a virtual address.
 /// `trailing_bytes` accounts for operands following the displacement.
 pub fn findUniqueRelativeReference(code: CodeView, prefix: []const u8, target: usize, suffix: []const u8, trailing_bytes: usize) !?usize {
     const suffix_offset = std.math.add(usize, prefix.len, 4) catch return error.TruncatedCodePattern;
@@ -103,8 +104,8 @@ pub fn findUniqueRelativeReference(code: CodeView, prefix: []const u8, target: u
     return found;
 }
 
-/// Resolves a signed `rel32` from the end of its four-byte operand. Instructions
-/// with more trailing bytes require the caller to account for those bytes.
+/// Resolves `rel32` from the end of its four-byte operand.
+/// The caller must account for any trailing instruction bytes.
 pub fn relativeTarget(code: CodeView, operand_offset: usize) !usize {
     const operand = try code.slice(operand_offset, 4);
     const next_instruction_address = std.math.add(usize, operand.address, 4) catch return error.InvalidCodeAddress;
@@ -123,8 +124,9 @@ pub fn addDisplacement(address: usize, displacement: i32) !usize {
     return std.math.add(usize, address, @intCast(safe_displacement)) catch error.InvalidCodeAddress;
 }
 
-/// Returns the unique match's byte offset, ignoring `gap_bytes` between the two
-/// fixed sequences. No match returns `null`; a second match is an ambiguity error.
+/// Returns the byte offset of the only match for `prefix` and `suffix`,
+/// separated by `gap_bytes` bytes.
+/// Returns `null` if no match exists, or `error.AmbiguousCodePattern` if several exist.
 pub fn findUnique(code: CodeView, prefix: []const u8, gap_bytes: usize, suffix: []const u8) !?usize {
     const suffix_offset = std.math.add(usize, prefix.len, gap_bytes) catch return error.TruncatedCodePattern;
     const pattern_size = std.math.add(usize, suffix_offset, suffix.len) catch return error.TruncatedCodePattern;

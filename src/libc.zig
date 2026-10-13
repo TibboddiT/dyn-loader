@@ -1,7 +1,4 @@
-//! Native libc policy and lifecycle boundary. Backend state is heap-stable and
-//! owned by `Runtime`; worker handles borrow it until their final join/release.
-//! Backends inspect mapped objects through `Services`; they do not own loader
-//! registries, stack mappings, or Zig's kernel thread-exit notification.
+//! Shared interface for native libc integration.
 
 const std = @import("std");
 
@@ -15,6 +12,8 @@ const ResolvedSymbol = DynObject.ResolvedSymbol;
 /// Loader operations used during native-runtime inspection and preparation.
 /// Returned object pointers are borrowed until the next registry mutation.
 /// Backends retain mapped addresses, never registry-entry pointers.
+/// The loader owns registries; Zig owns thread stacks and kernel thread-exit
+/// notification.
 pub const Services = struct {
     lookupSymbol: *const fn (object: *DynObject, name: []const u8, allow_preload_override: bool) anyerror!ResolvedSymbol,
     lookupRuntimeSymbol: *const fn (name: []const u8) anyerror!ResolvedSymbol,
@@ -45,9 +44,9 @@ pub const RuntimeValues = struct {
     tls_align: usize,
 };
 
-/// Deferred native-field assignment. `addr` is a loaded address for `.zero`, or
-/// an unsigned byte offset from TP for `.tp`. Values are computed at application
-/// time; `.tid` writes a `c_int`, while other values write a pointer-sized word.
+/// Deferred native-field assignment. Values are computed when applied.
+/// `addr` is a loaded address for `.zero` or an unsigned TP offset for `.tp`.
+/// `.tid` writes a `c_int`; other values write a pointer-sized word.
 pub const WriteOp = struct {
     addr: usize,
     relative_to: enum { zero, tp },
@@ -89,9 +88,9 @@ const NativeBinding = struct {
     address: usize,
 };
 
-/// Owns backend state and its write plan. Copies transfer ownership; they do not
-/// duplicate it. Once workers exist, this handle and its services must stay put
-/// until every worker has joined and released its backend storage.
+/// Owns heap-allocated backend state and its write plan. Copying transfers ownership.
+/// Keep this handle and its services stable until all workers join and release
+/// their backend storage.
 pub const Runtime = struct {
     pub const Worker = WorkerHandle;
 
@@ -182,9 +181,8 @@ pub const Runtime = struct {
         }
     }
 
-    /// Global fields are updated for the initial runtime; workers receive only
-    /// TP-relative fields. Failure may leave earlier writes applied. Unlike code
-    /// patching, this initialization plan does not own rollback byte snapshots.
+    /// Applies runtime fields, or only TP-relative fields for workers.
+    /// Failure may leave earlier writes applied. No rollback is attempted.
     fn applyWriteOps(self: *const Runtime, thread_pointer: usize, only_tp_relative: bool) !void {
         const values = self.services.runtimeValues();
         for (self.write_ops.items) |op| {
@@ -264,8 +262,8 @@ pub const Runtime = struct {
     }
 };
 
-/// Creator, worker context, and registry copy this handle. Backend storage has
-/// separate creator/registry ownership; copying the handle adds no reference.
+/// Borrows backend storage with separate creator and registry references.
+/// Copying the handle does not add a reference.
 pub const WorkerHandle = struct {
     runtime: *Runtime,
     state: ?*anyopaque,
@@ -283,7 +281,8 @@ pub const WorkerHandle = struct {
         if (self.creator_mask) |mask| restoreThreadSignals(&mask);
     }
 
-    /// Requires the registry lock. On failure no worker resources are retained.
+    /// Prepares worker resources while the caller holds the registry lock.
+    /// Retains no worker resources on failure.
     pub fn prepare(self: *WorkerHandle) !void {
         try self.runtime.vtable.prepareWorker(self);
     }
@@ -297,7 +296,7 @@ pub const WorkerHandle = struct {
         self.spawn_mask = null;
     }
 
-    /// Cancels a successful prepare when Zig cannot spawn the worker.
+    /// Cancels a successful preparation when Zig cannot spawn the worker.
     pub fn spawnFailed(self: *WorkerHandle) void {
         self.endSpawn();
         self.runtime.vtable.spawnFailed(self);
@@ -344,8 +343,9 @@ pub const WorkerHandle = struct {
 
 pub const ObjectRole = enum { ordinary, libc, loader, thread_support };
 
-/// Prefer the established names before trying architecture-qualified fallbacks.
-/// libc.so is a shared alias; backend-specific names belong to the backends.
+/// System libc names in search order, with established names before
+/// architecture-qualified fallbacks.
+/// `libc.so` is a shared alias; each backend supplies its other names.
 pub const system_libc_names = glibc.system_libc_names ++ [_][]const u8{"libc.so"} ++ musl.system_libc_names;
 
 pub fn objectRole(name: []const u8) ObjectRole {
@@ -377,8 +377,7 @@ pub fn checkCompatibleObject(name: []const u8, path: []const u8, objects: []cons
 }
 
 /// Returns owned runtime state for a recognized libc and `null` for other roles.
-/// Validate all required evidence before publishing it. Recognition ambiguity,
-/// failed write-plan validation, or failed allocator patching aborts preparation.
+/// Validates the runtime and applies allocator patches before returning it.
 pub fn inspectObject(services: *const Services, allocator: std.mem.Allocator, object: *DynObject) !?Runtime {
     if (objectRole(object.name) != .libc) return null;
 
@@ -467,8 +466,8 @@ pub const NotificationEvent = extern struct {
     sigev_notify: c_int,
 };
 
-/// Checks a PLT jump and its matching relocation. Input and result are ELF virtual
-/// addresses; a matching opcode without the named `JUMP_SLOT` is not sufficient.
+/// Checks a PLT jump and its named `JUMP_SLOT` relocation.
+/// Input and result are ELF virtual addresses.
 pub fn findPltSlot(dyn_object: *const DynObject, target_address: usize, symbol_name: []const u8) !?usize {
     const code = try CodeView.fromDynObject(dyn_object, target_address, 6);
     if (!std.mem.eql(u8, code.bytes[0..2], "\xff\x25")) return null; // `jmp [rip + disp32]`
@@ -490,8 +489,7 @@ pub fn findPltSlot(dyn_object: *const DynObject, target_address: usize, symbol_n
     return error.MissingPltRelocation;
 }
 
-/// Follows one recognized direct tail-jump wrapper in ELF coordinates. This is
-/// a bounded wrapper recognizer, not general control-flow traversal.
+/// Follows one recognized tail-jump wrapper in ELF coordinates.
 pub fn resolveEntryJump(dyn_object: *const DynObject, entry_address: usize) !usize {
     const entry = try CodeView.fromDynObject(dyn_object, entry_address, 5);
     if (entry.bytes[0] == 0xe9) return entry.relativeTarget(1); // `jmp rel32`
@@ -517,7 +515,8 @@ pub fn findLibcSymbol(services: *const Services, dyn_object: *DynObject, name: [
     };
 }
 
-/// Owns copies of the bytes; `address` borrows the object's mapping until application completes.
+/// Owns copies of the patch bytes.
+/// The mapping containing `address` must remain valid until application completes.
 pub const CodePatch = struct {
     address: usize,
     segment_index: usize,
@@ -558,9 +557,9 @@ pub fn appendCodePatch(allocator: std.mem.Allocator, object: *const DynObject, p
     logger.debug("libc.patch: object={s} action=prepared target_host=0x{x} segment={d} size={d} original={x} replacement={x}", .{ object.name, address, segment_index, patch.size, patch.original[0..patch.size], replacement });
 }
 
-/// Applies patches prepared for this object. On failure, attempts to restore
-/// original bytes and permissions in reverse order; rollback failures are logged.
-/// The caller prevents concurrent execution of the segments being modified.
+/// Applies prepared patches. On failure, tries to restore bytes and permissions
+/// in reverse order. Logs rollback failures.
+/// The caller must prevent concurrent execution of modified segments.
 pub fn applyCodePatches(object: *const DynObject, patches: []const CodePatch) !void {
     logger.debug("libc.patch: object={s} action=apply count={d}", .{ object.name, patches.len });
     var applied_count: usize = 0;

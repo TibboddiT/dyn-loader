@@ -1,6 +1,4 @@
-//! An ELF object's metadata and object-local mapping operations.
-//! The loader owns creation, population, registry publication, and resource cleanup.
-//! Borrowed metadata and mapped byte views remain valid only while their owner does.
+//! Metadata and mapping operations for an ELF object owned by the loader.
 
 const std = @import("std");
 
@@ -103,15 +101,14 @@ pub const DynObjectSegmentResult = struct {
     sym_index: ?usize,
 };
 
-/// A borrowed symbol definition. Registry mutations can invalidate these pointers;
-/// inspection must finish before loading, unloading, or publishing another object.
+/// A borrowed symbol definition. Finish inspection before any registry mutation.
 pub const Definition = struct {
     object: *const DynObject,
     symbol: *const DynSym,
 };
 
-/// The object and lookup callback form a bounded inspection scope. Lookup may
-/// resolve a dependency; callers requiring local code must check its owner.
+/// An object and lookup callback borrowed during inspection.
+/// Lookup may resolve a dependency; check the owner when local code is required.
 pub const Inspection = struct {
     object: *DynObject,
     lookup: *const fn (object: *DynObject, name: []const u8) anyerror!Definition,
@@ -250,8 +247,8 @@ pub fn findSegment(self: *const DynObject, mapped_address: usize) ?usize {
     return null;
 }
 
-/// Translates an ELF virtual address. Outside-segment translation is used only
-/// where the caller explicitly permits an address relative to the mapping base.
+/// Translates an ELF virtual address to a host address.
+/// `allow_outside` permits base-relative translation outside the object's segments.
 pub fn virtualToLoadedAddress(self: *const DynObject, virtual_address: usize, allow_outside: bool) !usize {
     for (self.segments.values()) |segment| {
         if (virtual_address >= segment.mem_offset and virtual_address - segment.mem_offset < segment.mem_size) {
@@ -275,8 +272,8 @@ pub fn virtualToFileAddress(self: *const DynObject, virtual_address: usize, size
     return @intFromPtr((try virtualFileRange(file_bytes, headers, virtual_address, size_bytes)).ptr);
 }
 
-/// Borrows a readable, executable range. The object must remain mapped while
-/// the returned bytes are in use; `virtual_address` is an ELF virtual address.
+/// Borrows a readable, executable range at an ELF virtual address.
+/// The object must remain mapped while the bytes are in use.
 pub fn mappedCodeBytes(self: *const DynObject, virtual_address: usize, size_bytes: usize) ![]const u8 {
     for (self.segments.values()) |segment| {
         if (!segment.flags_first.read or !segment.flags_first.exec) continue;
@@ -293,8 +290,9 @@ pub fn mappedCodeBytes(self: *const DynObject, virtual_address: usize, size_byte
     return error.InvalidCodeAddress;
 }
 
-/// Validates a complete readable, non-executable data range and returns its host
-/// address. The result borrows the mapping; it does not imply write permission.
+/// Returns the host address of a readable, non-executable data range.
+/// Validates the entire range. The result borrows the mapping and does not
+/// guarantee write permission.
 pub fn mappedDataAddress(self: *const DynObject, virtual_address: usize, size_bytes: usize) !usize {
     for (self.segments.values()) |segment| {
         if (!segment.flags_first.read or segment.flags_first.exec) continue;
@@ -323,8 +321,8 @@ pub fn mappedWritableDataAddress(self: *const DynObject, virtual_address: usize,
     return mapped_address;
 }
 
-/// Applies final page-rounded ranges after relocation. Failure can leave earlier
-/// segments updated; the loader owns cleanup of a partially prepared object.
+/// Applies final page-rounded permissions after relocation.
+/// Failure may leave earlier segments updated. The loader owns cleanup.
 pub fn updateSegmentsPermissions(self: *const DynObject) !void {
     logger.debug("updating segment permissions for {s}", .{self.name});
 
@@ -391,9 +389,11 @@ fn protectRange(aligned_start: usize, aligned_end: usize, protection: std.posix.
     }
 }
 
-/// Borrows a half-open byte range. Subtraction-based bounds checks avoid overflow
-/// from untrusted `offset + size`; an empty range at the end is valid.
+/// Borrows `size` bytes starting at `offset`.
+/// An empty range at the end is valid. Returns `error.InvalidElfFileRange`
+/// if the range extends beyond `bytes`.
 pub fn checkedSliceRange(bytes: []const u8, offset: usize, size: usize) ![]const u8 {
+    // Subtract to avoid overflow in untrusted `offset + size`.
     if (offset > bytes.len or size > bytes.len - offset) return error.InvalidElfFileRange;
     return bytes[offset..][0..size];
 }

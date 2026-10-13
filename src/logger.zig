@@ -1,19 +1,17 @@
-//! Shared loader diagnostics, controlled by the public loader log-level option.
-//! The loader's runtime threshold controls emission and diagnostic preparation.
-//! `std.log` independently controls host filtering and output. Set the runtime
-//! threshold during loader initialization before concurrent calls.
-//! Handlers must not reenter loader services or use intercepted native allocation;
-//! some diagnostics run under loader locks. Keep native thread error state intact.
-//!
-//! Use `info` for lifecycle milestones, `warn` for recoverable anomalies, and
-//! `err` for failed operations. `debug` records decisions, expected probe misses,
-//! native calls, and detailed evidence; expensive preparation needs a level guard.
+//! Loader diagnostics filtered by a runtime threshold and `std.log`.
+//! Configure the runtime threshold before concurrent use.
 
 const std = @import("std");
 
+/// Use `info` for lifecycle events, `warn` for recoverable anomalies,
+/// `err` for failures, and `debug` for diagnostic detail.
 pub const Level = enum { debug, info, warn, err, none };
 
+// Calls may hold loader locks. Host handlers must preserve native thread error
+// state and avoid loader reentry or intercepted allocation.
 const inner_logger = std.log.scoped(.dyn_loader);
+/// Runtime emission threshold. Check it before expensive diagnostic preparation.
+/// `std.log` independently controls host filtering and output.
 pub var level: Level = .debug;
 
 pub fn debug(comptime format: []const u8, args: anytype) void {

@@ -1,32 +1,5 @@
-//! Adapts x86-64 musl state to threads created and reclaimed by Zig.
-//!
-//! Several required musl globals and helpers are hidden symbols. Inspection
-//! follows references from exported functions and checks known instruction
-//! sequences before retaining their addresses. Thread inspection decodes a
-//! bounded instruction subset and follows integer values through branches,
-//! register copies, and stack spills. Unknown or conflicting facts fail loading.
-//!
-//! Detection uses ELF virtual addresses; native pointers refer to loaded
-//! mappings. Runtime state borrows these mappings for its entire lifetime.
-//! Worker state separately owns pthread-key storage and startup synchronization.
-//! Zig owns the actual stack, TLS allocation, and kernel exit notification.
-//!
-//! There are two initialization phases: establish the initial descriptor before
-//! constructors, then enable native multithreaded operation before the first
-//! worker is spawned. Each worker receives its own descriptor fields and TSD
-//! array before its thread pointer becomes visible in musl's circular list.
-//!
-//! Native lifecycle references in musl v1.2.5:
-//! Thread-list lock and unlock, lines 23-43:
-//! https://git.musl-libc.org/cgit/musl/tree/src/thread/pthread_create.c?h=v1.2.5#n23
-//! First-thread transition, lines 249-262:
-//! https://git.musl-libc.org/cgit/musl/tree/src/thread/pthread_create.c?h=v1.2.5#n249
-//! Worker descriptor initialization, lines 313-329:
-//! https://git.musl-libc.org/cgit/musl/tree/src/thread/pthread_create.c?h=v1.2.5#n313
-//! Signal masks and `clone`'s clear-child-TID address, lines 341-355:
-//! https://git.musl-libc.org/cgit/musl/tree/src/thread/pthread_create.c?h=v1.2.5#n341
-//! Exit-time unlinking and delayed lock release, lines 142-150:
-//! https://git.musl-libc.org/cgit/musl/tree/src/thread/pthread_create.c?h=v1.2.5#n142
+//! Native x86-64 musl integration for the loader.
+//! Finds private globals and helpers by inspecting exported functions.
 
 const std = @import("std");
 
@@ -81,15 +54,16 @@ pub fn isRuntimeName(name: []const u8) bool {
     return false;
 }
 
-/// Uses `issetugid` as a marker; `create` separately validates its implementation
-/// and the thread layout. The symbol name alone is not sufficient evidence.
+/// Checks for `issetugid`. `create` validates the implementation and layout.
 pub fn recognizes(services: *const Services, object: *DynObject) !bool {
     return try findLibcSymbol(services, object, "issetugid") != null;
 }
 
-/// Detects all required thread facilities before publishing owned backend state.
+/// Detects all required thread facilities before returning backend state.
 /// The returned runtime owns `State` and the write plan, but borrows native code,
 /// globals, and the `Services` interface.
+/// Native mappings must remain valid for the runtime's lifetime. Unknown or
+/// conflicting inspection facts return an error.
 pub fn create(services: *const Services, allocator: std.mem.Allocator, object: *DynObject) !common.Runtime {
     var capability: []const u8 = "layout";
     errdefer logger.err("musl.inspect: object={s} capability={s} action=failed", .{ object.name, capability });
@@ -137,8 +111,7 @@ fn initInitialThread(runtime: *common.Runtime) !void {
 }
 
 fn supportsWorkers(_: *const common.Runtime) bool {
-    // Unlike split glibc/libpthread, successful musl creation already validates
-    // the thread implementation; no later object supplies missing support.
+    // musl creation already validates all thread support.
     return true;
 }
 
@@ -151,8 +124,8 @@ fn threadStorageSize(_: *const common.Runtime) usize {
 }
 
 /// Redirects internal allocations that bypass normal symbol substitution.
-/// Build both patch sets before modifying code. `common.applyCodePatches` owns
-/// permission changes and rollback; these temporary records own no mappings.
+/// Builds both patch sets before modifying code. `common.applyCodePatches`
+/// handles permission changes and rollback. Temporary patch records borrow mappings.
 fn patchAllocatorCalls(runtime: *common.Runtime, object: *DynObject) !void {
     var patches: std.ArrayList(common.CodePatch) = .empty;
     defer patches.deinit(runtime.allocator);
@@ -185,8 +158,9 @@ fn initWorker(runtime: *common.Runtime) common.WorkerHandle {
     };
 }
 
-/// Runs in the creator under the loader registry lock. Allocate first so an
-/// allocation error occurs before the one-time native threaded transition.
+/// Prepares a worker in the creator while holding the loader registry lock.
+/// Allocates before the one-time native transition to multithreaded operation,
+/// so allocation failure leaves that state unchanged.
 fn prepareWorker(worker: *common.WorkerHandle) !void {
     const threads = &getState(worker.runtime).threads;
     worker.state = try MuslWorker.create(worker.runtime.allocator, threads.tsd_slots);
@@ -194,9 +168,7 @@ fn prepareWorker(worker: *common.WorkerHandle) !void {
     const was_threaded = threads.threaded;
     prepareMuslThreads(threads);
     if (!was_threaded) {
-        // The first-thread transition intentionally unblocks musl's reserved
-        // thread signals. Restoring the old application mask must preserve that
-        // change instead of silently blocking those signals again.
+        // Preserve the reserved signals unblocked by the first-thread transition.
         worker.creator_mask.?[0] &= ~musl_thread_signal_bits;
     }
 }
@@ -206,8 +178,7 @@ fn beginSpawn(worker: *common.WorkerHandle) void {
 }
 
 fn spawnFailed(worker: *common.WorkerHandle) void {
-    // No child or registry entry can retain this unpublished state. Destroy it
-    // directly rather than releasing the two references used on successful spawn.
+    // Unpublished state has no other owners; destroy it directly.
     getWorker(worker).destroy();
     worker.state = null;
 }
@@ -227,8 +198,9 @@ fn enterUserCode(worker: *const common.WorkerHandle) void {
     restoreThreadSignals(&mask);
 }
 
-/// Runs in the creator without the loader registry lock. Waiting under that
-/// lock would prevent the child from completing registration and publishing ready.
+/// Waits for worker startup in the creator without the loader registry lock.
+/// Holding that lock would prevent the child from completing registration and
+/// signalling readiness.
 fn finishStartup(worker: *const common.WorkerHandle) void {
     const state = getWorker(worker);
     state.waitUntilReady();
@@ -246,9 +218,7 @@ fn releaseAfterJoin(worker: *const common.WorkerHandle) void {
 // Thread-offset checks and allocator-call identification.
 // -------------------------------------------------------
 
-/// Cross-checks candidate pthread offsets using independent exported functions.
-/// `pthread_getcpuclockid` encodes the kernel TID into a clock ID; `getspecific`
-/// indexes through `self->tsd`. Neither needs a public `struct pthread` definition.
+/// Cross-checks TID and TSD offsets through `pthread_getcpuclockid` and `getspecific`.
 fn validateMuslThreadLayout(services: *const Services, dyn_object: *DynObject, layout: MuslLayout) !void {
     const clock_code = try CodeView.fromSymbol(services.inspect(dyn_object), "pthread_getcpuclockid");
     // mov eax, [rdi+disp8] (the one-byte gap is the TID offset)
@@ -292,8 +262,7 @@ const CallProbe = struct {
 };
 
 /// Recognizes a null check of `RAX`, optionally after saving it in another register.
-/// Some sequences put the integer failure result (-1) in `EAX` before testing the
-/// saved pointer, so those intervening writes are explicitly accepted.
+/// Allows writes of -1 to `EAX` before testing a saved pointer.
 fn hasPointerResultCheck(bytes: []const u8) bool {
     if (std.mem.startsWith(u8, bytes, "\x48\x85\xc0")) return true; // `test rax,rax`
     if (bytes.len < 3) return false;
@@ -332,9 +301,9 @@ fn hasPointerResultCheck(bytes: []const u8) bool {
 }
 
 /// Returns the byte offset of a call's signed `rel32` operand, not its opcode.
-/// Follow a small allowed set of instructions from known argument loads to a
-/// call and pointer-result check. Track overwrites of argument registers and
-/// stop at unknown instructions rather than assuming their effects.
+/// Follows a small allowed set of instructions from known argument loads to a
+/// call and pointer-result check. Tracks overwrites of argument registers and
+/// stops at unknown instructions.
 /// Multiple anchors may describe the same call; different matching calls fail.
 fn findCheckedCallOperand(code: CodeView, probe: CallProbe) !usize {
     const instruction_limit = 16;
@@ -475,8 +444,7 @@ fn detectMuslAllocatorCall(services: *const Services, dyn_object: *DynObject, na
 
         if (internal_implementation != public_implementation) return error.UnrecognizedAllocatorTarget;
 
-        // Validate a readable executable destination. `CodeView` does not require
-        // writable code; temporary write permissions belong to patch application.
+        // Write permission is needed only when applying patches.
         _ = try CodeView.fromDynObject(dyn_object, internal_implementation, 1);
 
         return .{ .internal = .{ .target_address = target_address } };
@@ -577,8 +545,7 @@ const MuslLayout = struct {
     joinable_state: c_int,
 };
 
-/// musl links contain `struct pthread` pointers. This differs from glibc `list_t`,
-/// whose pointers address embedded list nodes and separate sentinel heads.
+/// Links point to `struct pthread`, not embedded nodes as in glibc.
 const MuslThreadLinks = extern struct {
     prev: usize,
     next: usize,
@@ -745,18 +712,15 @@ fn detectMuslLayout(services: *const Services, dyn_object: *DynObject) !MuslLayo
     return detected orelse error.UnrecognizedMuslLayout;
 }
 
-/// Collects the complete native thread contract. A missing required helper or
-/// field rejects creation; later callbacks use these addresses without repeating
-/// instruction inspection. Temporary flow allocations are released on return.
+/// Finds and validates the thread helpers and fields needed by runtime callbacks.
+/// Missing helpers or fields fail creation.
 fn detectMuslThreads(allocator: std.mem.Allocator, services: *const Services, dyn_object: *DynObject, layout: MuslLayout) !MuslThreads {
     var capability: []const u8 = "pthread_create";
     errdefer logger.err("musl.threads: object={s} capability={s} action=failed", .{ dyn_object.name, capability });
     const create_code = try CodeView.fromSymbol(services.inspect(dyn_object), "pthread_create");
     logger.debug("musl.threads: object={s} symbol=pthread_create code_elf=0x{x} size={d}", .{ dyn_object.name, create_code.address, create_code.bytes.len });
 
-    // Convert the loaded `__libc` address back to ELF coordinates for comparison
-    // with RIP-relative targets. Segment translation avoids assuming that the
-    // file layout and the loaded layout have identical offsets.
+    // RIP-relative targets use ELF coordinates, not loaded addresses.
     const location = try services.findSegment(layout.mapped_address);
     const segment = dyn_object.segments.values()[location.segment_index];
     const global_virtual_address = segment.mem_offset + (layout.mapped_address - segment.loaded_at);
@@ -795,11 +759,9 @@ fn detectMuslThreads(allocator: std.mem.Allocator, services: *const Services, dy
     };
 }
 
-/// TSD here means pthread-key storage, separate from ELF thread-local variables.
-/// `key_create` lazily assigns `__pthread_tsd_main` when the initial thread has no
-/// TSD array. Follow that address load, then compare its key-index wrap bound
-/// with `__pthread_tsd_size` used by `pthread_create`. The checks establish both
-/// the initial array address and how much storage each Zig worker must own.
+/// Finds the main pthread-key array and per-worker storage size.
+/// Cross-checks `key_create`'s index bound against `pthread_create`'s allocation.
+/// This TSD storage is separate from ELF TLS.
 /// Native TSD size and main array, lines 4-5:
 /// https://git.musl-libc.org/cgit/musl/tree/src/thread/pthread_key_create.c?h=v1.2.5#n4
 /// Lazy main-array setup and key-index wrap, lines 31-50:
@@ -838,9 +800,7 @@ fn detectMuslTsdStorage(allocator: std.mem.Allocator, services: *const Services,
     const slots = slot_count orelse return error.MuslTsdKeyBoundNotFound;
     if (!std.math.isPowerOfTwo(slots)) return error.InconsistentMuslLayout;
 
-    // Cross-check the index bound in bytes against the global size operand used
-    // in native allocation arithmetic. A matching constant elsewhere would not
-    // establish the size of the worker's TSD allocation.
+    // Match the index bound to the allocation operand, not an unrelated constant.
     const expected_size = slots * @sizeOf(usize);
     var size_address: ?usize = null;
     for (create_flow.nodes.items) |node| {
@@ -865,9 +825,10 @@ fn detectMuslTsdStorage(allocator: std.mem.Allocator, services: *const Services,
     };
 }
 
-/// Recovers native `__tl_lock`/`__tl_unlock` through `key_delete`. Calling these
-/// helpers preserves musl's TID ownership, recursive count, and waiter tracking;
-/// using an unrelated loader mutex would not synchronize with native readers.
+/// Finds `__tl_lock`/`__tl_unlock` through `key_delete`.
+/// Native readers require musl's lock protocol, not a separate loader mutex.
+/// Native thread-list lock and unlock, lines 23-43:
+/// https://git.musl-libc.org/cgit/musl/tree/src/thread/pthread_create.c?h=v1.2.5#n23
 fn detectMuslListFunctions(allocator: std.mem.Allocator, services: *const Services, dyn_object: *DynObject, layout: MuslLayout) !MuslListFunctions {
     const key_delete = try CodeView.fromSymbol(services.inspect(dyn_object), "pthread_key_delete");
     var delete_flow = try InstructionFlow.init(allocator, key_delete);
@@ -953,9 +914,7 @@ fn detectMuslListFunctions(allocator: std.mem.Allocator, services: *const Servic
 }
 
 /// Validates the native first-thread transition and recovers `__membarrier_init`.
-/// Match stores to the already identified globals, then require the helper call
-/// directly between installing main TSD and setting `libc.threaded`. This ties an
-/// otherwise unnamed call to its initialization role.
+/// Requires the helper call directly between main TSD setup and `libc.threaded`.
 fn detectMuslStartup(dyn_object: *DynObject, flow: InstructionFlow, layout: MuslLayout, global_virtual_address: usize, tsd: MuslTsdStorage) !MuslStartup {
     var main_store: ?usize = null;
     var helper: ?usize = null;
@@ -1080,9 +1039,7 @@ fn detectMuslStdio(dyn_object: *DynObject, flow: InstructionFlow, setup_end_offs
     }
     const end = unlock_index orelse return error.MuslStdioListUnlockNotFound;
 
-    // Standard streams are separate nullable pointer slots. Retain slot addresses
-    // so runtime initialization observes their values after relocation, rather
-    // than assuming the values visible during code inspection are final.
+    // Retain nullable stream slots; their values are final only after relocation.
     var standard_files: [3]*const usize = undefined;
     var file_count: usize = 0;
     for (flow.nodes.items[end + 1 ..], end + 1..) |node, index| {
@@ -1131,9 +1088,9 @@ fn memoryField(operand: InstructionFlow.Operand, base: u4, offset: usize) bool {
     };
 }
 
-/// Validate the descriptor writes reproduced by `initMuslWorkerDescriptor`. Returns
+/// Validates the descriptor writes reproduced by `initMuslWorkerDescriptor`. Returns
 /// the optional allocator initialization slot, borrowed from the loaded object.
-/// Require all descriptor stores to refer to the same native call result.
+/// Requires all descriptor stores to refer to the same native call result.
 /// Canary/sysinfo sources must come from the current thread, and the robust
 /// head must point back to its own field. Register names are not layout facts.
 fn validateMuslWorkerFields(dyn_object: *DynObject, flow: InstructionFlow, layout: MuslLayout, global_virtual_address: usize) !?*const usize {
@@ -1212,8 +1169,7 @@ fn validateMuslWorkerFields(dyn_object: *DynObject, flow: InstructionFlow, layou
     return heap_slot;
 }
 
-/// Repeated evidence for the same address is allowed; conflicting definitions
-/// must not be resolved by whichever instruction happens to occur first.
+/// Accepts repeated evidence for the same address and rejects conflicting addresses.
 fn uniqueAddress(result: *?usize, value: i64) !void {
     const address = std.math.cast(usize, value) orelse return error.InvalidCodeAddress;
     if (result.*) |previous| {
@@ -1224,9 +1180,8 @@ fn uniqueAddress(result: *?usize, value: i64) !void {
 }
 
 /// Recognizes a pointer-width check or move of the allocator result in `RAX`.
-/// Skip only selected moves/address calculations that preserve `RAX`. Unknown
-/// instructions or an overwrite of the result end the search. This is a bounded
-/// call-site plausibility check, not complete disassembly of executable segments.
+/// Skips known instructions that preserve `RAX`. Stops at unknown instructions
+/// or overwrites. This is a bounded call-site check, not full disassembly.
 fn hasPointerResultUse(bytes: []const u8) bool {
     const instruction_limit = 8;
     const search_span_bytes = 64;
@@ -1297,11 +1252,9 @@ fn hasPointerResultUse(bytes: []const u8) bool {
 // Direct-call patch preparation.
 // ------------------------------
 
-/// Appends proposed bytes only; the caller applies the complete patch set later.
-/// A direct x86 call has a signed 32-bit displacement, so it may not reach the
-/// host substitute. Redirect it to the object's extra page, where an absolute
-/// jump can reach the full 64-bit host address. The jump preserves the return
-/// address pushed by the original call.
+/// Prepares call patches for later application by the caller.
+/// A trampoline in the object's extra page reaches host addresses beyond `rel32`
+/// range. Its absolute jump preserves the original return address.
 fn preparePatches(allocator: std.mem.Allocator, dyn_object: *DynObject, patches: *std.ArrayList(common.CodePatch), target_virtual_address: usize, substitute_address: usize, trampoline_offset: usize) !void {
     const loaded_address = dyn_object.loaded_at orelse return error.InvalidCodeAddress;
     const extra_offset = std.math.sub(usize, dyn_object.loaded_size, 0x1000) catch return error.InvalidCodeAddress;
@@ -1396,8 +1349,8 @@ fn initMuslInitialThread(initial_thread: *MuslThreads) void {
     initial_thread.initial_tp = tp;
 }
 
-/// Heap-stable storage shared by creator and registry handle copies. It owns
-/// the worker's pthread-key array, not its Zig stack or ELF TLS allocation.
+/// Heap-allocated worker state at a stable address, shared by creator and registry.
+/// Owns the worker's pthread-key array. Zig owns the stack and ELF TLS allocation.
 const MuslWorker = struct {
     allocator: std.mem.Allocator,
     tsd: []usize,
@@ -1425,7 +1378,7 @@ const MuslWorker = struct {
         return worker;
     }
 
-    /// Destroy an unpublished worker, or one whose last reference was released.
+    /// Destroys an unpublished worker, or one whose last reference was released.
     fn destroy(worker: *MuslWorker) void {
         const allocator = worker.allocator;
         allocator.free(worker.tsd);
@@ -1445,8 +1398,7 @@ const MuslWorker = struct {
     }
 
     fn waitUntilReady(worker: *MuslWorker) void {
-        // Recheck after interruption, a spurious wake, or a publish between the
-        // atomic load and futex wait. A wake is not itself proof of readiness.
+        // A futex wake does not guarantee readiness; recheck the atomic word.
         while (@atomicLoad(u32, &worker.ready, .acquire) == 0) {
             _ = std.os.linux.futex_4arg(&worker.ready, .{ .cmd = .WAIT, .private = true }, 0, null);
         }
@@ -1486,12 +1438,13 @@ fn enableMuslFileLock(file: usize) void {
     }
 }
 
-/// Requires the loader's thread registry lock. Completes the first-thread
-/// transition before publication; the caller preserves reserved-signal changes.
-/// Mirrors `pthread_create`'s `!libc.threaded` block, because Zig spawning bypasses
-/// native `pthread_create`. It enables existing stdio locks, unblocks internal
-/// thread signals, installs main TSD, and initializes membarrier support before
-/// advertising multithreaded operation. It runs once on the initial thread.
+/// Completes the first-thread transition before publishing the worker.
+/// Requires the loader's thread registry lock. The caller must preserve changes
+/// to the reserved-signal mask.
+/// Runs once on the initial thread, replacing `pthread_create`'s `!libc.threaded`
+/// setup that Zig spawning bypasses.
+/// Native first-thread transition, lines 249-262:
+/// https://git.musl-libc.org/cgit/musl/tree/src/thread/pthread_create.c?h=v1.2.5#n249
 fn prepareMuslThreads(threads: *MuslThreads) void {
     if (threads.threaded) return;
     std.debug.assert(currentThreadPointer() == threads.initial_tp);
@@ -1530,9 +1483,9 @@ fn prepareMuslThreads(threads: *MuslThreads) void {
 }
 
 /// Populates fields that native `pthread_create` normally writes after copying TLS.
-/// The common write plan has already installed `self` and kernel TID. The robust
-/// list starts as an empty self-linked list, and `locale` points at `global_locale`.
-/// Copy the parent's stack-protection canary and, for newer layouts, `sysinfo`.
+/// Requires `self` and kernel TID to be installed by the common write plan.
+/// Native worker descriptor initialization, lines 313-329:
+/// https://git.musl-libc.org/cgit/musl/tree/src/thread/pthread_create.c?h=v1.2.5#n313
 /// Upstream descriptor fields, lines 18-60:
 /// https://git.musl-libc.org/cgit/musl/tree/src/internal/pthread_impl.h?h=v1.2.5#n18
 /// Detach-state values, lines 70-75:
@@ -1569,7 +1522,7 @@ fn initMuslWorkerDescriptor(threads: *const MuslThreads, tp: usize, parent_tp: u
     }
 }
 
-/// Runs in the child, with all signals initially blocked. Publish a complete
+/// Runs in the child, with all signals initially blocked. Publishes a complete
 /// descriptor under musl's list lock before allowing application code to run.
 fn registerMuslWorker(threads: *MuslThreads, tp: usize, parent_tp: usize, worker: *MuslWorker) void {
     initMuslWorkerDescriptor(threads, tp, parent_tp, worker);
@@ -1595,9 +1548,10 @@ fn registerMuslWorker(threads: *MuslThreads, tp: usize, parent_tp: usize, worker
     }
 }
 
-/// Removes native visibility after user cleanup, leaving signals blocked for
-/// Zig teardown. This is the list-retirement portion of native exit, not the
-/// complete `pthread_exit` cancellation/destructor/resource-cleanup sequence.
+/// Unlinks the worker after user cleanup, leaving signals blocked for Zig teardown.
+/// Does not perform the rest of `pthread_exit`.
+/// Native exit-time unlinking and delayed lock release, lines 142-150:
+/// https://git.musl-libc.org/cgit/musl/tree/src/thread/pthread_create.c?h=v1.2.5#n142
 fn unregisterMuslWorker(threads: *MuslThreads, tp: usize) void {
     _ = blockMuslAppSignals();
 
@@ -1621,6 +1575,8 @@ fn unregisterMuslWorker(threads: *MuslThreads, tp: usize) void {
     // the kernel clears it and wakes waiters only when the thread has exited.
     // Zig uses that facility for its own join protocol. Replacing its address
     // with musl's lock would break Zig join, so release the native lock here.
+    // Native signal masks and `clone` flags, lines 341-355:
+    // https://git.musl-libc.org/cgit/musl/tree/src/thread/pthread_create.c?h=v1.2.5#n341
     // From here the worker performs only Zig teardown. Keep `need_locks` enabled
     // even when `threads_minus_1` becomes zero, since kernel exit has not occurred.
     threads.unlockList();
@@ -1699,7 +1655,7 @@ fn appendWritePlan(runtime: *common.Runtime, musl: MuslLayout) !void {
     });
 }
 
-test "allocator call recognition requires matching arguments and a result check" {
+test "allocator call detection requires matching arguments and a result check" {
     // musl's atfork allocation uses 40 bytes. The call is evidence only when
     // that size reaches EDI and its returned pointer is checked afterward.
     // mov edi, 40
@@ -1719,7 +1675,7 @@ test "allocator call recognition requires matching arguments and a result check"
     try std.testing.expectError(error.AmbiguousCodePattern, findCheckedCallOperand(CodeView.fromBytes(argument ++ checked_call ++ argument ++ checked_call, 0), probe));
 }
 
-test "calloc recognition accepts shared anchors but rejects a clobbered second argument" {
+test "calloc detection accepts shared anchors and rejects argument clobbers" {
     // musl's atexit allocation uses calloc(520, 1). Both argument-load anchors
     // may identify the same call; this must not be mistaken for ambiguity.
     // mov edi, 520
@@ -1741,7 +1697,7 @@ test "calloc recognition accepts shared anchors but rejects a clobbered second a
     try std.testing.expectError(error.UnrecognizedCheckedCall, findCheckedCallOperand(CodeView.fromBytes(&wrong, 0), probe));
 }
 
-test "first-thread recognition requires ordered TSD helper and flag evidence" {
+test "first-thread detection requires TSD, helper, and flag ordering" {
     // This tests musl's transition contract, not generic register propagation:
     // install main TSD, call the membarrier helper, then publish libc.threaded.
     // The counter store and (new layouts only) need_locks = 1 are also required.

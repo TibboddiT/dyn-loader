@@ -1,19 +1,5 @@
-//! Adapts x86-64 glibc state to threads created and reclaimed by Zig.
-//!
-//! Detection combines exported debugger metadata with bounded instruction
-//! dataflow. Private fields are identified by their use in TLS rounding and
-//! list operations, not by compiler-selected registers. Missing, inconsistent,
-//! unsupported, or ambiguous evidence rejects the layout during loading.
-//!
-//! `CodeView` addresses are ELF virtual addresses during inspection. Pointers
-//! retained in `State` refer to loaded mappings, which must outlive this runtime
-//! and all its workers. Creation builds a write plan; later callbacks initialize
-//! native state and register Zig-owned thread descriptors in glibc's lists.
-//!
-//! Inspection reads native code but does not run it. Runtime callbacks later
-//! perform the required subset of NPTL (Native POSIX Threads Library) setup.
-//! Native lists must recognize our descriptors as caller-owned stacks so glibc
-//! cannot put Zig's allocations in its reusable stack cache.
+//! Native x86-64 glibc integration for the loader.
+//! Discovers private layouts through debugger metadata and code inspection.
 
 const std = @import("std");
 
@@ -43,6 +29,7 @@ const Layout = struct {
     tls_offsets: ?GlibcTlsOffsets,
 };
 
+/// Borrows native mappings, which must outlive the runtime and all its workers.
 const State = struct {
     // `null` denotes the split-libpthread case until that object is prepared.
     // A failed detector returns an error rather than publishing a partial layout.
@@ -91,8 +78,10 @@ pub fn recognizes(services: *const Services, object: *DynObject) !bool {
     return try findLibcSymbol(services, object, "_rtld_global_ro") != null;
 }
 
-/// Requires successful recognition. Owns the allocated `State` and write plan;
-/// native addresses and the `Services` interface remain borrowed.
+/// Creates a runtime after successful recognition.
+/// The runtime owns the allocated `State` and write plan, and borrows native
+/// mappings and the `Services` interface.
+/// Inspects code without executing it. Rejects unproven layouts.
 pub fn create(services: *const Services, allocator: std.mem.Allocator, object: *DynObject) !common.Runtime {
     var capability: []const u8 = "symbols";
     errdefer logger.err("glibc.inspect: object={s} capability={s} action=failed", .{ object.name, capability });
@@ -165,8 +154,8 @@ fn supportsWorkers(runtime: *const common.Runtime) bool {
     return getState(runtime).threads != null;
 }
 
-/// Older glibc discovers thread support only when its libpthread is prepared.
-/// Pin that object because the retained list and lock addresses belong to it.
+/// Discovers thread support when an older glibc's libpthread is prepared.
+/// Pins that object because the retained list and lock addresses belong to it.
 fn prepareObject(runtime: *common.Runtime, object: *DynObject) !void {
     const state = getState(runtime);
     if (state.threads != null or !isThreadSupportName(object.name)) return;
@@ -190,7 +179,7 @@ fn threadStorageSize(runtime: *const common.Runtime) usize {
 }
 
 fn patchAllocatorCalls(_: *common.Runtime, _: *DynObject) !void {
-    // Glibc allocation calls are covered by symbol substitution.
+    // glibc allocation calls are covered by symbol substitution.
 }
 
 fn initWorker(runtime: *common.Runtime) common.WorkerHandle {
@@ -233,9 +222,7 @@ fn registerWorker(worker: *const common.WorkerHandle, tp: usize) !void {
     const state = getState(worker.runtime);
     registerGlibcWorker(&state.threads.?, tp);
     if (state.initCtype) |initialize| {
-        // This executes in the child: `__ctype_init` writes thread-local pointers
-        // used by character classification, so creator-side initialization
-        // would initialize the wrong thread.
+        // `__ctype_init` must initialize the child's thread-local pointers.
         initialize();
     }
 }
@@ -267,7 +254,7 @@ const GlibcTlsOffsets = struct {
 
 /// Finds the static TLS size/alignment loads in `__libc_early_init`.
 /// NPTL's inlined early setup rounds storage sizes using values supplied by rtld.
-/// Verify the division's actual operands: `(size + alignment - 1) / alignment`,
+/// Verifies the division's operands: `(size + alignment - 1) / alignment`,
 /// with zero in the high half of the dividend. Both fields must originate from
 /// the `_rtld_global_ro` relocation, including when SIMD instructions load them.
 /// https://github.com/bminor/glibc/blob/glibc-2.39/sysdeps/nptl/pthread_early_init.h#L43-L54
@@ -293,8 +280,7 @@ const GlibcThreadList = extern struct {
 };
 
 const GlibcThreadLayout = struct {
-    // Both representations mark a caller-owned stack. This prevents glibc from
-    // treating Zig's stack as an allocation available to its stack cache.
+    // Caller-owned stacks must not enter glibc's reusable stack cache.
     // Offsets here are relative to the thread pointer (`struct pthread` base).
     const Ownership = union(enum) {
         byte_flag: usize,
@@ -325,11 +311,9 @@ const GlibcForkLists = struct {
 };
 
 /// Reads one scalar debugger descriptor: bit size, element count, byte offset.
-/// Validate both its shape and its containing structure before using the offset.
-/// These exports let debuggers inspect the loaded glibc without compiling its
-/// private `struct pthread` into the debugger; they serve the same purpose here.
+/// Validates both its shape and its containing structure before using the offset.
+/// Uses debugger exports instead of a compiled-in `struct pthread` layout.
 /// https://github.com/bminor/glibc/blob/glibc-2.39/nptl_db/structs.def#L51-L67
-/// The descriptor generation macros encode `sizeof` and `offsetof` in:
 /// Field bit size and element count:
 /// https://github.com/bminor/glibc/blob/glibc-2.39/nptl_db/db_info.c#L50-L58
 /// Structure size and field byte offset:
@@ -386,16 +370,13 @@ fn detectGlibcThreadLayout(allocator: std.mem.Allocator, services: *const Servic
         return error.InvalidGlibcThreadLayout;
     }
 
-    // Debugger exports describe `used`/`user` heads and the embedded list node,
-    // but not every field we need. `fork`'s child-side stack recovery accesses
-    // the cache and ownership flag together, providing additional evidence.
+    // `fork` recovery reveals the cache and ownership fields missing from
+    // debugger exports.
     const code = try CodeView.fromSymbol(services.inspect(dyn_object), "fork");
     var flow = try analyzeGlibc(allocator, dyn_object, code);
     defer flow.deinit();
 
-    // Keep the GOT slot as the symbolic origin. `_rtld_global` belongs to a
-    // different ELF object, so its virtual address must not be confused with
-    // addresses of libc's own globals.
+    // Use the GOT slot as the origin: `_rtld_global` belongs to another object.
     const slot = try globalSlot(dyn_object, "_rtld_global");
     const used_head = globalAddress(slot, used_offset);
     const user_head = globalAddress(slot, user_offset);
@@ -471,11 +452,8 @@ fn detectGlibcThreadLayout(allocator: std.mem.Allocator, services: *const Servic
     };
 }
 
-/// In the older split implementation, libpthread owns the stack lists.
-/// Its initialization function passes a private `__reclaim_stacks` callback to
-/// libc. Follow that argument to inspect list recovery without a public symbol.
-/// The legacy descriptor positions remain fixed and cross-checked; its stack
-/// globals and callback are recovered from decoded operations and ABI arguments.
+/// Finds legacy libpthread's stack lists through its `__reclaim_stacks` callback.
+/// Cross-checks fixed descriptor offsets against native code.
 /// https://github.com/bminor/glibc/blob/glibc-2.31/nptl/nptl-init.c#L364-L369
 fn detectLegacyGlibcThreadLayout(allocator: std.mem.Allocator, services: *const Services, dyn_object: *DynObject) !GlibcThreadLayout {
     const init_code = try CodeView.fromSymbol(services.inspect(dyn_object), "__pthread_initialize_minimal");
@@ -617,11 +595,8 @@ fn detectLegacyGlibcThreadLayout(allocator: std.mem.Allocator, services: *const 
     };
 }
 
-/// Uses `fork`'s recovery code as layout evidence; this does not implement `fork`.
-/// In the child, glibc moves old active stacks to the cache, clears active list
-/// heads, and puts the surviving thread back in the list selected by ownership.
-/// The known `used`/`user` offsets anchor the unknown `cache` and `ownership` offsets.
-/// The byte-flag variant is illustrated by:
+/// Finds the stack-cache head from `fork`'s splice of the known `used` list.
+/// Native recovery code:
 /// https://github.com/bminor/glibc/blob/glibc-2.39/sysdeps/nptl/fork.h#L134-L149
 fn detectStackCache(flow: InstructionFlow, used: InstructionFlow.Value) !InstructionFlow.Value {
     var result: ?InstructionFlow.Value = null;
@@ -708,8 +683,8 @@ fn detectOwnership(flow: InstructionFlow, user: InstructionFlow.Value, list_offs
     return result orelse error.GlibcStackOwnershipNotFound;
 }
 
-/// Configures glibc-specific self pointers and helper contracts. The returned
-/// analysis owns nodes and borrows the object/code; its caller must deinitialize it.
+/// Builds a glibc-specific analysis. Borrows the object and code.
+/// The caller must deinitialize the result.
 fn analyzeGlibc(allocator: std.mem.Allocator, object: *DynObject, code: CodeView) !InstructionFlow {
     var options: InstructionFlow.Options = .{
         .thread_self_offsets = &.{ 0, 16 },
@@ -764,16 +739,15 @@ fn callsSymbol(object: *DynObject, target: usize, name: []const u8) !bool {
     }) != null;
 }
 
-/// GCC may put abort/assertion paths outside a function's exported symbol size.
-/// Follow those small blocks separately and authorize an external edge only if
-/// no explored path returns (including traps, fatal calls, and closed cycles).
+/// Accepts an external edge only if no explored path returns.
+/// GCC may place abort or assertion paths outside the exported symbol size.
+/// Inspects those blocks separately.
 fn terminalColdPath(object: *DynObject, entry: usize) !bool {
     return terminalPath(object, entry, 0);
 }
 
-/// Proves absence of a returning path, including bounded-depth private fatal
-/// helpers. Closed cycles cannot return; visited addresses avoid unfolding them.
-/// This also recognizes hidden assertion handlers without assuming their offsets.
+/// Checks that no path returns, following private fatal helpers to a bounded depth.
+/// Tracks visited addresses to stop at closed cycles, which cannot return.
 fn terminalPath(object: *DynObject, entry: usize, call_depth: u8) !bool {
     var pending: [32]usize = undefined;
     var count: usize = 1;
@@ -821,11 +795,8 @@ fn validateColdExit(context: *anyopaque, entry: usize) !bool {
     return terminalColdPath(@ptrCast(@alignCast(context)), entry);
 }
 
-/// The fork helpers read or write a caller-owned snapshot. Prove that its
-/// pointer is neither retained nor returned and bound writes through it before
-/// preserving unrelated private spills. Unknown pointer uses reject this proof;
-/// the analyzer then keeps its conservative escaped-frame behavior.
-/// The NSS snapshot contract is illustrated by these two helpers:
+/// Bounds writes by snapshot helpers that neither retain nor return the pointer.
+/// Unknown uses invalidate private spills. NSS snapshot helpers:
 /// https://github.com/bminor/glibc/blob/glibc-2.39/nss/nss_database.c#L505-L538
 fn borrowStackArgument(context: *anyopaque, allocator: std.mem.Allocator, entry: usize, argument_register: u4) !?usize {
     if (argument_register != Register.rdi) return null;
@@ -834,8 +805,7 @@ fn borrowStackArgument(context: *anyopaque, allocator: std.mem.Allocator, entry:
     var options: InstructionFlow.Options = .{ .log_errors = false };
     try setGlibcNoReturnTargets(object, code, &options, true);
 
-    // A synthetic call origin stands for the caller's snapshot pointer. Negative
-    // identity cannot collide with a real nonnegative call-site byte offset.
+    // A negative origin distinguishes the snapshot from real call-site offsets.
     options.initial_registers[Register.rdi] = .{ .kind = .call, .a = -1, .tainted = true };
     var flow = InstructionFlow.initWithOptions(allocator, code, options) catch |err| switch (err) {
         error.OutOfMemory => return err,
@@ -848,12 +818,10 @@ fn borrowStackArgument(context: *anyopaque, allocator: std.mem.Allocator, entry:
     return write_size;
 }
 
-/// Checks a restricted helper body for use without pointer retention. Reads or
-/// writes of snapshot contents are allowed; publishing the snapshot's address,
-/// returning it, or passing it to an unknown callee is not. `object = null` lets
-/// fixtures run without native symbol lookup and disables lock-helper exceptions.
-/// Returns the exclusive upper bound of writes relative to the first argument,
-/// or null when either non-retention or the write extent cannot be proved.
+/// Returns the exclusive upper bound of writes relative to the first argument.
+/// Returns `null` if the helper may retain the snapshot pointer or its writes
+/// cannot be bounded. Allows content access, but rejects pointer escape.
+/// `object = null` disables symbol lookup and lock-helper exceptions for fixtures.
 fn firstArgumentWriteSize(flow: InstructionFlow, object: ?*DynObject) !?usize {
     var argument_used = false;
     var write_size: usize = 0;
@@ -1028,9 +996,8 @@ fn through(pointer: Value, offset: i64) Value {
     return if (pointer.kind == .global) .{ .kind = .global_address, .a = pointer.a, .b = offset } else .{ .kind = .indirect_address, .a = pointer.a, .b = pointer.b, .c = offset };
 }
 
-/// Treat a packed two-pointer store as two scalar stores. The lane values must
-/// carry the same provenance as scalar operands; matching a SIMD opcode alone
-/// cannot establish a list-head reset or a surviving-thread insertion.
+/// Treats a packed two-pointer store as two scalar stores.
+/// Requires matching lane provenance, not just a matching opcode.
 fn hasStore(flow: InstructionFlow, destination: Value, source: Value, width: u8) bool {
     if (destination.kind == .unknown or source.kind == .unknown) return false;
 
@@ -1077,7 +1044,7 @@ fn uniqueOffset(result: *?usize, value: i64) !void {
 // ---------------------------------------------
 
 /// Establishes the initial caller-owned entry for a fresh integrated-NPTL state.
-/// Reject populated lists rather than discarding native registrations.
+/// Rejects populated lists to preserve native registrations.
 fn initGlibcInitialThread(layout: *GlibcThreadLayout) !void {
     if (layout.initialized) return;
 
@@ -1246,7 +1213,7 @@ test "TLS rounding identifies field roles through renamed registers" {
     try std.testing.expectError(error.GlibcTlsRoundingNotFound, tlsOffsets(flow, 0x3000));
 }
 
-test "TLS recognition rejects an unrelated divisor or incorrect rounding" {
+test "TLS rounding rejects unrelated divisors and incorrect formulas" {
     // Replace sub rbx, 1 with sub rbx, 2, or div r9 with div r10.
     // Neither is the required rounding calculation.
     for ([_]usize{ 27, 35 }) |offset| {
@@ -1265,10 +1232,7 @@ test "TLS recognition rejects an unrelated divisor or incorrect rounding" {
 }
 
 test "SIMD TLS rounding retains both field origins" {
-    // The glibc recognizer must identify the same size/alignment roles when
-    // compiler vectorization expresses its rounding formula with packed fields.
-    // Load adjacent size/alignment fields together, extract alignment, and add
-    // it into the size lane before transferring the numerator back to a GPR.
+    // Vectorized rounding must identify the same size and alignment fields.
     //
     // mov rax, [rip+0xff9] (GOT slot at 0x2000)
     // movdqu xmm0, [rax+0x2a0]
@@ -1315,7 +1279,7 @@ test "packed list-head reset requires both self-links" {
     try std.testing.expectError(error.GlibcStackHeadResetNotFound, requireEmptyHead(wrong, globalAddress(0x2000, 0x800)));
 }
 
-test "ownership is tied to the branch that inserts into the user list" {
+test "ownership detection follows the user-list insertion branch" {
     // The taken equality branch inserts the thread for word mode 2. Replacing
     // it with `JNE` must fail even though the field and four stores still match.
     //
@@ -1360,7 +1324,7 @@ test "ownership is tied to the branch that inserts into the user list" {
     try std.testing.expectEqual(GlibcThreadLayout.Ownership{ .byte_flag = 128 }, try detectOwnership(older, globalAddress(0x2000, 256), 64));
 }
 
-test "snapshot borrowing proof rejects retained returned or obscured pointers" {
+test "snapshot borrowing rejects retained, returned, or obscured pointers" {
     // glibc fork inspection permits private spills to survive recognized NSS
     // snapshot helpers only when those helpers borrow, rather than retain, RDI.
     // mov qword ptr [rdi], 0
@@ -1401,7 +1365,7 @@ test "snapshot borrowing proof rejects retained returned or obscured pointers" {
     }
 }
 
-test "snapshot borrowing bounds writes and preserves callee-saved pointer handling" {
+test "snapshot borrowing bounds writes through callee-saved pointers" {
     // xor eax, eax
     // ret
     const finish = "\x31\xc0\xc3";
@@ -1475,7 +1439,7 @@ test "snapshot borrowing bounds writes and preserves callee-saved pointer handli
     }
 }
 
-test "private terminal helpers require every path to be non-returning within the depth bound" {
+test "terminal helper detection checks all paths within the depth bound" {
     var bytes: [64]u8 = @splat(0x90);
     // call 8
     // ret
