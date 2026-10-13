@@ -84,6 +84,14 @@ pub fn main(init: std.process.Init) !void {
             try emit(init, .{ .event = "result", .id = case_id, .status = 2, .detail = reason });
             return;
         }
+    } else {
+        const case = lifecycle_cases[case_id - elf_cases.len];
+        if (case.requires.libc_abi) |required_abi| {
+            if (!std.mem.eql(u8, args[3], @tagName(required_abi))) {
+                try emit(init, .{ .event = "result", .id = case_id, .status = 2, .detail = "case requires a different libc ABI" });
+                return;
+            }
+        }
     }
 
     try emit(init, .{ .event = "stage", .stage = "assertion" });

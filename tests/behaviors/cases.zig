@@ -8,6 +8,7 @@ const LibraryState = @import("regression_abi").LibraryState;
 const host_tls_migration = @import("specifics/host_tls_migration.zig");
 const failure_recovery = @import("specifics/failure_recovery.zig");
 const tls_surplus = @import("specifics/tls_surplus.zig");
+const tls_lookup = @import("specifics/tls_lookup.zig");
 
 const bridge_symbols: runner.BridgeSymbols = .{
     .open = "openProbe",
@@ -44,6 +45,21 @@ const mutated_state: LibraryState = .{
 };
 
 pub const cases: []const runner.Case = &.{
+    .{
+        .name = "tls-symbol-lookup",
+        .bridge = "bridge.so",
+        .bridge_symbols = bridge_symbols,
+        .library = "target_large_tls.so",
+        .behavior = .{ .specific = .{ .run = &tls_lookup.run } },
+    },
+    .{
+        .name = "tls-symbol-lookup-versioned-glibc",
+        .bridge = "bridge.so",
+        .bridge_symbols = bridge_symbols,
+        .library = "target_large_tls.so",
+        .requires = .{ .libc_abi = .gnu },
+        .behavior = .{ .specific = .{ .run = &tls_lookup.runVersioned } },
+    },
     .{
         .name = "reallocarray-failure",
         .bridge = "bridge.so",

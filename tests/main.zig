@@ -758,7 +758,7 @@ const Matrix = struct {
         const recipes = [_][]const []const u8{
             &.{ "/src/regression/target.c", "-Wl,-soname,target.so", "-o", "target.so" },
             &.{ "/src/regression/target.c", "-O2", "-Wl,-soname,target_optimized.so", "-o", "target_optimized.so" },
-            &.{ "/src/regression/target.c", "-DTLS_BYTES=65536", "-Wl,-soname,target_large_tls.so", "-o", "target_large_tls.so" },
+            &.{ "/src/regression/target.c", "-DTLS_BYTES=65536", "-Wl,--version-script=/src/regression/tls.map", "-Wl,-soname,target_large_tls.so", "-o", "target_large_tls.so" },
             &.{ "/src/regression/target.c", "-DTLS_BYTES=2097152", "-Wl,-soname,target_excess_tls.so", "-o", "target_excess_tls.so" },
             &.{
                 "/src/regression/bridge.c",
@@ -826,6 +826,7 @@ const Matrix = struct {
             "tests/main.zig",
             "tests/fixture_layout.zig",
             "tests/resources/regression/target.c",
+            "tests/resources/regression/tls.map",
             "tests/resources/regression/abi.h",
             "tests/resources/regression/bridge.c",
             "tests/resources/regression/dependency.c",

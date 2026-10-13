@@ -1,0 +1,3 @@
+TLS_TEST_1 {
+    global: tls_value; tls_tail;
+};

@@ -30,6 +30,7 @@ pub const Case = struct {
 
 pub const Prerequisites = struct {
     tls_size_greater_than: ?u64 = null,
+    libc_abi: ?enum { gnu, musl } = null,
 };
 
 pub const BridgeSymbols = support.BridgeSymbols;
