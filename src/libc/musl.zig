@@ -86,11 +86,11 @@ pub fn create(services: *const Services, allocator: std.mem.Allocator, object: *
         .services = services,
         .state = state,
         .vtable = &vtable,
-        .getErrnoLocation = @ptrFromInt(errno_symbol.address),
+        .getErrnoLocation = @ptrFromInt(try errno_symbol.getStaticAddress()),
     });
     errdefer runtime.write_ops.deinit(allocator);
     try appendWritePlan(&runtime, layout);
-    logger.debug("musl.inspect: object={s} action=validated tsd_slots={d} errno_function_host=0x{x}", .{ object.name, threads.tsd_slots, errno_symbol.address });
+    logger.debug("musl.inspect: object={s} action=validated tsd_slots={d} errno_function_host=0x{x}", .{ object.name, threads.tsd_slots, try errno_symbol.getStaticAddress() });
     return runtime;
 }
 
@@ -703,7 +703,7 @@ fn detectMuslLayout(services: *const Services, dyn_object: *DynObject) !MuslLayo
         try validateMuslThreadLayout(services, dyn_object, layout);
 
         if (try findLibcSymbol(services, dyn_object, "__libc")) |symbol| {
-            if (symbol.address != layout.mapped_address) return error.InconsistentMuslLayout;
+            if (try symbol.getStaticAddress() != layout.mapped_address) return error.InconsistentMuslLayout;
         }
 
         detected = layout;
@@ -1624,12 +1624,12 @@ fn appendWritePlan(runtime: *common.Runtime, musl: MuslLayout) !void {
             .value = .page_size,
         },
         .{
-            .addr = program_name.address, // program_invocation_name / __progname_full.
+            .addr = try program_name.getStaticAddress(), // program_invocation_name / __progname_full.
             .relative_to = .zero,
             .value = .{ .addr = @intFromPtr(argv[0]) },
         },
         .{
-            .addr = environment.address, // environ / __environ.
+            .addr = try environment.getStaticAddress(), // environ / __environ.
             .relative_to = .zero,
             .value = .{ .addr = @intFromPtr(values.environ.block.slice.ptr) },
         },

@@ -37,6 +37,7 @@ pub const DynamicLibrary = struct {
 
     /// Searches preload roots before this library's scope and resolves IFUNCs.
     /// The caller supplies the correct native type and calling convention for `addr`.
+    /// TLS symbols return this thread's instance; look them up again in other threads.
     pub fn getSymbol(lib: DynamicLibrary, sym_name: []const u8) !Symbol {
         for (state.preload_root_indices.items) |preload_idx| {
             const preload_dyn_obj = &state.dyn_objects.values()[preload_idx];
@@ -46,14 +47,14 @@ pub const DynamicLibrary = struct {
             };
 
             return .{
-                .addr = preload_sym.address,
+                .addr = getRuntimeSymbolAddress(preload_sym),
             };
         }
 
         const dyn_obj = &state.dyn_objects.values()[lib.index];
         const sym = try getResolvedSymbolByName(dyn_obj, sym_name, false, false, true);
         return .{
-            .addr = sym.address,
+            .addr = getRuntimeSymbolAddress(sym),
         };
     }
 
@@ -318,14 +319,15 @@ pub fn load(f_path: []const u8) !DynamicLibrary {
     return loadWithRootResolveContext(f_path, null, null);
 }
 
-/// Resolves a name in the loader's global scope. The returned address borrows its
-/// defining mapping and may be the result of a native IFUNC resolver call.
+/// Resolves a name in the loader's global scope, including native IFUNC calls.
+/// Ordinary symbols borrow their defining mapping; TLS symbols borrow the
+/// calling thread's instance.
 pub fn getSymbol(sym_name: []const u8) !Symbol {
     if (!state.initialized) return error.Uninitialized;
 
     const sym = try getResolvedSymbolByName(null, sym_name, false, false, true);
     return .{
-        .addr = sym.address,
+        .addr = getRuntimeSymbolAddress(sym),
     };
 }
 
@@ -2645,8 +2647,8 @@ fn processRelocations(dyn_object: *DynObject) !void {
                 // R_X86_64_64: S + A
                 const sym = try resolveSymbol(dyn_object, reloc.sym_idx);
                 const value = r64_blk: {
-                    if (reloc.addend != 0) break :r64_blk sym.address +% @as(usize, @bitCast(reloc.addend));
-                    break :r64_blk if (try getSubstituteAddress(sym, dyn_object, true)) |a| a else sym.address;
+                    if (reloc.addend != 0) break :r64_blk (try sym.getStaticAddress()) +% @as(usize, @bitCast(reloc.addend));
+                    break :r64_blk if (try getSubstituteAddress(sym, dyn_object, true)) |a| a else try sym.getStaticAddress();
                 };
                 logger.debug("  64: 0x{x} (0x{x}): 0x{x} -> 0x{x} (0x{x}, {s}@{s} + 0x{x})", .{ reloc_addr, reloc.offset, ptr.*, value, sym.value, sym.name, sym.version, reloc.addend });
                 ptr.* = value;
@@ -2655,7 +2657,7 @@ fn processRelocations(dyn_object: *DynObject) !void {
                 reloc_count += 1;
                 // R_X86_64_GLOB_DAT: S
                 const sym = try resolveSymbol(dyn_object, reloc.sym_idx);
-                const value = if (try getSubstituteAddress(sym, dyn_object, true)) |a| a else sym.address;
+                const value = if (try getSubstituteAddress(sym, dyn_object, true)) |a| a else try sym.getStaticAddress();
                 logger.debug("  GLOB_DAT: 0x{x} (0x{x}): 0x{x} -> 0x{x} (0x{x}, {s}@{s} + 0x{x})", .{ reloc_addr, reloc.offset, ptr.*, value, sym.value, sym.name, sym.version, reloc.addend });
                 ptr.* = value;
             },
@@ -2663,7 +2665,7 @@ fn processRelocations(dyn_object: *DynObject) !void {
                 reloc_count += 1;
                 // R_X86_64_JUMP_SLOT: S
                 const sym = try resolveSymbol(dyn_object, reloc.sym_idx);
-                const value = if (try getSubstituteAddress(sym, dyn_object, true)) |a| a else sym.address;
+                const value = if (try getSubstituteAddress(sym, dyn_object, true)) |a| a else try sym.getStaticAddress();
                 logger.debug("  JUMP_SLOT: 0x{x} (0x{x}): 0x{x} -> 0x{x} (0x{x}, {s}@{s} + 0x{x})", .{ reloc_addr, reloc.offset, ptr.*, value, sym.value, sym.name, sym.version, reloc.addend });
                 ptr.* = value;
             },
@@ -2869,6 +2871,55 @@ fn processIRelativeRelocations(dyn_object: *DynObject) !void {
     logger.debug("processed {d} IRELATIVE relocations for {s}", .{ reloc_count, dyn_object.name });
 }
 
+/// Builds a TLS definition, including before the module's TLS is installed.
+fn makeTlsDefinition(object: *const DynObject, sym_idx: usize) ResolvedSymbol {
+    const sym = object.syms_array.items[sym_idx];
+    std.debug.assert(sym.type == .TLS);
+
+    return .{
+        .value = sym.value,
+        .location = .tls,
+        .name = sym.name,
+        .version = sym.version,
+        .dyn_object_idx = state.dyn_objects.getIndex(object.key).?,
+        .sym_idx = sym_idx,
+    };
+}
+
+/// Selects a TLS definition and retains any selected preload provider.
+fn lookupTlsSymbol(object: *DynObject, sym_idx: usize, allow_preload_override: bool) anyerror!ResolvedSymbol {
+    const sym = makeTlsDefinition(object, sym_idx);
+    const is_preload_root = std.mem.findScalar(usize, state.preload_root_indices.items, sym.dyn_object_idx) != null;
+
+    if (allow_preload_override and !is_preload_root) {
+        // Match ordinary lookup's preload policy, retaining the entire definition
+        // rather than substituting an address belonging to a particular thread.
+        const replacement = getResolvedSymbolByName(null, sym.name, false, true, false) catch |err| switch (err) {
+            error.UnresolvedSymbol => return sym,
+            else => return err,
+        };
+
+        if (std.mem.findScalar(usize, object.binding_dependencies.items, replacement.dyn_object_idx) == null) {
+            try object.binding_dependencies.append(state.allocator, replacement.dyn_object_idx);
+        }
+
+        return replacement;
+    }
+
+    return sym;
+}
+
+/// Returns this thread's symbol address. The module's TLS must be installed.
+fn getRuntimeSymbolAddress(sym: ResolvedSymbol) usize {
+    return switch (sym.location) {
+        .address => |address| address,
+        .tls => blk: {
+            const object = &state.dyn_objects.values()[sym.dyn_object_idx];
+            break :blk libc.currentThreadPointer() - object.tls_offset + sym.value;
+        },
+    };
+}
+
 // Looks up libc runtime data without invoking IFUNC resolvers or applying
 // substitutions; this can run before relocation completes.
 // TODO replace registry-order lookup with explicit scopes: private runtime
@@ -2887,6 +2938,8 @@ fn resolveLibcRuntimeSymbol(sym_name: []const u8) !ResolvedSymbol {
                         logger.debug("WARNING: ABSOLUTE SYMBOL from dep: {s}", .{dep_sym.name});
                     }
 
+                    if (dep_sym.type == .TLS) return makeTlsDefinition(dep_object, dep_sym_idx);
+
                     const dep_sym_address = dep_sym.value;
 
                     var dep_addr = try dep_object.virtualToLoadedAddress(dep_sym_address, false);
@@ -2896,7 +2949,7 @@ fn resolveLibcRuntimeSymbol(sym_name: []const u8) !ResolvedSymbol {
 
                     return .{
                         .value = dep_sym.value,
-                        .address = dep_addr,
+                        .location = .{ .address = dep_addr },
                         .name = dep_sym.name,
                         .version = dep_sym.version,
                         .dyn_object_idx = state.dyn_objects.getIndex(dep_object.key).?,
@@ -2944,8 +2997,9 @@ fn getResolvedSymbolByName(maybe_dyn_object: ?*DynObject, sym_name: []const u8, 
                             logger.debug("WARNING: ABSOLUTE SYMBOL from dep: {s}", .{dep_sym.name});
                         }
 
-                        const dep_sym_address = dep_sym.value;
+                        if (dep_sym.type == .TLS) return lookupTlsSymbol(dep_object, dep_sym_idx, allow_preload_override);
 
+                        const dep_sym_address = dep_sym.value;
                         var dep_addr = try dep_object.virtualToLoadedAddress(dep_sym_address, false);
 
                         if (state.ifunc_resolved_addrs.get(dep_addr)) |res_addr| {
@@ -2967,7 +3021,7 @@ fn getResolvedSymbolByName(maybe_dyn_object: ?*DynObject, sym_name: []const u8, 
 
                         return .{
                             .value = dep_sym.value,
-                            .address = dep_addr,
+                            .location = .{ .address = dep_addr },
                             .name = dep_sym.name,
                             .version = dep_sym.version,
                             .dyn_object_idx = state.dyn_objects.getIndex(dep_object.key).?,
@@ -3005,8 +3059,9 @@ fn getResolvedSymbolByName(maybe_dyn_object: ?*DynObject, sym_name: []const u8, 
                             logger.debug("WARNING: ABSOLUTE SYMBOL from dep: {s}", .{dep_sym.name});
                         }
 
-                        const dep_sym_address = dep_sym.value;
+                        if (dep_sym.type == .TLS) return lookupTlsSymbol(dep_object, dep_sym_idx, allow_preload_override);
 
+                        const dep_sym_address = dep_sym.value;
                         var dep_addr = try dep_object.virtualToLoadedAddress(dep_sym_address, false);
 
                         if (state.ifunc_resolved_addrs.get(dep_addr)) |res_addr| {
@@ -3028,7 +3083,7 @@ fn getResolvedSymbolByName(maybe_dyn_object: ?*DynObject, sym_name: []const u8, 
 
                         var res_sym: ResolvedSymbol = .{
                             .value = dep_sym.value,
-                            .address = dep_addr,
+                            .location = .{ .address = dep_addr },
                             .name = dep_sym.name,
                             .version = dep_sym.version,
                             .dyn_object_idx = state.dyn_objects.getIndex(dep_object.key).?,
@@ -3037,11 +3092,11 @@ fn getResolvedSymbolByName(maybe_dyn_object: ?*DynObject, sym_name: []const u8, 
 
                         if (!only_preload) {
                             if (try getSubstituteAddress(res_sym, dep_object, allow_preload_override)) |a| {
-                                res_sym.address = a;
+                                res_sym.location = .{ .address = a };
                             }
                         }
 
-                        logger.debug("symbol.selected: symbol={s} version={s} provider_index={d} value=0x{x} resolved_host=0x{x}", .{ res_sym.name, res_sym.version, res_sym.dyn_object_idx, res_sym.value, res_sym.address });
+                        logger.debug("symbol.selected: symbol={s} version={s} provider_index={d} value=0x{x} location={any}", .{ res_sym.name, res_sym.version, res_sym.dyn_object_idx, res_sym.value, res_sym.location });
                         return res_sym;
                     }
 
@@ -3067,8 +3122,9 @@ fn getResolvedSymbolByName(maybe_dyn_object: ?*DynObject, sym_name: []const u8, 
                             logger.debug("WARNING: ABSOLUTE SYMBOL from dep: {s}", .{dep_sym.name});
                         }
 
-                        const dep_sym_address = dep_sym.value;
+                        if (dep_sym.type == .TLS) return lookupTlsSymbol(dep_object, dep_sym_idx, allow_preload_override);
 
+                        const dep_sym_address = dep_sym.value;
                         var dep_addr = try dep_object.virtualToLoadedAddress(dep_sym_address, false);
 
                         if (state.ifunc_resolved_addrs.get(dep_addr)) |res_addr| {
@@ -3090,7 +3146,7 @@ fn getResolvedSymbolByName(maybe_dyn_object: ?*DynObject, sym_name: []const u8, 
 
                         var res_sym: ResolvedSymbol = .{
                             .value = dep_sym.value,
-                            .address = dep_addr,
+                            .location = .{ .address = dep_addr },
                             .name = dep_sym.name,
                             .version = dep_sym.version,
                             .dyn_object_idx = state.dyn_objects.getIndex(dep_object.key).?,
@@ -3099,11 +3155,11 @@ fn getResolvedSymbolByName(maybe_dyn_object: ?*DynObject, sym_name: []const u8, 
 
                         if (!only_preload) {
                             if (try getSubstituteAddress(res_sym, dep_object, allow_preload_override)) |a| {
-                                res_sym.address = a;
+                                res_sym.location = .{ .address = a };
                             }
                         }
 
-                        logger.debug("symbol.selected: symbol={s} version={s} provider_index={d} value=0x{x} resolved_host=0x{x}", .{ res_sym.name, res_sym.version, res_sym.dyn_object_idx, res_sym.value, res_sym.address });
+                        logger.debug("symbol.selected: symbol={s} version={s} provider_index={d} value=0x{x} location={any}", .{ res_sym.name, res_sym.version, res_sym.dyn_object_idx, res_sym.value, res_sym.location });
                         return res_sym;
                     }
 
@@ -3143,8 +3199,9 @@ fn getResolvedSymbolByNameAndVersion(maybe_dyn_object: ?*DynObject, sym_name: []
                             logger.debug("WARNING: ABSOLUTE SYMBOL from dep: {s}", .{dep_sym.name});
                         }
 
-                        const dep_sym_address = dep_sym.value;
+                        if (dep_sym.type == .TLS) return lookupTlsSymbol(dep_object, dep_sym_idx, allow_preload_override);
 
+                        const dep_sym_address = dep_sym.value;
                         var dep_addr = try dep_object.virtualToLoadedAddress(dep_sym_address, false);
 
                         if (state.ifunc_resolved_addrs.get(dep_addr)) |res_addr| {
@@ -3166,7 +3223,7 @@ fn getResolvedSymbolByNameAndVersion(maybe_dyn_object: ?*DynObject, sym_name: []
 
                         return .{
                             .value = dep_sym.value,
-                            .address = dep_addr,
+                            .location = .{ .address = dep_addr },
                             .name = dep_sym.name,
                             .version = dep_sym.version,
                             .dyn_object_idx = state.dyn_objects.getIndex(dep_object.key).?,
@@ -3204,8 +3261,9 @@ fn getResolvedSymbolByNameAndVersion(maybe_dyn_object: ?*DynObject, sym_name: []
                             logger.debug("WARNING: ABSOLUTE SYMBOL from dep: {s}", .{dep_sym.name});
                         }
 
-                        const dep_sym_address = dep_sym.value;
+                        if (dep_sym.type == .TLS) return lookupTlsSymbol(dep_object, dep_sym_idx, allow_preload_override);
 
+                        const dep_sym_address = dep_sym.value;
                         var dep_addr = try dep_object.virtualToLoadedAddress(dep_sym_address, false);
 
                         if (state.ifunc_resolved_addrs.get(dep_addr)) |res_addr| {
@@ -3227,7 +3285,7 @@ fn getResolvedSymbolByNameAndVersion(maybe_dyn_object: ?*DynObject, sym_name: []
 
                         var res_sym: ResolvedSymbol = .{
                             .value = dep_sym.value,
-                            .address = dep_addr,
+                            .location = .{ .address = dep_addr },
                             .name = dep_sym.name,
                             .version = dep_sym.version,
                             .dyn_object_idx = state.dyn_objects.getIndex(dep_object.key).?,
@@ -3236,11 +3294,11 @@ fn getResolvedSymbolByNameAndVersion(maybe_dyn_object: ?*DynObject, sym_name: []
 
                         if (!only_preload) {
                             if (try getSubstituteAddress(res_sym, dep_object, allow_preload_override)) |a| {
-                                res_sym.address = a;
+                                res_sym.location = .{ .address = a };
                             }
                         }
 
-                        logger.debug("symbol.selected: symbol={s} version={s} provider_index={d} value=0x{x} resolved_host=0x{x}", .{ res_sym.name, res_sym.version, res_sym.dyn_object_idx, res_sym.value, res_sym.address });
+                        logger.debug("symbol.selected: symbol={s} version={s} provider_index={d} value=0x{x} location={any}", .{ res_sym.name, res_sym.version, res_sym.dyn_object_idx, res_sym.value, res_sym.location });
                         return res_sym;
                     }
 
@@ -3266,8 +3324,9 @@ fn getResolvedSymbolByNameAndVersion(maybe_dyn_object: ?*DynObject, sym_name: []
                             logger.debug("WARNING: ABSOLUTE SYMBOL from dep: {s}", .{dep_sym.name});
                         }
 
-                        const dep_sym_address = dep_sym.value;
+                        if (dep_sym.type == .TLS) return lookupTlsSymbol(dep_object, dep_sym_idx, allow_preload_override);
 
+                        const dep_sym_address = dep_sym.value;
                         var dep_addr = try dep_object.virtualToLoadedAddress(dep_sym_address, false);
 
                         if (state.ifunc_resolved_addrs.get(dep_addr)) |res_addr| {
@@ -3289,7 +3348,7 @@ fn getResolvedSymbolByNameAndVersion(maybe_dyn_object: ?*DynObject, sym_name: []
 
                         var res_sym: ResolvedSymbol = .{
                             .value = dep_sym.value,
-                            .address = dep_addr,
+                            .location = .{ .address = dep_addr },
                             .name = dep_sym.name,
                             .version = dep_sym.version,
                             .dyn_object_idx = state.dyn_objects.getIndex(dep_object.key).?,
@@ -3298,11 +3357,11 @@ fn getResolvedSymbolByNameAndVersion(maybe_dyn_object: ?*DynObject, sym_name: []
 
                         if (!only_preload) {
                             if (try getSubstituteAddress(res_sym, dep_object, allow_preload_override)) |a| {
-                                res_sym.address = a;
+                                res_sym.location = .{ .address = a };
                             }
                         }
 
-                        logger.debug("symbol.selected: symbol={s} version={s} provider_index={d} value=0x{x} resolved_host=0x{x}", .{ res_sym.name, res_sym.version, res_sym.dyn_object_idx, res_sym.value, res_sym.address });
+                        logger.debug("symbol.selected: symbol={s} version={s} provider_index={d} value=0x{x} location={any}", .{ res_sym.name, res_sym.version, res_sym.dyn_object_idx, res_sym.value, res_sym.location });
                         return res_sym;
                     }
 
@@ -3330,13 +3389,13 @@ const ResolvedBinding = struct {
 fn resolveSymbol(dyn_object: *DynObject, sym_idx: usize) !ResolvedSymbol {
     const binding = try resolveSymbolInner(dyn_object, sym_idx);
     const sym = binding.symbol;
-    logger.debug("symbol.bind: requester={s} symbol={s} version={s} provider_index={d} symbol_value=0x{x} resolved_host=0x{x}", .{ dyn_object.name, sym.name, sym.version, sym.dyn_object_idx, sym.value, sym.address });
+    logger.debug("symbol.bind: requester={s} symbol={s} version={s} provider_index={d} symbol_value=0x{x} location={any}", .{ dyn_object.name, sym.name, sym.version, sym.dyn_object_idx, sym.value, sym.location });
 
     // Ordinary definitions come from self or the declared dependency closure,
     // which unloading already follows. Only redirected addresses need an owner.
     switch (binding.provenance) {
         .declared_scope, .unresolved_weak => {},
-        .redirected_address => try recordBindingDependency(dyn_object, sym.address, sym.dyn_object_idx),
+        .redirected_address => try recordBindingDependency(dyn_object, try sym.getStaticAddress(), sym.dyn_object_idx),
     }
     return sym;
 }
@@ -3380,6 +3439,11 @@ fn resolveSymbolInner(dyn_object: *DynObject, sym_idx: usize) !ResolvedBinding {
             logger.debug("WARNING: ABSOLUTE SYMBOL: {s}", .{if (sym_idx == 0) "ZERO" else sym.name});
         }
 
+        if (sym.type == .TLS) return .{
+            .symbol = makeTlsDefinition(dyn_object, sym_idx),
+            .provenance = .declared_scope,
+        };
+
         const sym_address = sym.value;
 
         var addr = try dyn_object.virtualToLoadedAddress(sym_address, false);
@@ -3407,7 +3471,7 @@ fn resolveSymbolInner(dyn_object: *DynObject, sym_idx: usize) !ResolvedBinding {
         return .{
             .symbol = .{
                 .value = sym.value,
-                .address = addr,
+                .location = .{ .address = addr },
                 .name = sym.name,
                 .version = sym.version,
                 .dyn_object_idx = state.dyn_objects.getIndex(dyn_object.key).?,
@@ -3440,6 +3504,11 @@ fn resolveSymbolInner(dyn_object: *DynObject, sym_idx: usize) !ResolvedBinding {
                         logger.debug("WARNING: ABSOLUTE SYMBOL from dep: {s}", .{if (sym_idx == 0) "ZERO" else dep_sym.name});
                     }
 
+                    if (dep_sym.type == .TLS) return .{
+                        .symbol = makeTlsDefinition(dep_object, dep_sym_idx),
+                        .provenance = .declared_scope,
+                    };
+
                     const dep_sym_address = dep_sym.value;
 
                     var dep_addr = try dep_object.virtualToLoadedAddress(dep_sym_address, false);
@@ -3467,7 +3536,7 @@ fn resolveSymbolInner(dyn_object: *DynObject, sym_idx: usize) !ResolvedBinding {
                     return .{
                         .symbol = .{
                             .value = dep_sym.value,
-                            .address = dep_addr,
+                            .location = .{ .address = dep_addr },
                             .name = dep_sym.name,
                             .version = dep_sym.version,
                             .dyn_object_idx = dep_idx,
@@ -3494,7 +3563,7 @@ fn resolveSymbolInner(dyn_object: *DynObject, sym_idx: usize) !ResolvedBinding {
         return .{
             .symbol = .{
                 .value = 0,
-                .address = 0,
+                .location = .{ .address = 0 },
                 .name = sym.name,
                 .version = sym.version,
                 .dyn_object_idx = std.math.maxInt(usize),
@@ -3543,6 +3612,8 @@ fn findDynObjectSegmentForLoadedAddr(addr: usize) !DynObjectSegmentResult {
     const dyn_object = &state.dyn_objects.values()[object_result.dyn_object_index];
 
     for (dyn_object.syms_array.items, 0..) |*sym, sym_idx| {
+        if (sym.type == .TLS) continue;
+
         const sym_addr = try dyn_object.virtualToLoadedAddress(sym.value, false);
         if (sym_addr <= addr and sym_addr + sym.size > addr) {
             return .{
@@ -3958,6 +4029,10 @@ const substitutes = std.StaticStringMap(*const anyopaque).initComptime([_]struct
 /// Chooses a native symbol substitute. Returns `null` to keep the native address.
 /// A preload's own lookup skips recursive overrides to reach the next implementation.
 fn getSubstituteAddress(sym: ResolvedSymbol, for_obj: *DynObject, allow_preload_override: bool) anyerror!?usize {
+    const native_address = switch (sym.location) {
+        .address => |address| address,
+        .tls => return null,
+    };
     if (sym.dyn_object_idx == std.math.maxInt(usize)) return null;
 
     const dyn_object = &state.dyn_objects.values()[sym.dyn_object_idx];
@@ -3973,11 +4048,14 @@ fn getSubstituteAddress(sym: ResolvedSymbol, for_obj: *DynObject, allow_preload_
             else => return err,
         };
         if (preload_sym) |psym| {
+            const replacement_address = try psym.getStaticAddress();
+
             if (std.mem.findScalar(usize, for_obj.binding_dependencies.items, psym.dyn_object_idx) == null) {
                 try for_obj.binding_dependencies.append(state.allocator, psym.dyn_object_idx);
             }
-            logger.debug("substitutes: preload override for {s}: 0x{x} => 0x{x}", .{ sym.name, sym.address, psym.address });
-            return psym.address;
+
+            logger.debug("substitutes: preload override for {s}: 0x{x} => 0x{x}", .{ sym.name, native_address, replacement_address });
+            return replacement_address;
         }
     }
 
@@ -3994,10 +4072,10 @@ fn getSubstituteAddress(sym: ResolvedSymbol, for_obj: *DynObject, allow_preload_
     };
 
     if (address == @intFromPtr(&unsubstitutedTrap)) {
-        logger.warn("substitutes: {s}: installing trap for [{s}] {s} at 0x{x}", .{ for_obj.name, dyn_object.name, sym.name, sym.address });
+        logger.warn("substitutes: {s}: installing trap for [{s}] {s} at 0x{x}", .{ for_obj.name, dyn_object.name, sym.name, native_address });
     }
 
-    logger.debug("substitutes: {s}: found for {s}: 0x{x} => 0x{x}", .{ dyn_object.name, sym.name, sym.address, address });
+    logger.debug("substitutes: {s}: found for {s}: 0x{x} => 0x{x}", .{ dyn_object.name, sym.name, native_address, address });
     return address;
 }
 
@@ -4610,9 +4688,10 @@ fn lookupDlSymbol(lib_handle: ?*anyopaque, sym_name: []const u8, version: ?[]con
         return null;
     };
 
-    logger.debug("intercepted call: success: {s}({d} [{s}], \"{s}{s}{s}\") = 0x{x}", .{ operation, @intFromPtr(lib_handle), if (dyn_object) |do| do.name else "NULL", sym_name, version_separator, version_name, sym.address });
+    const address = getRuntimeSymbolAddress(sym);
+    logger.debug("intercepted call: success: {s}({d} [{s}], \"{s}{s}{s}\") = 0x{x}", .{ operation, @intFromPtr(lib_handle), if (dyn_object) |do| do.name else "NULL", sym_name, version_separator, version_name, address });
 
-    return @ptrFromInt(sym.address);
+    return @ptrFromInt(address);
 }
 
 const DlInfo = extern struct {
@@ -5851,26 +5930,26 @@ test "binding retention follows resolution provenance and declared reachability"
     try indices.value_ptr.append(state.allocator, 0);
 
     requester.binding_dependencies.clearRetainingCapacity();
-    try std.testing.expectEqual(@as(usize, 0x2020), (try resolveSymbol(requester, 1)).address);
+    try std.testing.expectEqual(@as(usize, 0x2020), try (try resolveSymbol(requester, 1)).getStaticAddress());
     try std.testing.expectEqual(@as(usize, 0), requester.binding_dependencies.items.len);
 
     requester.syms_array.items[1].name = "missing";
     requester.syms_array.items[1].bind = .WEAK;
-    try std.testing.expectEqual(@as(usize, 0), (try resolveSymbol(requester, 1)).address);
+    try std.testing.expectEqual(@as(usize, 0), try (try resolveSymbol(requester, 1)).getStaticAddress());
     try std.testing.expectEqual(@as(usize, 0), requester.binding_dependencies.items.len);
 
     // Cached redirection must be recognized even for a non-IFUNC definition,
     // both in the requester and in a declared provider.
     requester.syms_array.items[1] = definition;
     try state.ifunc_resolved_addrs.put(state.allocator, 0x1020, 0x3020);
-    try std.testing.expectEqual(@as(usize, 0x3020), (try resolveSymbol(requester, 1)).address);
+    try std.testing.expectEqual(@as(usize, 0x3020), try (try resolveSymbol(requester, 1)).getStaticAddress());
     try std.testing.expectEqualSlices(usize, &.{2}, requester.binding_dependencies.items);
 
     requester.binding_dependencies.clearRetainingCapacity();
     requester.syms_array.items[1] = reference;
     try state.ifunc_resolved_addrs.put(state.allocator, 0x2020, 0x3020);
     for (0..2) |_| {
-        try std.testing.expectEqual(@as(usize, 0x3020), (try resolveSymbol(requester, 1)).address);
+        try std.testing.expectEqual(@as(usize, 0x3020), try (try resolveSymbol(requester, 1)).getStaticAddress());
     }
     try std.testing.expectEqualSlices(usize, &.{2}, requester.binding_dependencies.items);
 
@@ -5889,7 +5968,7 @@ test "binding retention follows resolution provenance and declared reachability"
 
     requester.binding_dependencies.clearRetainingCapacity();
     for (0..2) |_| {
-        try std.testing.expectEqual(@as(usize, 0x3020), (try resolveSymbol(requester, 1)).address);
+        try std.testing.expectEqual(@as(usize, 0x3020), try (try resolveSymbol(requester, 1)).getStaticAddress());
     }
     try std.testing.expectEqualSlices(usize, &.{2}, requester.binding_dependencies.items);
 
@@ -5899,7 +5978,7 @@ test "binding retention follows resolution provenance and declared reachability"
     requester.deps_breadth_first.clearRetainingCapacity();
     try collectDepsBreadthFirst(requester);
     requester.binding_dependencies.clearRetainingCapacity();
-    try std.testing.expectEqual(@as(usize, 0x3020), (try resolveSymbol(requester, 1)).address);
+    try std.testing.expectEqual(@as(usize, 0x3020), try (try resolveSymbol(requester, 1)).getStaticAddress());
     try recordBindingDependency(requester, 0x3020, null);
     try std.testing.expectEqual(@as(usize, 0), requester.binding_dependencies.items.len);
 }

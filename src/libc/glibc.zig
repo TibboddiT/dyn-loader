@@ -92,7 +92,7 @@ pub fn create(services: *const Services, allocator: std.mem.Allocator, object: *
 
     capability = "tls_offsets";
     const layout: Layout = .{
-        .rtld_mapped_address = marker.address,
+        .rtld_mapped_address = try marker.getStaticAddress(),
         .tls_offsets = if (early_init != null)
             try detectGlibcTlsOffsets(allocator, object, try CodeView.fromSymbol(services.inspect(object), "__libc_early_init"))
         else
@@ -106,21 +106,21 @@ pub fn create(services: *const Services, allocator: std.mem.Allocator, object: *
         else => return err,
     };
 
-    logger.debug("glibc.inspect: object={s} integrated_threads={} early_init={} ctype_init={} errno_function_host=0x{x}", .{ object.name, threads != null, early_init != null, ctype_init != null, errno_symbol.address });
+    logger.debug("glibc.inspect: object={s} integrated_threads={} early_init={} ctype_init={} errno_function_host=0x{x}", .{ object.name, threads != null, early_init != null, ctype_init != null, try errno_symbol.getStaticAddress() });
     capability = "runtime_state";
     const state = try allocator.create(State);
     errdefer allocator.destroy(state);
     state.* = .{
         .threads = threads,
-        .earlyInit = if (early_init) |symbol| @ptrFromInt(symbol.address) else null,
-        .initCtype = if (ctype_init) |symbol| @ptrFromInt(symbol.address) else null,
+        .earlyInit = if (early_init) |symbol| @ptrFromInt(try symbol.getStaticAddress()) else null,
+        .initCtype = if (ctype_init) |symbol| @ptrFromInt(try symbol.getStaticAddress()) else null,
     };
 
     var runtime = common.Runtime.init(allocator, .{
         .services = services,
         .state = state,
         .vtable = &vtable,
-        .getErrnoLocation = @ptrFromInt(errno_symbol.address),
+        .getErrnoLocation = @ptrFromInt(try errno_symbol.getStaticAddress()),
     });
     errdefer runtime.write_ops.deinit(allocator);
     try appendWritePlan(&runtime, layout);
@@ -174,7 +174,8 @@ fn threadStorageSize(runtime: *const common.Runtime) usize {
     // its private C definition. The extra page is reserved descriptor space;
     // this value is not the worker's stack size or ELF TLS payload size.
     const symbol = runtime.services.lookupRuntimeSymbol("_thread_db_sizeof_pthread") catch return common.bootstrapThreadStorageSize();
-    const size: *const u32 = @ptrFromInt(symbol.address);
+    const address = symbol.getStaticAddress() catch return common.bootstrapThreadStorageSize();
+    const size: *const u32 = @ptrFromInt(address);
     return size.* + std.heap.pageSize();
 }
 

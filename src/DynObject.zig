@@ -70,14 +70,25 @@ pub const DynSym = struct {
 pub const DynSymList = std.StringArrayHashMapUnmanaged(std.ArrayList(usize));
 
 pub const ResolvedSymbol = struct {
-    // Preserve the ELF value alongside the callable/data host address. Indices
-    // identify the defining registry entry and symbol without retaining pointers.
+    // `value` preserves st_value: an ELF value or a module-relative TLS offset.
+    // Indices identify the defining object and symbol without retaining pointers.
     value: usize,
-    address: usize,
+    location: union(enum) {
+        address: usize,
+        tls,
+    },
     name: []const u8,
     version: []const u8,
     dyn_object_idx: usize,
     sym_idx: usize,
+
+    /// Returns a thread-independent address. TLS requires runtime materialization.
+    pub fn getStaticAddress(self: ResolvedSymbol) error{TlsSymbolHasNoStaticAddress}!usize {
+        return switch (self.location) {
+            .address => |address| address,
+            .tls => error.TlsSymbolHasNoStaticAddress,
+        };
+    }
 };
 
 pub const Reloc = struct {
