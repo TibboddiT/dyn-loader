@@ -1,5 +1,5 @@
-#ifndef DYNLOADER_PROBE_API_H
-#define DYNLOADER_PROBE_API_H
+#ifndef DYN_LOADER_PROBE_API_H
+#define DYN_LOADER_PROBE_API_H
 /* Shared ABI for the native C reference and the static Zig worker. Keep field
  * order and widths synchronized with `tests/workers/libc.zig`. Exported size/version
  * functions are checked before either host passes these records to `probe_run`. */

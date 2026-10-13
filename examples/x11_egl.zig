@@ -1,17 +1,17 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
-const dll = @import("dll");
+const dyn_loader = @import("dyn_loader");
 
 // pub const std_options: std.Options = .{
 //     .log_scope_levels = &.{.{
-//         .scope = .dynamic_library_loader,
+//         .scope = .dyn_loader,
 //         .level = .debug,
 //     }},
 // };
 
 pub const debug = struct {
-    pub const SelfInfo = dll.CustomSelfInfo;
+    pub const SelfInfo = dyn_loader.CustomSelfInfo;
 };
 
 pub const Xlib = struct {
@@ -92,17 +92,17 @@ pub fn main(init: std.process.Init) !void {
     const args = init.minimal.args;
     const environ = init.minimal.environ;
 
-    try dll.init(.{ .allocator = allocator, .io = io, .args = args, .environ = environ });
-    defer dll.deinit();
+    try dyn_loader.init(.{ .allocator = allocator, .io = io, .args = args, .environ = environ });
+    defer dyn_loader.deinit();
 
     std.log.info("loading 'libX11.so.6'...", .{});
-    const lib_x11 = try dll.load("libX11.so.6");
+    const lib_x11 = try dyn_loader.load("libX11.so.6");
 
     std.log.info("loading 'libEGL.so.1'...", .{});
-    const lib_egl = try dll.load("libEGL.so.1");
+    const lib_egl = try dyn_loader.load("libEGL.so.1");
 
     std.log.info("loading 'libGL.so.1'...", .{});
-    const lib_gl = try dll.load("libGL.so.1");
+    const lib_gl = try dyn_loader.load("libGL.so.1");
 
     std.log.info("testing X11 + EGL...", .{});
 

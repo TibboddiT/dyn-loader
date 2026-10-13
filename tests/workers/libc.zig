@@ -5,14 +5,14 @@
 
 const std = @import("std");
 
-const dll = @import("dll");
+const dyn_loader = @import("dyn_loader");
 
 // Keep detailed diagnostics available in optimized workers too. Normal matrix
 // runs retain `.err`; append `--debug` when reproducing one case manually.
 pub const std_options: std.Options = .{ .log_level = .debug };
 
 pub const debug = struct {
-    pub const SelfInfo = dll.CustomSelfInfo;
+    pub const SelfInfo = dyn_loader.CustomSelfInfo;
 };
 
 const abi_version = 1;
@@ -126,7 +126,7 @@ fn fail(allocator: std.mem.Allocator, stage: []const u8, message: []const u8) no
     std.process.exit(2);
 }
 
-fn resolveFunction(comptime Function: type, allocator: std.mem.Allocator, library: dll.DynamicLibrary, name: []const u8) Function {
+fn resolveFunction(comptime Function: type, allocator: std.mem.Allocator, library: dyn_loader.DynamicLibrary, name: []const u8) Function {
     const symbol = library.getSymbol(name) catch |err| fail(allocator, "abi", @errorName(err));
 
     return @ptrFromInt(symbol.addr);
@@ -147,7 +147,7 @@ pub fn main(init: std.process.Init) void {
 
     emit(allocator, .{ .event = "stage", .stage = "init" });
 
-    dll.init(.{
+    dyn_loader.init(.{
         .allocator = allocator,
         .io = init.io,
         .args = init.minimal.args,
@@ -157,7 +157,7 @@ pub fn main(init: std.process.Init) void {
 
     emit(allocator, .{ .event = "stage", .stage = "load" });
 
-    const library = dll.load(args[1]) catch |err| fail(allocator, "load", @errorName(err));
+    const library = dyn_loader.load(args[1]) catch |err| fail(allocator, "load", @errorName(err));
 
     emit(allocator, .{ .event = "stage", .stage = "abi" });
 

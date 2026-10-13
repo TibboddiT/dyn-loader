@@ -13,13 +13,13 @@ pub const Row = struct {
     suite: []const u8,
     name: []const u8,
     reference: protocol.Outcome,
-    dynloader: protocol.Outcome,
+    dyn_loader: protocol.Outcome,
     comparison: protocol.Comparison,
 };
 
 pub const Bootstrap = struct {
     reference: protocol.Outcome,
-    dynloader: protocol.Outcome,
+    dyn_loader: protocol.Outcome,
 };
 
 pub const RuntimeResult = struct {
@@ -32,7 +32,7 @@ pub const RuntimeResult = struct {
     cases: []const Row = &.{},
 };
 
-pub const schema_version = 5;
+pub const schema_version = 6;
 
 pub const Report = struct {
     schema_version: u32 = schema_version,
@@ -98,7 +98,7 @@ pub fn validate(allocator: std.mem.Allocator, report: json.Value) !void {
 }
 
 fn validateOutcomes(value: json.Value) !void {
-    for ([_][]const u8{ "reference", "dynloader" }) |key| {
+    for ([_][]const u8{ "reference", "dyn_loader" }) |key| {
         protocol.validateOutcome(json.field(value, key)) catch return error.InvalidReport;
     }
 }
@@ -271,7 +271,7 @@ pub fn markdown(allocator: std.mem.Allocator, report: json.Value) ![]const u8 {
     });
 
     try writer.writeAll("Reproduction commands run from the project root.\n\n");
-    try writer.writeAll("| Runtime | Suite | Case | Reference | dynloader | Result | Reproduce |\n");
+    try writer.writeAll("| Runtime | Suite | Case | Reference | DynLoader | Result | Reproduce |\n");
     try writer.writeAll("|---|---|---|---|---|---|---|\n");
 
     const runtimes = json.field(report, "runtimes");
@@ -304,7 +304,7 @@ pub fn markdown(allocator: std.mem.Allocator, report: json.Value) ![]const u8 {
 
             const suite = json.field(row, "suite").string;
             const reference = json.field(row, "reference");
-            const loader = json.field(row, "dynloader");
+            const loader = json.field(row, "dyn_loader");
 
             const reference_status = json.stringField(reference, "status");
             const loader_status = json.stringField(loader, "status");
@@ -330,13 +330,13 @@ pub fn markdown(allocator: std.mem.Allocator, report: json.Value) ![]const u8 {
 
     for (runtimes.array.items) |runtime| {
         const bootstrap = json.field(runtime, "bootstrap");
-        const loader_bootstrap = json.field(bootstrap, "dynloader");
+        const loader_bootstrap = json.field(bootstrap, "dyn_loader");
         if (loader_bootstrap == .null) continue;
 
         const status = json.field(loader_bootstrap, "status");
         if (json.isString(status, "pass")) continue;
 
-        try writer.print("**{s} dynloader bootstrap:** `{s}`, stage `{s}`; see `{s}`.\n\n", .{
+        try writer.print("**{s} DynLoader bootstrap:** `{s}`, stage `{s}`; see `{s}`.\n\n", .{
             json.stringField(runtime, "id"),
             json.stringField(loader_bootstrap, "status"),
             json.stringField(loader_bootstrap, "stage"),
@@ -369,7 +369,7 @@ const test_row: Row = .{
     .suite = "libc",
     .name = "test",
     .reference = .{ .status = .pass },
-    .dynloader = .{ .status = .pass },
+    .dyn_loader = .{ .status = .pass },
     .comparison = .pass,
 };
 
@@ -387,7 +387,7 @@ test "current reports render explicit suites and result categories" {
                 .suite = "libc",
                 .name = "test",
                 .reference = .{ .status = .pass },
-                .dynloader = .{ .status = .crash },
+                .dyn_loader = .{ .status = .crash },
                 .comparison = .compatibility_gap,
             },
             .{
@@ -395,7 +395,7 @@ test "current reports render explicit suites and result categories" {
                 .suite = "elf",
                 .name = "elf.test",
                 .reference = .{ .status = .not_applicable },
-                .dynloader = .{ .status = .failure },
+                .dyn_loader = .{ .status = .failure },
                 .comparison = .assertion_failure,
             },
         },
@@ -420,7 +420,7 @@ test "global summaries aggregate runtimes and distinguish preparation from case 
 
     const allocator = arena.allocator();
     var blocked = test_row;
-    blocked.dynloader.status = .not_run;
+    blocked.dyn_loader.status = .not_run;
     blocked.comparison = .blocked;
 
     var unavailable = test_row;
@@ -462,7 +462,7 @@ test "invalid report versions, missing fields, and wrong types are errors" {
     const allocator = arena.allocator();
     var report = try testReport(allocator, &.{.{ .id = "runtime", .cases = &.{test_row} }});
 
-    try json.putField(allocator, &report, "schema_version", .{ .integer = 3 });
+    try json.putField(allocator, &report, "schema_version", .{ .integer = schema_version - 1 });
     try std.testing.expectError(error.InvalidReport, markdown(allocator, report));
     try json.putField(allocator, &report, "schema_version", .{ .integer = schema_version });
 
@@ -478,7 +478,7 @@ test "invalid report versions, missing fields, and wrong types are errors" {
     try std.testing.expectError(error.InvalidReport, markdown(allocator, report));
     try json.putField(allocator, row, "suite", json.string("libc"));
 
-    const outcome = row.object.getPtr("dynloader").?;
+    const outcome = row.object.getPtr("dyn_loader").?;
     _ = outcome.object.swapRemove("exit_code");
     try std.testing.expectError(error.InvalidReport, summarize(allocator, report));
     try json.putField(allocator, outcome, "exit_code", .{ .integer = 0 });

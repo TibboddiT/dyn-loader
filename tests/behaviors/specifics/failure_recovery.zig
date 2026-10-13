@@ -3,7 +3,7 @@
 
 const std = @import("std");
 
-const dll = @import("dll");
+const dyn_loader = @import("dyn_loader");
 const support = @import("behavior_support");
 
 const Allocator = std.mem.Allocator;
@@ -76,7 +76,7 @@ const OffsetAllocator = struct {
 };
 
 fn symbol(comptime T: type, name: []const u8) !T {
-    const resolved = dll.getSymbol(name) catch |err| {
+    const resolved = dyn_loader.getSymbol(name) catch |err| {
         std.debug.print("failure-recovery: resolving {s}: {}\n", .{ name, err });
         return err;
     };
@@ -95,18 +95,18 @@ fn countObjects(_: *anyopaque, _: c_uint, data: ?*anyopaque) callconv(.c) c_int 
 
 pub fn run(init: std.process.Init, fixtures: support.SpecificContext) !void {
     var memory: OffsetAllocator = .{ .failing = .init(init.gpa, .{}) };
-    try dll.init(.{
+    try dyn_loader.init(.{
         .allocator = memory.allocator(),
         .io = init.io,
         .args = init.minimal.args,
         .environ = init.minimal.environ,
         .log_level = .none,
     });
-    defer dll.deinit();
+    defer dyn_loader.deinit();
     defer memory.recover(); // Runs before loader teardown, which may allocate.
 
     const bridge = try support.Bridge.init(fixtures.bridge_path, fixtures.bridge_symbols);
-    _ = try dll.load(fixtures.target_path);
+    _ = try dyn_loader.load(fixtures.target_path);
 
     const malloc = try symbol(*const fn (size: usize) callconv(.c) ?*anyopaque, "malloc");
     const calloc = try symbol(*const fn (count: usize, size: usize) callconv(.c) ?*anyopaque, "calloc");
@@ -118,7 +118,7 @@ pub fn run(init: std.process.Init, fixtures: support.SpecificContext) !void {
     const dlerror = try symbol(*const fn () callconv(.c) ?[*:0]const u8, "dlerror");
     const dlsym = try symbol(*const fn (handle: ?*anyopaque, name: [*:0]const u8) callconv(.c) ?*anyopaque, "dlsym");
     const dladdr = try symbol(*const fn (address: *anyopaque, info: *DlInfo) callconv(.c) c_int, "dladdr");
-    const target_address: *anyopaque = @ptrFromInt((try dll.getSymbol("readState")).addr);
+    const target_address: *anyopaque = @ptrFromInt((try dyn_loader.getSymbol("readState")).addr);
     const iterate = try symbol(*const fn (callback: *const fn (*anyopaque, c_uint, ?*anyopaque) callconv(.c) c_int, data: ?*anyopaque) callconv(.c) c_int, "dl_iterate_phdr");
 
     // Fail both early bookkeeping and later payload allocations, then verify
@@ -163,7 +163,7 @@ pub fn run(init: std.process.Init, fixtures: support.SpecificContext) !void {
     }
 
     memory.failAfter(0);
-    try std.testing.expect(dlsym(null, "dynloader_missing_symbol_for_failure_test") == null);
+    try std.testing.expect(dlsym(null, "dyn_loader_missing_symbol_for_failure_test") == null);
     const message = dlerror() orelse return error.MissingDiagnostic;
     try std.testing.expect(std.mem.span(message).len != 0);
     try std.testing.expect(dlerror() == null);
@@ -243,18 +243,18 @@ pub fn run(init: std.process.Init, fixtures: support.SpecificContext) !void {
 
 pub fn runReallocarray(init: std.process.Init, fixtures: support.SpecificContext) !void {
     var memory: OffsetAllocator = .{ .failing = .init(init.gpa, .{}) };
-    try dll.init(.{
+    try dyn_loader.init(.{
         .allocator = memory.allocator(),
         .io = init.io,
         .args = init.minimal.args,
         .environ = init.minimal.environ,
         .log_level = .none,
     });
-    defer dll.deinit();
+    defer dyn_loader.deinit();
     defer memory.recover();
-    _ = try dll.load(fixtures.bridge_path);
+    _ = try dyn_loader.load(fixtures.bridge_path);
 
-    const resolved = dll.getSymbol("reallocarray") catch |err| switch (err) {
+    const resolved = dyn_loader.getSymbol("reallocarray") catch |err| switch (err) {
         error.UnresolvedSymbol => return error.RequiredSymbolUnavailable,
         else => return err,
     };

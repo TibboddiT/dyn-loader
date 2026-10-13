@@ -4,7 +4,7 @@
 
 const std = @import("std");
 
-const dll = @import("dll");
+const dyn_loader = @import("dyn_loader");
 const support = @import("behavior_support");
 
 threadlocal var host_value: usize = 17;
@@ -16,19 +16,19 @@ fn callback(argument: ?*anyopaque) callconv(.c) *anyopaque {
 }
 
 pub fn run(init: std.process.Init, fixtures: support.SpecificContext) !void {
-    try dll.init(.{
+    try dyn_loader.init(.{
         .allocator = init.gpa,
         .io = init.io,
         .args = init.minimal.args,
         .environ = init.minimal.environ,
         .log_level = .none,
     });
-    defer dll.deinit();
+    defer dyn_loader.deinit();
 
     const bridge = try support.Bridge.init(fixtures.bridge_path, fixtures.bridge_symbols);
     host_value = 42;
     for (0..2) |_| {
-        try std.testing.expectError(error.TlsSurplusExhausted, dll.load(fixtures.target_path));
+        try std.testing.expectError(error.TlsSurplusExhausted, dyn_loader.load(fixtures.target_path));
         try std.testing.expectEqual(@as(usize, 42), host_value);
 
         var handle: usize = undefined;
@@ -41,6 +41,6 @@ pub fn run(init: std.process.Init, fixtures: support.SpecificContext) !void {
     const resources = std.fs.path.dirname(fixtures.target_path).?;
     const small_path = try std.fs.path.join(init.gpa, &.{ resources, "target.so" });
     defer init.gpa.free(small_path);
-    const library = try dll.load(small_path);
+    const library = try dyn_loader.load(small_path);
     _ = try library.getSymbol("readState");
 }

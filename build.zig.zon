@@ -1,5 +1,5 @@
 .{
-    .name = .dynamic_library_loader,
+    .name = .dyn_loader,
     .version = "0.0.0",
     .minimum_zig_version = "0.18.0-dev.120+9fe22a29b",
     .dependencies = .{},
@@ -8,5 +8,5 @@
         "build.zig.zon",
         "src",
     },
-    .fingerprint = 0xa78f1b5f7c564109,
+    .fingerprint = 0x79ebc1f07c564109,
 }

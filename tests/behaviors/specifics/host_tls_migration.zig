@@ -4,7 +4,7 @@
 
 const std = @import("std");
 
-const dll = @import("dll");
+const dyn_loader = @import("dyn_loader");
 const support = @import("behavior_support");
 const LibraryState = @import("regression_abi").LibraryState;
 
@@ -41,12 +41,12 @@ pub fn run(init: std.process.Init, fixtures: support.SpecificContext) !void {
     }
 
     try initHostTlsLoader(init);
-    defer dll.deinit();
+    defer dyn_loader.deinit();
 
     const bridge = try support.Bridge.init(fixtures.bridge_path, fixtures.bridge_symbols);
     try checkMutatedHostTls();
 
-    const target = try dll.load(fixtures.target_path);
+    const target = try dyn_loader.load(fixtures.target_path);
     try checkMutatedHostTls();
 
     const read: ReadState = @ptrFromInt((try target.getSymbol("readState")).addr);
@@ -71,7 +71,7 @@ pub fn run(init: std.process.Init, fixtures: support.SpecificContext) !void {
     try std.testing.expectEqual(@as(u32, 55), state.tls_value);
     try checkMutatedHostTls();
 
-    dll.deinit();
+    dyn_loader.deinit();
     try checkMutatedHostTls();
 
     {
@@ -153,7 +153,7 @@ fn hostTlsCallback(argument: ?*anyopaque) callconv(.c) *anyopaque {
 }
 
 fn initHostTlsLoader(init: std.process.Init) !void {
-    try dll.init(.{
+    try dyn_loader.init(.{
         .allocator = init.gpa,
         .io = init.io,
         .args = init.minimal.args,

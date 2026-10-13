@@ -1,4 +1,4 @@
-const dll = @import("dll");
+const dyn_loader = @import("dyn_loader");
 
 pub const Display = opaque {};
 pub const Proxy = opaque {};
@@ -99,7 +99,7 @@ pub const Api = struct {
     seat_interface: *const Interface,
     output_interface: *const Interface,
 
-    pub fn load(lib: dll.DynamicLibrary) !Api {
+    pub fn load(lib: dyn_loader.DynamicLibrary) !Api {
         const api = Api{
             .display_connect = try getFunction(DisplayConnect, lib, "wl_display_connect"),
             .display_disconnect = try getFunction(DisplayDisconnect, lib, "wl_display_disconnect"),
@@ -282,11 +282,11 @@ pub const Api = struct {
     }
 };
 
-fn getFunction(comptime T: type, lib: dll.DynamicLibrary, name: []const u8) !*const T {
+fn getFunction(comptime T: type, lib: dyn_loader.DynamicLibrary, name: []const u8) !*const T {
     return @ptrFromInt((try lib.getSymbol(name)).addr);
 }
 
-fn getObject(comptime T: type, lib: dll.DynamicLibrary, name: []const u8) !*const T {
+fn getObject(comptime T: type, lib: dyn_loader.DynamicLibrary, name: []const u8) !*const T {
     return @ptrFromInt((try lib.getSymbol(name)).addr);
 }
 

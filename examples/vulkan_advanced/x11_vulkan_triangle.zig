@@ -1,5 +1,5 @@
 const std = @import("std");
-const dll = @import("dll");
+const dyn_loader = @import("dyn_loader");
 const vk = @import("vk.zig");
 const Xlib = @import("xlib.zig").Xlib;
 const VulkanProcResolver = @import("vulkan_proc_resolver.zig").VulkanProcResolver;
@@ -9,13 +9,13 @@ const Allocator = std.mem.Allocator;
 
 // pub const std_options: std.Options = .{
 //     .log_scope_levels = &.{.{
-//         .scope = .dynamic_library_loader,
+//         .scope = .dyn_loader,
 //         .level = .debug,
 //     }},
 // };
 
 pub const debug = struct {
-    pub const SelfInfo = dll.CustomSelfInfo;
+    pub const SelfInfo = dyn_loader.CustomSelfInfo;
 };
 
 const vert_spv align(@alignOf(u32)) = @embedFile("vert.spv").*;
@@ -61,17 +61,17 @@ pub fn main(init: std.process.Init) !void {
     const args = init.minimal.args;
     const environ = init.minimal.environ;
 
-    try dll.init(.{ .allocator = allocator, .io = io, .args = args, .environ = environ });
-    defer dll.deinit();
+    try dyn_loader.init(.{ .allocator = allocator, .io = io, .args = args, .environ = environ });
+    defer dyn_loader.deinit();
 
     std.log.info("loading 'libX11.so.6'...", .{});
 
-    const lib_x11 = try dll.load("libX11.so.6");
+    const lib_x11 = try dyn_loader.load("libX11.so.6");
 
     // Workaround: nvidia's vulkan driver registers X display cleanup callbacks in libXext,
-    // so keep it loaded until dll.deinit().
+    // so keep it loaded until dyn_loader.deinit().
     // See https://forums.developer.nvidia.com/t/vulkan-xlib-issue/230914
-    _ = try dll.load("libXext.so.6");
+    _ = try dyn_loader.load("libXext.so.6");
 
     const xOpenDisplay: *Xlib.XOpenDisplay = @ptrFromInt((try lib_x11.getSymbol("XOpenDisplay")).addr);
     const xDefaultScreen: *Xlib.XDefaultScreen = @ptrFromInt((try lib_x11.getSymbol("XDefaultScreen")).addr);
@@ -93,7 +93,7 @@ pub fn main(init: std.process.Init) !void {
 
     std.log.info("loading 'libvulkan.so.1'...", .{});
 
-    const lib_vulkan = try dll.load("libvulkan.so.1");
+    const lib_vulkan = try dyn_loader.load("libvulkan.so.1");
 
     VulkanProcResolver.lib_vulkan = lib_vulkan;
 

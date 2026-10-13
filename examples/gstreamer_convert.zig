@@ -1,9 +1,9 @@
 const std = @import("std");
 
-const dll = @import("dll");
+const dyn_loader = @import("dyn_loader");
 
 pub const debug = struct {
-    pub const SelfInfo = dll.CustomSelfInfo;
+    pub const SelfInfo = dyn_loader.CustomSelfInfo;
 };
 
 const GError = extern struct {
@@ -44,13 +44,13 @@ pub fn main(init: std.process.Init) !void {
     const args = init.minimal.args;
     const environ = init.minimal.environ;
 
-    try dll.init(.{ .allocator = allocator, .io = io, .args = args, .environ = environ });
-    defer dll.deinit();
+    try dyn_loader.init(.{ .allocator = allocator, .io = io, .args = args, .environ = environ });
+    defer dyn_loader.deinit();
 
     std.log.info("loading 'libgstreamer-1.0.so.0'...", .{});
 
-    const lib_gst = try dll.load("libgstreamer-1.0.so.0");
-    const lib_glib = try dll.load("libglib-2.0.so.0");
+    const lib_gst = try dyn_loader.load("libgstreamer-1.0.so.0");
+    const lib_glib = try dyn_loader.load("libglib-2.0.so.0");
 
     const gstInitCheck: *const fn (argc: ?*c_int, argv: ?*?[*]?[*:0]u8, err: *?*GError) callconv(.c) c_int = @ptrFromInt((try lib_gst.getSymbol("gst_init_check")).addr);
     const gstDeinit: *const fn () callconv(.c) void = @ptrFromInt((try lib_gst.getSymbol("gst_deinit")).addr);

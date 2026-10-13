@@ -13,7 +13,7 @@ const std = @import("std");
 
 pub const Level = enum { debug, info, warn, err, none };
 
-const inner_logger = std.log.scoped(.dynamic_library_loader);
+const inner_logger = std.log.scoped(.dyn_loader);
 pub var level: Level = .debug;
 
 pub fn debug(comptime format: []const u8, args: anytype) void {

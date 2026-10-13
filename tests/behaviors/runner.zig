@@ -4,7 +4,7 @@
 
 const std = @import("std");
 
-const dll = @import("dll");
+const dyn_loader = @import("dyn_loader");
 const regression_abi = @import("regression_abi");
 const support = @import("behavior_support");
 
@@ -151,14 +151,14 @@ pub fn runCase(init: std.process.Init, cases: []const Case, name: []const u8, re
         .reload_cycles, .dependency_lifetime => {}, // Runner owns the loader lifecycle.
     }
 
-    try dll.init(.{
+    try dyn_loader.init(.{
         .allocator = init.gpa,
         .io = init.io,
         .args = init.minimal.args,
         .environ = init.minimal.environ,
         .log_level = .none,
     });
-    defer dll.deinit();
+    defer dyn_loader.deinit();
 
     const bridge = try Bridge.init(bridge_path, case.bridge_symbols);
 

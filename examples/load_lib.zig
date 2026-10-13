@@ -1,17 +1,17 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
-const dll = @import("dll");
+const dyn_loader = @import("dyn_loader");
 
 pub const std_options: std.Options = .{
     .log_scope_levels = &.{.{
-        .scope = .dynamic_library_loader,
+        .scope = .dyn_loader,
         .level = .debug,
     }},
 };
 
 pub const debug = struct {
-    pub const SelfInfo = dll.CustomSelfInfo;
+    pub const SelfInfo = dyn_loader.CustomSelfInfo;
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -20,8 +20,8 @@ pub fn main(init: std.process.Init) !void {
     const args = init.minimal.args;
     const environ = init.minimal.environ;
 
-    try dll.init(.{ .allocator = allocator, .io = io, .args = args, .environ = environ, .log_level = .debug });
-    defer dll.deinit();
+    try dyn_loader.init(.{ .allocator = allocator, .io = io, .args = args, .environ = environ, .log_level = .debug });
+    defer dyn_loader.deinit();
 
     const args_slice = try init.minimal.args.toSlice(allocator);
     defer allocator.free(args_slice);
@@ -36,7 +36,7 @@ pub fn main(init: std.process.Init) !void {
 
         std.log.info("loading '{s}'...", .{lib_name});
 
-        _ = try dll.load(lib_name);
+        _ = try dyn_loader.load(lib_name);
     }
 
     std.log.info("success", .{});

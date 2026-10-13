@@ -211,7 +211,7 @@ fn trimOutput(text: []const u8) []const u8 {
     return std.mem.trim(u8, text, " \r\n\t");
 }
 
-const WorkerKind = enum { assertion, reference, dynloader };
+const WorkerKind = enum { assertion, reference, dyn_loader };
 
 const Runtime = struct {
     // `image` is the pinned execution image (or a built image ID). Informational
@@ -542,7 +542,7 @@ const Matrix = struct {
         const context = matrix.context;
         const allocator = context.allocator;
 
-        const image_tag = try std.fmt.allocPrint(allocator, "dynloader-libc-{s}:{s}", .{ target, runtime.id });
+        const image_tag = try std.fmt.allocPrint(allocator, "dyn_loader-libc-{s}:{s}", .{ target, runtime.id });
         const base_argument = try std.fmt.allocPrint(allocator, "BASE={s}", .{try json.requireString(runtime.metadata, "image")});
         const version_argument = try std.fmt.allocPrint(allocator, "LIBC_PACKAGE_VERSION={s}", .{runtime.package_version});
 
@@ -973,7 +973,7 @@ const Matrix = struct {
         const executable = switch (options.worker) {
             .assertion => "loader-cases",
             .reference => "reference",
-            .dynloader => "libc-runner",
+            .dyn_loader => "libc-runner",
         };
 
         const executable_path = try std.fmt.allocPrint(allocator, "/fixtures/{s}", .{executable});
@@ -1028,7 +1028,7 @@ const Matrix = struct {
         const context = matrix.context;
 
         const suffix = try context.randomSuffix();
-        const container_name = try std.fmt.allocPrint(context.allocator, "dynloader-probe-{s}", .{suffix});
+        const container_name = try std.fmt.allocPrint(context.allocator, "dyn_loader-probe-{s}", .{suffix});
         defer matrix.removeContainer(container_name);
 
         const create_argv = try matrix.createContainerArgs(runtime, options, container_name);
@@ -1184,7 +1184,7 @@ fn runRuntimeCases(
         const suite = case.name[0..separator];
         if (!options.selectsCase(suite, case.name)) continue;
 
-        const log_prefix = try std.fs.path.join(allocator, &.{ logs_dir, case.name, "dynloader" });
+        const log_prefix = try std.fs.path.join(allocator, &.{ logs_dir, case.name, "dyn_loader" });
         const outcome: protocol.Outcome = if (entry.assertion_preparation_error) |reason|
             .{ .status = .not_run, .reason = reason }
         else
@@ -1202,7 +1202,7 @@ fn runRuntimeCases(
             .suite = suite,
             .name = case.name,
             .reference = .{ .status = .not_applicable },
-            .dynloader = outcome,
+            .dyn_loader = outcome,
             .comparison = comparison,
         });
 
@@ -1213,7 +1213,7 @@ fn runRuntimeCases(
 
     if (options.selectsSuite("libc")) {
         const reference_log = try std.fs.path.join(allocator, &.{ logs_dir, "reference-bootstrap" });
-        const loader_log = try std.fs.path.join(allocator, &.{ logs_dir, "dynloader-bootstrap" });
+        const loader_log = try std.fs.path.join(allocator, &.{ logs_dir, "dyn_loader-bootstrap" });
 
         const reference = try matrix.execute(runtime, .{
             .fixtures_dir = fixtures_dir,
@@ -1224,7 +1224,7 @@ fn runRuntimeCases(
 
         var loader = try matrix.execute(runtime, .{
             .fixtures_dir = fixtures_dir,
-            .worker = .dynloader,
+            .worker = .dyn_loader,
             .timeout_ms = options.timeout_ms,
             .log_prefix = loader_log,
         });
@@ -1239,7 +1239,7 @@ fn runRuntimeCases(
             }
         }
 
-        entry.bootstrap = .{ .reference = reference, .dynloader = loader };
+        entry.bootstrap = .{ .reference = reference, .dyn_loader = loader };
 
         if (reference.status != .pass) {
             entry.preparation_error = "reference bootstrap failed; see bootstrap logs";
@@ -1250,7 +1250,7 @@ fn runRuntimeCases(
 
                 const case_dir = try std.fs.path.join(allocator, &.{ logs_dir, case.name });
                 const reference_case_log = try std.fs.path.join(allocator, &.{ case_dir, "reference" });
-                const loader_case_log = try std.fs.path.join(allocator, &.{ case_dir, "dynloader" });
+                const loader_case_log = try std.fs.path.join(allocator, &.{ case_dir, "dyn_loader" });
 
                 const reference_result = try matrix.execute(runtime, .{
                     .fixtures_dir = fixtures_dir,
@@ -1263,13 +1263,13 @@ fn runRuntimeCases(
                 const loader_result: protocol.Outcome = if (loader.status == .pass)
                     try matrix.execute(runtime, .{
                         .fixtures_dir = fixtures_dir,
-                        .worker = .dynloader,
+                        .worker = .dyn_loader,
                         .case_id = case.id,
                         .timeout_ms = options.timeout_ms,
                         .log_prefix = loader_case_log,
                     })
                 else
-                    .{ .status = .not_run, .reason = "dynloader bootstrap failed" };
+                    .{ .status = .not_run, .reason = "DynLoader bootstrap failed" };
 
                 const comparison = protocol.compare(reference_result.status, loader_result.status);
                 try rows.append(allocator, .{
@@ -1277,13 +1277,13 @@ fn runRuntimeCases(
                     .suite = "libc",
                     .name = case.name,
                     .reference = reference_result,
-                    .dynloader = loader_result,
+                    .dyn_loader = loader_result,
                     .comparison = comparison,
                 });
 
                 failed = failed or (comparison != .pass and comparison != .unavailable);
 
-                std.debug.print("[{s}] {s}: reference={t} dynloader={t}\n", .{
+                std.debug.print("[{s}] {s}: reference={t} DynLoader={t}\n", .{
                     entry.id,
                     case.name,
                     reference_result.status,
@@ -1307,7 +1307,7 @@ fn runMatrix(matrix: *Matrix, selected_runtimes: []const Runtime, options: Optio
     const source_paths = libc_sources ++ .{
         "build.zig",
         "build.zig.zon",
-        "src/dll.zig",
+        "src/dyn_loader.zig",
         "src/CodeView.zig",
         "src/DynObject.zig",
         "src/logger.zig",

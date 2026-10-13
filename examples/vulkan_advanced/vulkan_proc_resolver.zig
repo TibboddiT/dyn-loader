@@ -1,10 +1,10 @@
 const std = @import("std");
 
 const vk = @import("vk.zig");
-const dll = @import("dll");
+const dyn_loader = @import("dyn_loader");
 
 pub const VulkanProcResolver = struct {
-    pub var lib_vulkan: dll.DynamicLibrary = undefined;
+    pub var lib_vulkan: dyn_loader.DynamicLibrary = undefined;
 
     pub fn resolver(instance: vk.Instance, procname: [*:0]const u8) vk.PfnVoidFunction {
         _ = instance;

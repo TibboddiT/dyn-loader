@@ -4,14 +4,14 @@
 
 const std = @import("std");
 
-const dll = @import("dll");
+const dyn_loader = @import("dyn_loader");
 const elf = @import("elf_runner");
 const elf_cases = @import("elf_cases").cases;
 const lifecycle = @import("lifecycle_runner");
 const lifecycle_cases = @import("lifecycle_cases").cases;
 
 pub const debug = struct {
-    pub const SelfInfo = dll.CustomSelfInfo;
+    pub const SelfInfo = dyn_loader.CustomSelfInfo;
 };
 
 fn emit(init: std.process.Init, event: anytype) !void {

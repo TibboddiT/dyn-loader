@@ -1,17 +1,17 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
-const dll = @import("dll");
+const dyn_loader = @import("dyn_loader");
 
 // pub const std_options: std.Options = .{
 //     .log_scope_levels = &.{.{
-//         .scope = .dynamic_library_loader,
+//         .scope = .dyn_loader,
 //         .level = .debug,
 //     }},
 // };
 
 pub const debug = struct {
-    pub const SelfInfo = dll.CustomSelfInfo;
+    pub const SelfInfo = dyn_loader.CustomSelfInfo;
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -20,8 +20,8 @@ pub fn main(init: std.process.Init) !void {
     const args = init.minimal.args;
     const environ = init.minimal.environ;
 
-    try dll.init(.{ .allocator = allocator, .io = io, .args = args, .environ = environ });
-    defer dll.deinit();
+    try dyn_loader.init(.{ .allocator = allocator, .io = io, .args = args, .environ = environ });
+    defer dyn_loader.deinit();
 
     var cwd_buf: [1024]u8 = undefined;
     const cwd_idx = try std.process.executableDirPath(io, &cwd_buf);
@@ -32,7 +32,7 @@ pub fn main(init: std.process.Init) !void {
 
     std.log.info("loading '{s}'...", .{lib_c_path});
 
-    const lib_c = try dll.load(lib_c_path);
+    const lib_c = try dyn_loader.load(lib_c_path);
 
     std.log.info("testing libc printf...", .{});
 

@@ -1,18 +1,18 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
-const dll = @import("dll");
+const dyn_loader = @import("dyn_loader");
 
 pub const std_options: std.Options = .{
     // .log_scope_levels = &.{.{
-    //     .scope = .dynamic_library_loader,
+    //     .scope = .dyn_loader,
     //     .level = .debug,
     // }},
     .enable_segfault_handler = true,
 };
 
 pub const debug = struct {
-    pub const SelfInfo = dll.CustomSelfInfo;
+    pub const SelfInfo = dyn_loader.CustomSelfInfo;
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -21,12 +21,12 @@ pub fn main(init: std.process.Init) !void {
     const args = init.minimal.args;
     const environ = init.minimal.environ;
 
-    try dll.init(.{ .allocator = allocator, .io = io, .args = args, .environ = environ });
-    defer dll.deinit();
+    try dyn_loader.init(.{ .allocator = allocator, .io = io, .args = args, .environ = environ });
+    defer dyn_loader.deinit();
 
     std.log.info("loading system libc...", .{});
 
-    const lib_c = try dll.loadSystemLibC();
+    const lib_c = try dyn_loader.loadSystemLibC();
 
     std.log.info("testing libc printf segfault...", .{});
 

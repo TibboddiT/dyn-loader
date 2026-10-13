@@ -4,7 +4,7 @@
 
 const std = @import("std");
 
-const dll = @import("dll");
+const dyn_loader = @import("dyn_loader");
 
 pub const BridgeSymbols = struct {
     open: []const u8,
@@ -32,7 +32,7 @@ pub const Bridge = struct {
     joinThread: *const fn (thread: usize) callconv(.c) c_int,
 
     pub fn init(path: []const u8, symbols: BridgeSymbols) !Bridge {
-        const library = try dll.load(path);
+        const library = try dyn_loader.load(path);
         return .{
             .openLibrary = @ptrFromInt(try symbolAddress(library, symbols.open)),
             .resolveSymbol = @ptrFromInt(try symbolAddress(library, symbols.symbol)),
@@ -58,7 +58,7 @@ pub const Bridge = struct {
         try std.testing.expectEqual(@as(c_int, 0), bridge.closeLibrary(handle));
     }
 
-    fn symbolAddress(library: dll.DynamicLibrary, name: []const u8) !usize {
+    fn symbolAddress(library: dyn_loader.DynamicLibrary, name: []const u8) !usize {
         const resolved = library.getSymbol(name) catch |err| {
             std.debug.print("unable to resolve bridge symbol '{s}': {s}\n", .{ name, @errorName(err) });
             return err;

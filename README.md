@@ -15,7 +15,7 @@ See [this thread](https://ziggit.dev/t/dynamic-linking-without-libc-adventures) 
 For now, the library always follows the latest "master" x86_64 tarball available on [ziglang.org](https://ziglang.org/download/).
 
 ```sh
-zig fetch --save=dll https://github.com/TibboddiT/dyn-loader/archive/refs/heads/main.tar.gz
+zig fetch --save=dyn_loader https://github.com/TibboddiT/dyn-loader/archive/refs/heads/main.tar.gz
 ```
 
 ```zig
@@ -23,21 +23,21 @@ zig fetch --save=dll https://github.com/TibboddiT/dyn-loader/archive/refs/heads/
 
 // ...
 
-    const dll_dep = b.dependency("dll", .{
+    const dyn_loader_dep = b.dependency("dyn_loader", .{
         .optimize = optimize,
         // no `target`, because it is always x86_64 linux baseline
     });
-    const dll_mod = dll_dep.module("dll");
+    const dyn_loader_mod = dyn_loader_dep.module("dyn_loader");
 
 // then add the module to your executable as usual
 ```
 
 ```zig
 const std = @import("std");
-const dll = @import("dll");
+const dyn_loader = @import("dyn_loader");
 
 pub const debug = struct {
-    pub const SelfInfo = dll.CustomSelfInfo;
+    pub const SelfInfo = dyn_loader.CustomSelfInfo;
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -46,14 +46,14 @@ pub fn main(init: std.process.Init) !void {
     const args = init.minimal.args;
     const environ = init.minimal.environ;
 
-    // `dll` is a singleton, it should be initialized early and only once, on the main thread
-    try dll.init(.{ .allocator = allocator, .io = io, .args = args, .environ = environ, .log_level = .err });
-    defer dll.deinit();
+    // DynLoader is a singleton, it should be initialized early and only once, on the main thread
+    try dyn_loader.init(.{ .allocator = allocator, .io = io, .args = args, .environ = environ, .log_level = .err });
+    defer dyn_loader.deinit();
 
-    const lib_c = try dll.loadSystemLibC();
+    const lib_c = try dyn_loader.loadSystemLibC();
 
     // or load any other dynamic library:
-    // const lib_x11 = try dll.load("libX11.so.6");
+    // const lib_x11 = try dyn_loader.load("libX11.so.6");
 
     const printf_sym = try lib_c.getSymbol("printf");
     const printf_addr = printf_sym.addr;

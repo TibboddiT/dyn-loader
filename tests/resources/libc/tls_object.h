@@ -1,5 +1,5 @@
-#ifndef DYNLOADER_TLS_OBJECT_H
-#define DYNLOADER_TLS_OBJECT_H
+#ifndef DYN_LOADER_TLS_OBJECT_H
+#define DYN_LOADER_TLS_OBJECT_H
 
 /* Caller-owned observation storage must outlive the thread's TLS destructors.
  * `destruction_order` appends each object's ordinal as a decimal digit. */

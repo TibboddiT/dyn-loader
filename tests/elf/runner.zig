@@ -5,7 +5,7 @@
 const std = @import("std");
 const elf = std.elf;
 
-const dll = @import("dll");
+const dyn_loader = @import("dyn_loader");
 
 pub const Library = enum {
     non_identity,
@@ -58,7 +58,7 @@ pub const Expectation = union(enum) {
     loaded: []const SymbolCheck,
 
     pub fn checkLoad(expect: Expectation, path: []const u8) !void {
-        const library = dll.load(path) catch |err| {
+        const library = dyn_loader.load(path) catch |err| {
             switch (expect) {
                 .load_error => |expected| return std.testing.expectEqual(expected, err),
                 .loaded => {
@@ -86,7 +86,7 @@ pub const SymbolCheck = struct {
     symbol: []const u8,
     verify: *const fn (address: usize) anyerror!void,
 
-    pub fn run(check: SymbolCheck, library: dll.DynamicLibrary) !void {
+    pub fn run(check: SymbolCheck, library: dyn_loader.DynamicLibrary) !void {
         const symbol = library.getSymbol(check.symbol) catch |err| {
             std.debug.print("unable to resolve symbol '{s}': {s}\n", .{ check.symbol, @errorName(err) });
             return err;
@@ -186,14 +186,14 @@ pub fn runCase(init: std.process.Init, cases: []const Case, name: []const u8, re
     try std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = mutated_path, .data = bytes });
     defer std.Io.Dir.cwd().deleteFile(init.io, mutated_path) catch {};
 
-    try dll.init(.{
+    try dyn_loader.init(.{
         .allocator = init.gpa,
         .io = init.io,
         .args = init.minimal.args,
         .environ = init.minimal.environ,
         .log_level = .none,
     });
-    defer dll.deinit();
+    defer dyn_loader.deinit();
 
     try case.expect.checkLoad(mutated_path);
 }

@@ -113,7 +113,7 @@ static void runpathScope(const struct probe_host_api *host, struct probe_result 
 static void errnoFailure(const struct probe_host_api *host, struct probe_result *result) {
     UNUSED_HOST();
     errno = 0;
-    int fd = open("/__dynloader_matrix_missing__/file", O_RDONLY);
+    int fd = open("/__dyn_loader_matrix_missing__/file", O_RDONLY);
     int saved_errno = errno;
     if (fd >= 0) close(fd);
     EXPECT(result, fd, -1);
@@ -909,7 +909,7 @@ static void timerNotificationModes(const struct probe_host_api *host, struct pro
 static void queueNotificationCancel(const struct probe_host_api *host, struct probe_result *result) {
     UNUSED_HOST();
     char name[64];
-    snprintf(name, sizeof name, "/dynloader-notify-%ld", (long)getpid());
+    snprintf(name, sizeof name, "/dyn_loader-notify-%ld", (long)getpid());
     struct mq_attr attributes = {.mq_maxmsg = 1, .mq_msgsize = 1};
     mqd_t queue = mq_open(name, O_CREAT | O_EXCL | O_RDWR | O_NONBLOCK, 0600, &attributes);
     EXPECT(result, queue != (mqd_t)-1, 1);

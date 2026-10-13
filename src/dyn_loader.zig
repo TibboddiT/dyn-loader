@@ -75,7 +75,7 @@ const InitOptions = struct {
     args: std.process.Args,
     environ: std.process.Environ,
     /// Runtime threshold. Debug output also requires the host's `std_options`
-    /// to enable `.debug` for the `dynamic_library_loader` log scope.
+    /// to enable `.debug` for the `dyn_loader` log scope.
     log_level: logger.Level = .err,
 };
 
@@ -5689,6 +5689,11 @@ test "tracked realloc accepts null and rejects external pointers" {
 }
 
 test "dl symbol lookup preserves versions, caller scopes, and handle validation" {
+    // Invalid lookups below deliberately exercise warning-producing paths.
+    const previous_log_level = logger.level;
+    logger.level = .err;
+    defer logger.level = previous_log_level;
+
     state = .{ .allocator = std.testing.allocator };
     defer {
         for (state.dyn_objects.values()) |*object| {

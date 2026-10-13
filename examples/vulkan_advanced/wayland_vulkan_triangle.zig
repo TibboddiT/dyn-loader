@@ -1,5 +1,5 @@
 const std = @import("std");
-const dll = @import("dll");
+const dyn_loader = @import("dyn_loader");
 const vk = @import("vk.zig");
 const wl = @import("wayland.zig");
 const VulkanProcResolver = @import("vulkan_proc_resolver.zig").VulkanProcResolver;
@@ -9,13 +9,13 @@ const Allocator = std.mem.Allocator;
 
 // pub const std_options: std.Options = .{
 //     .log_scope_levels = &.{.{
-//         .scope = .dynamic_library_loader,
+//         .scope = .dyn_loader,
 //         .level = .debug,
 //     }},
 // };
 
 pub const debug = struct {
-    pub const SelfInfo = dll.CustomSelfInfo;
+    pub const SelfInfo = dyn_loader.CustomSelfInfo;
 };
 
 const vert_spv align(@alignOf(u32)) = @embedFile("vert.spv").*;
@@ -157,17 +157,17 @@ pub fn main(init: std.process.Init) !void {
     const args = init.minimal.args;
     const environ = init.minimal.environ;
 
-    try dll.init(.{ .allocator = allocator, .io = io, .args = args, .environ = environ });
-    defer dll.deinit();
+    try dyn_loader.init(.{ .allocator = allocator, .io = io, .args = args, .environ = environ });
+    defer dyn_loader.deinit();
 
     std.log.info("loading 'libwayland-client.so.0'...", .{});
 
-    const lib_wayland = try dll.load("libwayland-client.so.0");
+    const lib_wayland = try dyn_loader.load("libwayland-client.so.0");
     const wayland = try wl.Api.load(lib_wayland);
 
     std.log.info("loading 'libvulkan.so.1'...", .{});
 
-    const lib_vulkan = try dll.load("libvulkan.so.1");
+    const lib_vulkan = try dyn_loader.load("libvulkan.so.1");
     VulkanProcResolver.lib_vulkan = lib_vulkan;
 
     const display = try wayland.connect();

@@ -17,14 +17,14 @@ pub fn build(b: *std.Build) void {
 
     const use_llvm = b.option(bool, "llvm", "Use LLVM and LLD for loader hosts");
 
-    const dll_mod = b.addModule("dll", .{
-        .root_source_file = b.path("src/dll.zig"),
+    const dyn_loader_mod = b.addModule("dyn_loader", .{
+        .root_source_file = b.path("src/dyn_loader.zig"),
         .target = target,
         .optimize = optimize,
     });
 
-    const dll_tests = b.addTest(.{
-        .root_module = dll_mod,
+    const dyn_loader_tests = b.addTest(.{
+        .root_module = dyn_loader_mod,
         .use_llvm = use_llvm,
         .use_lld = use_llvm,
     });
@@ -35,14 +35,14 @@ pub fn build(b: *std.Build) void {
         .install_subdir = "resources",
     });
 
-    const run_dll_tests = b.addRunArtifact(dll_tests);
+    const run_dyn_loader_tests = b.addRunArtifact(dyn_loader_tests);
 
     const test_step = b.step("test", "Run module tests");
-    test_step.dependOn(&run_dll_tests.step);
+    test_step.dependOn(&run_dyn_loader_tests.step);
 
     const check_step = b.step("check", "Check that everything compiles");
 
-    addTestMatrix(b, check_step, &run_dll_tests.step, dll_mod, target, optimize, use_llvm);
+    addTestMatrix(b, check_step, &run_dyn_loader_tests.step, dyn_loader_mod, target, optimize, use_llvm);
 
     const examples = [_]Example{
         .{ .source_path = "examples/load_lib.zig" },
@@ -62,7 +62,7 @@ pub fn build(b: *std.Build) void {
     };
 
     for (examples) |example| {
-        addExample(b, &resources_dir.step, check_step, dll_mod, target, example.optimize orelse optimize, example, use_llvm);
+        addExample(b, &resources_dir.step, check_step, dyn_loader_mod, target, example.optimize orelse optimize, example, use_llvm);
     }
 }
 
@@ -70,7 +70,7 @@ fn addExample(
     b: *std.Build,
     resources_step: *std.Build.Step,
     check_step: *std.Build.Step,
-    dll_module: *std.Build.Module,
+    dyn_loader_module: *std.Build.Module,
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
     example: Example,
@@ -86,7 +86,7 @@ fn addExample(
             .target = target,
             .optimize = optimize,
             .imports = &.{
-                .{ .name = "dll", .module = dll_module },
+                .{ .name = "dyn_loader", .module = dyn_loader_module },
             },
             .strip = if (example.force_unstripped) false else null,
         }),
@@ -114,7 +114,7 @@ fn addExample(
             .target = target,
             .optimize = optimize,
             .imports = &.{
-                .{ .name = "dll", .module = dll_module },
+                .{ .name = "dyn_loader", .module = dyn_loader_module },
             },
         }),
     });
@@ -122,7 +122,7 @@ fn addExample(
     check_step.dependOn(&check.step);
 }
 
-fn addTestMatrix(b: *std.Build, check_step: *std.Build.Step, dll_tests_step: *std.Build.Step, dll_mod: *std.Build.Module, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, use_llvm: ?bool) void {
+fn addTestMatrix(b: *std.Build, check_step: *std.Build.Step, dyn_loader_tests_step: *std.Build.Step, dyn_loader_mod: *std.Build.Module, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, use_llvm: ?bool) void {
     const regression_abi = b.createModule(.{
         .root_source_file = b.path("tests/resources/regression/abi.zig"),
         .target = target,
@@ -133,14 +133,14 @@ fn addTestMatrix(b: *std.Build, check_step: *std.Build.Step, dll_tests_step: *st
         .root_source_file = b.path("tests/elf/runner.zig"),
         .target = target,
         .optimize = optimize,
-        .imports = &.{.{ .name = "dll", .module = dll_mod }},
+        .imports = &.{.{ .name = "dyn_loader", .module = dyn_loader_mod }},
     });
 
     const behavior_support = b.createModule(.{
         .root_source_file = b.path("tests/behaviors/support.zig"),
         .target = target,
         .optimize = optimize,
-        .imports = &.{.{ .name = "dll", .module = dll_mod }},
+        .imports = &.{.{ .name = "dyn_loader", .module = dyn_loader_mod }},
     });
 
     const lifecycle_runner = b.createModule(.{
@@ -148,7 +148,7 @@ fn addTestMatrix(b: *std.Build, check_step: *std.Build.Step, dll_tests_step: *st
         .target = target,
         .optimize = optimize,
         .imports = &.{
-            .{ .name = "dll", .module = dll_mod },
+            .{ .name = "dyn_loader", .module = dyn_loader_mod },
             .{ .name = "regression_abi", .module = regression_abi },
             .{ .name = "behavior_support", .module = behavior_support },
         },
@@ -171,7 +171,7 @@ fn addTestMatrix(b: *std.Build, check_step: *std.Build.Step, dll_tests_step: *st
         .imports = &.{
             .{ .name = "lifecycle_runner", .module = lifecycle_runner },
             .{ .name = "regression_abi", .module = regression_abi },
-            .{ .name = "dll", .module = dll_mod },
+            .{ .name = "dyn_loader", .module = dyn_loader_mod },
             .{ .name = "behavior_support", .module = behavior_support },
         },
     });
@@ -185,7 +185,7 @@ fn addTestMatrix(b: *std.Build, check_step: *std.Build.Step, dll_tests_step: *st
             .target = target,
             .optimize = optimize,
             .imports = &.{
-                .{ .name = "dll", .module = dll_mod },
+                .{ .name = "dyn_loader", .module = dyn_loader_mod },
                 .{ .name = "elf_runner", .module = elf_runner },
                 .{ .name = "elf_cases", .module = elf_cases },
                 .{ .name = "lifecycle_runner", .module = lifecycle_runner },
@@ -202,7 +202,7 @@ fn addTestMatrix(b: *std.Build, check_step: *std.Build.Step, dll_tests_step: *st
             .root_source_file = b.path("tests/workers/libc.zig"),
             .target = target,
             .optimize = optimize,
-            .imports = &.{.{ .name = "dll", .module = dll_mod }},
+            .imports = &.{.{ .name = "dyn_loader", .module = dyn_loader_mod }},
         }),
     });
 
@@ -233,7 +233,7 @@ fn addTestMatrix(b: *std.Build, check_step: *std.Build.Step, dll_tests_step: *st
     const run_unit_tests = b.addRunArtifact(unit_tests);
     run_matrix.step.dependOn(&run_unit_tests.step);
 
-    run_matrix.step.dependOn(dll_tests_step);
+    run_matrix.step.dependOn(dyn_loader_tests_step);
 
     const run_matrix_step = b.step("run-tests_matrix", "Run ELF, lifecycle, and libc tests (uses docker)");
     run_matrix_step.dependOn(&run_matrix.step);
