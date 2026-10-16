@@ -9,6 +9,28 @@ const host_tls_migration = @import("specifics/host_tls_migration.zig");
 const failure_recovery = @import("specifics/failure_recovery.zig");
 const tls_surplus = @import("specifics/tls_surplus.zig");
 const tls_lookup = @import("specifics/tls_lookup.zig");
+const managed_threads = @import("specifics/managed_threads.zig");
+const constructor_workers = @import("specifics/constructor_workers.zig");
+const contract_failures = @import("specifics/contract_failures.zig");
+const fork_scope = @import("specifics/fork_scope.zig");
+const control = @import("control.zig");
+const resolver_context = @import("specifics/resolver_context.zig");
+const nodelete = @import("specifics/nodelete.zig");
+
+pub const runThreadContractChild = contract_failures.runChild;
+pub fn onLoaderEvent(event: anytype) error{InjectedFailure}!void {
+    switch (event) {
+        .managed_membership_locked => fork_scope.pauseAtMembershipLock(),
+        .allocator_initialized => |allocator| if (control.allocator) |injected| {
+            allocator.* = injected;
+        },
+        .native_preflight => if (control.shouldFail(.native_preflight, null)) return error.InjectedFailure,
+        .native_committed => if (control.shouldFail(.native_committed, null)) return error.InjectedFailure,
+        .worker_preflight => if (control.shouldFail(.worker_preflight, null)) return error.InjectedFailure,
+        .child_preflight => if (control.shouldFail(.child_preflight, null)) return error.InjectedFailure,
+        .constructor_completed => |name| if (control.shouldFail(.constructor_completed, name)) return error.InjectedFailure,
+    }
+}
 
 const bridge_symbols: runner.BridgeSymbols = .{
     .open = "openProbe",
@@ -45,6 +67,78 @@ const mutated_state: LibraryState = .{
 };
 
 pub const cases: []const runner.Case = &.{
+    .{
+        .name = "nodelete-elf",
+        .bridge = "bridge.so",
+        .bridge_symbols = bridge_symbols,
+        .library = "nodelete.so",
+        .behavior = .{ .specific = .{ .run = &nodelete.runElf } },
+    },
+    .{
+        .name = "nodelete-flag",
+        .bridge = "bridge.so",
+        .bridge_symbols = bridge_symbols,
+        .library = "nodelete_plain.so",
+        .behavior = .{ .specific = .{ .run = &nodelete.runFlag } },
+    },
+    .{
+        .name = "nodelete-promotion",
+        .bridge = "bridge.so",
+        .bridge_symbols = bridge_symbols,
+        .library = "nodelete_plain.so",
+        .behavior = .{ .specific = .{ .run = &nodelete.runPromotion } },
+    },
+    .{
+        .name = "early-resolver-context-glibc",
+        .bridge = "bridge.so",
+        .bridge_symbols = bridge_symbols,
+        .library = "resolver_context.so",
+        .requires = .{ .libc_abi = .gnu },
+        .behavior = .{ .specific = .{ .run = &resolver_context.runEarly } },
+    },
+    .{
+        .name = "late-resolver-context-glibc",
+        .bridge = "bridge.so",
+        .bridge_symbols = bridge_symbols,
+        .library = "resolver_context.so",
+        .requires = .{ .libc_abi = .gnu },
+        .behavior = .{ .specific = .{ .run = &resolver_context.runLate } },
+    },
+    .{
+        .name = "restricted-fork",
+        .bridge = "bridge.so",
+        .bridge_symbols = bridge_symbols,
+        .library = "target.so",
+        .behavior = .{ .specific = .{ .run = &fork_scope.run } },
+    },
+    .{
+        .name = "escaped-constructor-failure",
+        .bridge = "bridge.so",
+        .bridge_symbols = bridge_symbols,
+        .library = "constructor_workers.so",
+        .behavior = .{ .specific = .{ .run = &constructor_workers.runFailedLoad } },
+    },
+    .{
+        .name = "thread-contract-failures",
+        .bridge = "bridge.so",
+        .bridge_symbols = bridge_symbols,
+        .library = "target.so",
+        .behavior = .{ .specific = .{ .run = &contract_failures.run } },
+    },
+    .{
+        .name = "constructor-workers",
+        .bridge = "bridge.so",
+        .bridge_symbols = bridge_symbols,
+        .library = "constructor_workers.so",
+        .behavior = .{ .specific = .{ .run = &constructor_workers.run } },
+    },
+    .{
+        .name = "managed-threads",
+        .bridge = "bridge.so",
+        .bridge_symbols = bridge_symbols,
+        .library = "target.so",
+        .behavior = .{ .specific = .{ .run = &managed_threads.run } },
+    },
     .{
         .name = "tls-symbol-lookup",
         .bridge = "bridge.so",

@@ -35,19 +35,24 @@ pub fn run(init: std.process.Init, fixtures: support.SpecificContext) !void {
     try expectInitialHostTls();
     mutateHostTls();
 
+    try initHostTlsLoader(init);
+    defer dyn_loader.deinit();
+
+    try checkMutatedHostTls();
+    const permanent_tp = currentThreadPointer();
+    const permanent_tls = @intFromPtr(&host_initialized);
     {
         const thread = try std.Thread.spawn(.{}, hostTlsThread, .{});
         thread.join();
     }
-
-    try initHostTlsLoader(init);
-    defer dyn_loader.deinit();
 
     const bridge = try support.Bridge.init(fixtures.bridge_path, fixtures.bridge_symbols);
     try checkMutatedHostTls();
 
     const target = try dyn_loader.load(fixtures.target_path);
     try checkMutatedHostTls();
+    try std.testing.expectEqual(permanent_tp, currentThreadPointer());
+    try std.testing.expectEqual(permanent_tls, @intFromPtr(&host_initialized));
 
     const read: ReadState = @ptrFromInt((try target.getSymbol("readState")).addr);
     const set: SetTls = @ptrFromInt((try target.getSymbol("setTls")).addr);
@@ -73,14 +78,16 @@ pub fn run(init: std.process.Init, fixtures: support.SpecificContext) !void {
 
     dyn_loader.deinit();
     try checkMutatedHostTls();
-
-    {
-        const thread = try std.Thread.spawn(.{}, hostTlsThread, .{});
-        thread.join();
-    }
-    try checkMutatedHostTls();
+    try std.testing.expectEqual(permanent_tp, currentThreadPointer());
+    try std.testing.expectEqual(permanent_tls, @intFromPtr(&host_initialized));
 
     try std.testing.expectError(error.ReinitializationUnsupported, initHostTlsLoader(init));
+}
+
+fn currentThreadPointer() usize {
+    return asm ("movq %%fs:0, %[result]"
+        : [result] "=r" (-> usize),
+    );
 }
 
 /// Independently derive module 1's base from executable PT_TLS and compare the
@@ -154,8 +161,6 @@ fn hostTlsCallback(argument: ?*anyopaque) callconv(.c) *anyopaque {
 
 fn initHostTlsLoader(init: std.process.Init) !void {
     try dyn_loader.init(.{
-        .allocator = init.gpa,
-        .io = init.io,
         .args = init.minimal.args,
         .environ = init.minimal.environ,
         .log_level = .none,

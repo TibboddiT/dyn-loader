@@ -57,11 +57,10 @@ const vertices = [_]Vertex{
 
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
-    const io = init.io;
     const args = init.minimal.args;
     const environ = init.minimal.environ;
 
-    try dyn_loader.init(.{ .allocator = allocator, .io = io, .args = args, .environ = environ });
+    try dyn_loader.init(.{ .args = args, .environ = environ });
     defer dyn_loader.deinit();
 
     std.log.info("loading 'libX11.so.6'...", .{});

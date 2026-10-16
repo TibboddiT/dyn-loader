@@ -23,7 +23,7 @@ pub fn fromDynObject(dyn_object: *const DynObject, virtual_address: usize, size_
 }
 
 /// Borrows a symbol's code, rejecting definitions in another object.
-/// Does not consume the inspection. The object must outlive the view.
+/// Does not consume the inspection. The code mapping must outlive the view.
 pub fn fromSymbol(object: DynObject.Inspection, name: []const u8) !CodeView {
     const definition = try object.lookup(object.object, name);
     if (definition.object != object.object) return error.InvalidCodeAddress;

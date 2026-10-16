@@ -17,8 +17,6 @@ fn callback(argument: ?*anyopaque) callconv(.c) *anyopaque {
 
 pub fn run(init: std.process.Init, fixtures: support.SpecificContext) !void {
     try dyn_loader.init(.{
-        .allocator = init.gpa,
-        .io = init.io,
         .args = init.minimal.args,
         .environ = init.minimal.environ,
         .log_level = .none,

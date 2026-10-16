@@ -20,7 +20,7 @@ pub fn main(init: std.process.Init) !void {
     const args = init.minimal.args;
     const environ = init.minimal.environ;
 
-    try dyn_loader.init(.{ .allocator = allocator, .io = io, .args = args, .environ = environ });
+    try dyn_loader.init(.{ .args = args, .environ = environ });
     defer dyn_loader.deinit();
 
     var cwd_buf: [1024]u8 = undefined;

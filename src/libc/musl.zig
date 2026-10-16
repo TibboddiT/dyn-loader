@@ -27,6 +27,7 @@ const State = struct {
 const vtable: common.VTable = .{
     .destroyState = &destroyState,
     .initInitialThread = &initInitialThread,
+    .prepareThreads = &prepareThreads,
     .supportsWorkers = &supportsWorkers,
     .prepareObject = &prepareObject,
     .threadStorageSize = &threadStorageSize,
@@ -110,6 +111,10 @@ fn initInitialThread(runtime: *common.Runtime) !void {
     initMuslInitialThread(&getState(runtime).threads);
 }
 
+fn prepareThreads(runtime: *common.Runtime) !void {
+    prepareMuslThreads(&getState(runtime).threads);
+}
+
 fn supportsWorkers(_: *const common.Runtime) bool {
     // musl creation already validates all thread support.
     return true;
@@ -158,19 +163,11 @@ fn initWorker(runtime: *common.Runtime) common.WorkerHandle {
     };
 }
 
-/// Prepares a worker in the creator while holding the loader registry lock.
-/// Allocates before the one-time native transition to multithreaded operation,
-/// so allocation failure leaves that state unchanged.
+/// Allocates worker-owned TSD before publishing a lifecycle record. Process-wide
+/// preparation is already complete and does not participate in worker rollback.
 fn prepareWorker(worker: *common.WorkerHandle) !void {
     const threads = &getState(worker.runtime).threads;
     worker.state = try MuslWorker.create(worker.runtime.allocator, threads.tsd_slots);
-
-    const was_threaded = threads.threaded;
-    prepareMuslThreads(threads);
-    if (!was_threaded) {
-        // Preserve the reserved signals unblocked by the first-thread transition.
-        worker.creator_mask.?[0] &= ~musl_thread_signal_bits;
-    }
 }
 
 fn beginSpawn(worker: *common.WorkerHandle) void {
@@ -1439,15 +1436,15 @@ fn enableMuslFileLock(file: usize) void {
 }
 
 /// Completes the first-thread transition before publishing the worker.
-/// Requires the loader's thread registry lock. The caller must preserve changes
-/// to the reserved-signal mask.
+/// Requires transaction ownership on the initial thread. Host-only threads may
+/// already exist, but no other native libc user has been admitted.
 /// Runs once on the initial thread, replacing `pthread_create`'s `!libc.threaded`
 /// setup that Zig spawning bypasses.
 /// Native first-thread transition, lines 249-262:
 /// https://git.musl-libc.org/cgit/musl/tree/src/thread/pthread_create.c?h=v1.2.5#n249
 fn prepareMuslThreads(threads: *MuslThreads) void {
     if (threads.threaded) return;
-    std.debug.assert(currentThreadPointer() == threads.initial_tp);
+    if (currentThreadPointer() != threads.initial_tp) @panic("musl preparation requires the initial thread");
 
     {
         var file = threads.stdio.lockFiles().*;

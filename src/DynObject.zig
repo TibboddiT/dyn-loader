@@ -6,6 +6,11 @@ const logger = @import("logger.zig");
 
 const DynObject = @This();
 
+/// Loader-assigned identity, distinct from an object-registry index.
+pub const TlsModuleId = struct {
+    value: usize,
+};
+
 pub const LoadSegmentFlags = struct {
     read: bool,
     write: bool,
@@ -67,11 +72,67 @@ pub const DynSym = struct {
     }
 };
 
-pub const DynSymList = std.StringArrayHashMapUnmanaged(std.ArrayList(usize));
+/// Names map to ranges in one owned index buffer, preserving ELF symbol order.
+/// Name keys borrow the symbol strings; returned ranges borrow the index buffer.
+pub const DynSymList = struct {
+    const Range = struct { start: usize = 0, len: usize = 0 };
+
+    names: std.StringArrayHashMapUnmanaged(Range) = .empty,
+    indices: std.ArrayList(usize) = .empty,
+
+    pub const empty: DynSymList = .{};
+
+    /// Invalidates previous ranges. Failure leaves an empty index with capacity retained.
+    pub fn build(self: *DynSymList, allocator: std.mem.Allocator, symbols: []const DynSym) !void {
+        self.clearRetainingCapacity();
+        errdefer self.clearRetainingCapacity();
+        try self.names.ensureTotalCapacity(allocator, symbols.len);
+        try self.indices.ensureTotalCapacityPrecise(allocator, symbols.len);
+
+        for (symbols) |symbol| {
+            const entry = self.names.getOrPutAssumeCapacity(symbol.name);
+            if (!entry.found_existing) entry.value_ptr.* = .{};
+            entry.value_ptr.len += 1;
+        }
+
+        var start: usize = 0;
+        for (self.names.values()) |*range| {
+            range.start = start;
+            start += range.len;
+            range.len = 0;
+        }
+        self.indices.items.len = symbols.len;
+        for (symbols, 0..) |symbol, index| {
+            const range = self.names.getPtr(symbol.name).?;
+            self.indices.items[range.start + range.len] = index;
+            range.len += 1;
+        }
+    }
+
+    pub fn get(self: *const DynSymList, name: []const u8) ?[]const usize {
+        const range = self.names.get(name) orelse return null;
+        return self.indices.items[range.start..][0..range.len];
+    }
+
+    pub fn count(self: *const DynSymList) usize {
+        return self.names.count();
+    }
+
+    pub fn clearRetainingCapacity(self: *DynSymList) void {
+        self.names.clearRetainingCapacity();
+        self.indices.clearRetainingCapacity();
+    }
+
+    pub fn deinit(self: *DynSymList, allocator: std.mem.Allocator) void {
+        self.names.deinit(allocator);
+        self.indices.deinit(allocator);
+        self.* = .empty;
+    }
+};
 
 pub const ResolvedSymbol = struct {
     // `value` preserves st_value: an ELF value or a module-relative TLS offset.
-    // Indices identify the defining object and symbol without retaining pointers.
+    // Indices avoid registry-entry pointers; names and versions borrow the ELF file mapping.
     value: usize,
     location: union(enum) {
         address: usize,
@@ -146,6 +207,8 @@ tls_init_mem_size: usize,
 tls_align: usize,
 tls_offset: usize,
 tls_mapped_at: usize,
+tls_module_id: ?TlsModuleId = null,
+tls_published: bool = false,
 
 eh: *std.elf.Elf64_Ehdr,
 eh_init_file_offset: usize,
@@ -171,10 +234,16 @@ fini_array_addr: usize,
 fini_array_size: usize,
 
 // These flags describe separate phases, not interchangeable "loaded" states.
-loaded: bool, // Final permissions applied; debug registration follows this flag.
+loaded: bool, // Final permissions and debug publication are complete.
+initializing: bool = false,
+initialization_failed: bool = false,
+execution_started: bool = false,
 init_called: bool,
 current_epoch: u30,
 ref_count: usize,
+host_open_count: usize = 0,
+nodelete_requested: bool = false,
+nodelete: bool = false,
 loaded_at: ?usize,
 loaded_size: usize,
 reservation: ?[]align(std.heap.pageSize()) u8,
@@ -183,6 +252,7 @@ tls_slot_align: usize,
 load_requested: bool,
 finalizing: bool,
 pinned: bool,
+runtime_pinned: bool = false,
 tls_destructors: usize,
 binding_dependencies: std.ArrayList(usize),
 phdr_info: ?*std.posix.dl_phdr_info,

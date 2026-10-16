@@ -41,13 +41,11 @@ pub const debug = struct {
 };
 
 pub fn main(init: std.process.Init) !void {
-    const allocator = init.gpa;
-    const io = init.io;
     const args = init.minimal.args;
     const environ = init.minimal.environ;
 
-    // DynLoader is a singleton, it should be initialized early and only once, on the main thread
-    try dyn_loader.init(.{ .allocator = allocator, .io = io, .args = args, .environ = environ, .log_level = .err });
+    // Initialize once, on the initial thread, before any additional threads.
+    try dyn_loader.init(.{ .args = args, .environ = environ, .log_level = .err });
     defer dyn_loader.deinit();
 
     const lib_c = try dyn_loader.loadSystemLibC();
@@ -63,9 +61,143 @@ pub fn main(init: std.process.Init) !void {
 }
 ```
 
+## Public API
+
+The loader is process-wide. Its internal allocations use `std.heap.smp_allocator`,
+and it owns its `Io.Threaded` I/O backend. Functions returning caller-owned memory take an allocator explicitly.
+
+### Initialization and teardown
+
+```zig
+pub fn init(options: InitOptions) !void;
+pub fn deinit() void;
+```
+
+`init` must run on the initial thread, before creating additional threads or loading libraries.
+It establishes the fixed TLS layout. Pointers into executable thread-local variables obtained
+before successful initialization become stale.
+
+`InitOptions` has the following fields:
+
+| Field | Type / values | Default | Purpose |
+| --- | --- | --- | --- |
+| `args` | `std.process.Args` | Required | Process arguments, normally `init.minimal.args`. |
+| `environ` | `std.process.Environ` | Required | Process environment, normally `init.minimal.environ`. |
+| `log_level` | `.debug`, `.info`, `.warn`, `.err`, `.none` | `.err` | Runtime logging threshold. Host `std.log` filtering also applies. |
+| `tls_surplus_size` | `usize` | `0x100000` (1 MiB) | Reserved library TLS bytes, including alignment padding. Fixed at initialization. |
+
+Before calling `deinit`, join application-owned managed workers and stop external calls into
+loaded libraries. Teardown runs eligible finalizers and frees resources. Libraries marked
+NODELETE retain their dependencies and supporting runtime, including the I/O backend.
+Repeated `deinit` calls are no-op. Reinitialization after teardown is unsupported.
+
+### Finding and loading libraries
+
+```zig
+pub fn resolve(allocator: std.mem.Allocator, name: []const u8) !?[]const u8;
+pub fn load(f_path: []const u8) !DynamicLibrary;
+pub fn loadSystemLibC() !DynamicLibrary;
+```
+
+- **`resolve`** searches for a supported ELF library without loading it. It returns `null`
+  when no candidate is found. The caller owns the returned path memory.
+- **`load`** accepts a library name or path and loads it with its dependencies. Constructors finish
+  before it returns. A failed load attempts cleanup.
+- **`loadSystemLibC`** loads the first system-libc candidate found. It does not retry another
+  ABI if that load fails.
+
+For example, within an initialized loader:
+
+```zig
+if (try dyn_loader.resolve(init.gpa, "libvulkan.so.1")) |path| {
+    defer init.gpa.free(path);
+    _ = try dyn_loader.load(path);
+}
+```
+
+`DynamicLibrary` is a handle to a loaded library and its dependency scope. Copies refer to
+the same load; copying does not acquire a separate reference. Its `index` field is an internal
+registry identifier. There is currently no public per-library unload function.
+
+### Looking up symbols
+
+```zig
+// Module-level lookup:
+pub fn getSymbol(sym_name: []const u8) !Symbol;
+
+// DynamicLibrary method:
+pub fn getSymbol(lib: DynamicLibrary, sym_name: []const u8) !Symbol;
+```
+
+`dyn_loader.getSymbol` searches the global loader scope. `library.getSymbol` searches preload
+roots first, then that library and its dependencies.
+
+The result has an `addr: usize` field. To convert the address to the correct native pointer type:
+
+```zig
+const lib_c = try dyn_loader.loadSystemLibC();
+const symbol = try lib_c.getSymbol("puts");
+const puts: *const fn ([*:0]const u8) callconv(.c) c_int = @ptrFromInt(symbol.addr);
+_ = puts("Hello from a loaded library");
+```
+
+Symbol addresses are not allocations to free. They remain valid only while their
+defining mappings remain loaded. TLS symbols identify the calling thread's instance: look
+them up separately in each thread and do not retain them past that thread's lifetime.
+Library handles become invalid when their objects retire. NODELETE retention can keep
+objects and their symbols valid beyond `deinit`.
+
+### Managed threads
+
+```zig
+pub fn spawn(
+    config: std.Thread.SpawnConfig,
+    comptime function: anytype,
+    args: anytype,
+) !Thread;
+
+// Thread method:
+pub fn join(self: Thread) void;
+```
+
+Use `dyn_loader.spawn` for Zig workers that call loaded libraries. It establishes both
+executable and native-library TLS. A native libc with ready threading support must already
+be loaded, and the caller must be the initial thread or another managed worker.
+
+The function must return `void`. Arguments are passed as a tuple and copied by value.
+
+```zig
+fn worker(value: usize) void {
+    std.debug.print("worker value: {d}\n", .{value});
+}
+
+fn runWorker() !void {
+    const thread = try dyn_loader.spawn(.{}, worker, .{@as(usize, 42)});
+    thread.join();
+}
+```
+
+`Thread` represents one join obligation. Copies share that obligation: join exactly once.
+Its `index` and `native_handle` fields are internal identifiers. Invalid, duplicate, stale,
+or self-joins panic. Detachment is unsupported. Failed startup reclaims the failed child
+and its resources before returning an error.
+
+### Debug information
+
+`CustomSelfInfo` integrates loaded-library symbols and unwind information with Zig's debug
+facilities. Enable it in the executable's root source file:
+
+```zig
+pub const debug = struct {
+    pub const SelfInfo = dyn_loader.CustomSelfInfo;
+};
+```
+
+
 ## Current known limitations
 
-- Initializing the loader and loading libraries should be done before starting any thread.
+- Initialization requires the initial thread to be the only thread. `/proc/self/task` must be accessible.
+- Ordinary `std.Thread.spawn` workers must not interact with the loader. Use `dyn_loader.spawn` for workers that call loaded libraries.
 - Dirty tricks are used to manually initialize the supported libc (glibc and musl).
 - Some libc functions that need to be implemented in Zig are not yet implemented.
 

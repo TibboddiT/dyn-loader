@@ -7,6 +7,7 @@ const logger = @import("logger.zig");
 const CodeView = @import("CodeView.zig");
 const musl = @import("libc/musl.zig");
 const glibc = @import("libc/glibc.zig");
+const hooks = @import("hooks.zig");
 const ResolvedSymbol = DynObject.ResolvedSymbol;
 
 /// Loader operations used during native-runtime inspection and preparation.
@@ -15,6 +16,8 @@ const ResolvedSymbol = DynObject.ResolvedSymbol;
 /// The loader owns registries; Zig owns thread stacks and kernel thread-exit
 /// notification.
 pub const Services = struct {
+    /// Bytes reserved by the loader at and above the thread pointer.
+    native_metadata_capacity: usize,
     lookupSymbol: *const fn (object: *DynObject, name: []const u8, allow_preload_override: bool) anyerror!ResolvedSymbol,
     lookupRuntimeSymbol: *const fn (name: []const u8) anyerror!ResolvedSymbol,
     definingObject: *const fn (symbol: ResolvedSymbol) *DynObject,
@@ -63,11 +66,12 @@ pub const WriteOp = struct {
 };
 
 /// Every slot has an explicit implementation, including intentional no-ops.
-/// Creator-side preparation/spawn callbacks run under the registry lock. Child
-/// callbacks and post-startup/join release use the contracts on `WorkerHandle`.
+/// Worker resource preparation and native registration run without the thread-registry lock.
+/// Backends synchronize native lists independently of loader metadata.
 pub const VTable = struct {
     destroyState: *const fn (runtime: *Runtime) void,
     initInitialThread: *const fn (runtime: *Runtime) anyerror!void,
+    prepareThreads: *const fn (runtime: *Runtime) anyerror!void,
     supportsWorkers: *const fn (runtime: *const Runtime) bool,
     prepareObject: *const fn (runtime: *Runtime, object: *DynObject) anyerror!void,
     threadStorageSize: *const fn (runtime: *const Runtime) usize,
@@ -83,16 +87,19 @@ pub const VTable = struct {
     releaseAfterJoin: *const fn (worker: *const WorkerHandle) void,
 };
 
-const NativeBinding = struct {
-    object_index: usize,
-    address: usize,
-};
-
-/// Owns heap-allocated backend state and its write plan. Copying transfers ownership.
+/// Owns heap-allocated backend state and its write plan. Copies alias that storage;
+/// only one owner may deinitialize it.
 /// Keep this handle and its services stable until all workers join and release
 /// their backend storage.
 pub const Runtime = struct {
     pub const Worker = WorkerHandle;
+
+    pub const Readiness = enum(u8) {
+        unavailable,
+        preparing,
+        ready,
+        permanently_failed,
+    };
 
     pub const InitOptions = struct {
         services: *const Services,
@@ -107,8 +114,11 @@ pub const Runtime = struct {
     vtable: *const VTable,
     write_ops: std.ArrayList(WriteOp),
     getErrnoLocation: *const fn () callconv(.c) *c_int,
-    native_mq_notify: ?NativeBinding,
-    native_timer_create: [4]?NativeBinding,
+    native_mq_notify: std.atomic.Value(usize),
+    native_timer_create: [4]std.atomic.Value(usize),
+    readiness: std.atomic.Value(Readiness) = .init(.unavailable),
+    initial_fields_written: bool = false,
+    initial_thread_initialized: bool = false,
 
     /// Takes ownership of backend state; services and native code remain borrowed.
     pub fn init(allocator: std.mem.Allocator, options: InitOptions) Runtime {
@@ -119,8 +129,8 @@ pub const Runtime = struct {
             .vtable = options.vtable,
             .write_ops = .empty,
             .getErrnoLocation = options.getErrnoLocation,
-            .native_mq_notify = null,
-            .native_timer_create = @splat(null),
+            .native_mq_notify = .init(0),
+            .native_timer_create = @splat(.init(0)),
         };
     }
 
@@ -142,15 +152,37 @@ pub const Runtime = struct {
         logger.debug("libc.prepare: object={s} action=complete workers_supported={}", .{ object.name, self.supportsWorkers() });
     }
 
-    pub fn beforeConstructors(self: *Runtime, name: []const u8) !void {
-        if (objectRole(name) == .libc) {
+    /// Requires transaction ownership. Prerequisite discovery happens before
+    /// this boundary; failures during permanent native preparation panic.
+    pub fn beforeConstructors(self: *Runtime, name: []const u8) void {
+        switch (self.readiness.load(.acquire)) {
+            .ready, .preparing => return,
+            .permanently_failed => @panic("native preparation cannot be retried"),
+            .unavailable => {},
+        }
+
+        if (objectRole(name) == .libc and !self.initial_thread_initialized) {
+            self.readiness.store(.preparing, .release);
             logger.debug("libc.initial_thread: action=initialize", .{});
-            self.vtable.initInitialThread(self) catch |err| {
-                logger.err("libc.initial_thread: action=initialize error={t}", .{err});
-                return err;
+            self.vtable.initInitialThread(self) catch {
+                self.readiness.store(.permanently_failed, .release);
+                @panic("native initial-thread initialization failed after commitment");
             };
+            self.initial_thread_initialized = true;
             logger.debug("libc.initial_thread: action=initialized", .{});
         }
+
+        if (!self.initial_thread_initialized or !self.supportsWorkers()) {
+            self.readiness.store(.unavailable, .release);
+            return;
+        }
+
+        self.readiness.store(.preparing, .release);
+        self.vtable.prepareThreads(self) catch {
+            self.readiness.store(.permanently_failed, .release);
+            @panic("native threading preparation failed after commitment");
+        };
+        self.readiness.store(.ready, .release);
     }
 
     pub fn threadStorageSize(self: *const Runtime) usize {
@@ -166,7 +198,9 @@ pub const Runtime = struct {
             logger.debug("libc.write_plan: base={t} offset_or_host=0x{x} value_kind={s}", .{ op.relative_to, op.addr, @tagName(op.value) });
             errdefer logger.err("libc.write_plan: base={t} offset_or_host=0x{x} action=failed", .{ op.relative_to, op.addr });
             switch (op.relative_to) {
-                .tp => {},
+                .tp => {
+                    if (op.addr > self.services.native_metadata_capacity - @sizeOf(usize)) return error.NativeMetadataCapacityExceeded;
+                },
                 .zero => {
                     const location = try self.services.findSegment(op.addr);
                     const segment = location.dyn_object.segments.values()[location.segment_index];
@@ -203,7 +237,11 @@ pub const Runtime = struct {
                 .addr => |literal| literal,
             };
 
-            const location = self.services.findSegment(address) catch null;
+            // Worker TP-relative writes must not consult the growable registry.
+            const location = switch (op.relative_to) {
+                .zero => self.services.findSegment(address) catch null,
+                .tp => null,
+            };
             logger.debug("libc.write: tp_host=0x{x} target_host=0x{x} value_kind={s} value=0x{x} width={d}", .{ thread_pointer, address, @tagName(op.value), value, @as(usize, if (op.value == .tid) @sizeOf(c_int) else @sizeOf(usize)) });
             if (location) |segment| {
                 try segment.dyn_object.unprotectSegment(segment.segment_index);
@@ -227,37 +265,40 @@ pub const Runtime = struct {
     /// versions have separate slots because their native argument ABIs may differ.
     pub fn selectSymbolSubstitute(self: *Runtime, symbol: ResolvedSymbol) !?usize {
         if (std.mem.eql(u8, symbol.name, "mq_notify")) {
-            self.native_mq_notify = try self.nativeBinding(symbol);
+            const address = try self.pinNativeEntry(symbol);
+            self.native_mq_notify.store(address, .release);
             return @intFromPtr(self.services.mq_notify_substitute);
         }
 
         if (std.mem.eql(u8, symbol.name, "timer_create")) {
             const index = glibc.timerBindingIndex(symbol.version);
-            self.native_timer_create[index] = try self.nativeBinding(symbol);
+            const address = try self.pinNativeEntry(symbol);
+            self.native_timer_create[index].store(address, .release);
             return @intFromPtr(self.services.timer_substitutes[index]);
         }
 
         return null;
     }
 
-    fn nativeBinding(self: *const Runtime, symbol: ResolvedSymbol) !NativeBinding {
+    /// Requires transaction ownership. Pins the defining object for the runtime's
+    /// lifetime, including NODELETE retention, so wrappers can retain its entry address.
+    fn pinNativeEntry(self: *const Runtime, symbol: ResolvedSymbol) !usize {
         const object = self.services.definingObject(symbol);
-        return .{
-            .object_index = symbol.dyn_object_idx,
-            .address = try object.virtualToLoadedAddress(symbol.value, false),
-        };
+        const address = try object.virtualToLoadedAddress(symbol.value, false);
+        object.runtime_pinned = true;
+        return address;
     }
 
     pub fn createTimer(self: *const Runtime, binding_index: usize, clock: c_int, event: ?*const NotificationEvent, timer_id: *anyopaque) c_int {
         checkNotification(event);
-        const binding = self.native_timer_create[binding_index].?;
-        const function: *const fn (clock: c_int, event: ?*const NotificationEvent, timer_id: *anyopaque) callconv(.c) c_int = @ptrFromInt(binding.address);
+        const address = self.native_timer_create[binding_index].load(.acquire);
+        const function: *const fn (clock: c_int, event: ?*const NotificationEvent, timer_id: *anyopaque) callconv(.c) c_int = @ptrFromInt(address);
         return function(clock, event, timer_id);
     }
 
     pub fn notifyQueue(self: *const Runtime, queue: c_int, event: ?*const NotificationEvent) c_int {
         checkNotification(event);
-        const function: *const fn (queue: c_int, event: ?*const NotificationEvent) callconv(.c) c_int = @ptrFromInt(self.native_mq_notify.?.address);
+        const function: *const fn (queue: c_int, event: ?*const NotificationEvent) callconv(.c) c_int = @ptrFromInt(self.native_mq_notify.load(.acquire));
         return function(queue, event);
     }
 };
@@ -281,7 +322,7 @@ pub const WorkerHandle = struct {
         if (self.creator_mask) |mask| restoreThreadSignals(&mask);
     }
 
-    /// Prepares worker resources while the caller holds the registry lock.
+    /// Prepares worker resources without holding the registry lock.
     /// Retains no worker resources on failure.
     pub fn prepare(self: *WorkerHandle) !void {
         try self.runtime.vtable.prepareWorker(self);
@@ -296,14 +337,16 @@ pub const WorkerHandle = struct {
         self.spawn_mask = null;
     }
 
-    /// Cancels a successful preparation when Zig cannot spawn the worker.
+    /// Releases a failed creation's resources and native count reservation.
+    /// If a child started, it must have left TLS participation and been joined
+    /// without native registration before creator ownership can be reclaimed.
     pub fn spawnFailed(self: *WorkerHandle) void {
         self.endSpawn();
         self.runtime.vtable.spawnFailed(self);
     }
 
-    /// Runs in the child before acquiring the generic registry lock. Native
-    /// backends use their own list locks after the TP-relative writes complete.
+    /// Runs in an admitted TLS participant without the generic registry lock.
+    /// Backends use their own list locks after the TP-relative writes complete.
     pub fn register(self: *const WorkerHandle, tp: usize) !void {
         logger.debug("worker.register: tp_host=0x{x} parent_tp_host=0x{x} action=begin", .{ tp, self.parent_tp });
         errdefer logger.err("worker.register: tp_host=0x{x} action=failed", .{tp});
@@ -335,7 +378,7 @@ pub const WorkerHandle = struct {
         logger.debug("worker.unregister: tp_host=0x{x} action=complete", .{tp});
     }
 
-    /// Called only after join or during final loader teardown.
+    /// Consumes registry-owned native storage only after actual OS-thread join.
     pub fn releaseAfterJoin(self: *const WorkerHandle) void {
         self.runtime.vtable.releaseAfterJoin(self);
     }
@@ -401,6 +444,8 @@ pub fn inspectObject(services: *const Services, allocator: std.mem.Allocator, ob
 
     phase = "write_plan";
     try runtime.validateWritePlan();
+    if (runtime.threadStorageSize() > services.native_metadata_capacity) return error.NativeMetadataCapacityExceeded;
+    try hooks.emit(.native_preflight);
 
     phase = "allocator_patches";
     try runtime.vtable.patchAllocatorCalls(&runtime, object);

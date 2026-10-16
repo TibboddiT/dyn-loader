@@ -148,8 +148,6 @@ pub fn main(init: std.process.Init) void {
     emit(allocator, .{ .event = "stage", .stage = "init" });
 
     dyn_loader.init(.{
-        .allocator = allocator,
-        .io = init.io,
         .args = init.minimal.args,
         .environ = init.minimal.environ,
         .log_level = if (args.len == 4) .debug else .err,

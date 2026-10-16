@@ -1,5 +1,6 @@
 //! Process-wide ELF loader for statically linked x86-64 Linux hosts.
-//! Callers must serialize loader lifecycle operations.
+//! Loading is serialized and same-thread reentrant. Initialize and tear down on
+//! the initial thread; library-calling workers must use the managed spawn paths.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -10,6 +11,7 @@ const DynObject = @import("DynObject.zig");
 const logger = @import("logger.zig");
 const libc = @import("libc.zig");
 const CodeView = @import("CodeView.zig");
+const hooks = @import("hooks.zig");
 
 const LoadSegmentFlags = DynObject.LoadSegmentFlags;
 const LoadSegment = DynObject.LoadSegment;
@@ -30,8 +32,8 @@ const Symbol = struct {
 };
 
 /// Registry handle for a loaded root and its dependency scope. Copies refer to
-/// the same load; symbol addresses borrow the corresponding native mappings.
-/// Handles and symbols must not be used after loader teardown.
+/// the same load. Handles expire when their object retires; symbol addresses
+/// borrow their defining mappings or thread TLS, which may survive NODELETE teardown.
 pub const DynamicLibrary = struct {
     index: usize,
 
@@ -39,6 +41,10 @@ pub const DynamicLibrary = struct {
     /// The caller supplies the correct native type and calling convention for `addr`.
     /// TLS symbols return this thread's instance; look them up again in other threads.
     pub fn getSymbol(lib: DynamicLibrary, sym_name: []const u8) !Symbol {
+        try requireManaged(.allow_finalization);
+        state.transaction_lock.lock(state.io);
+        defer state.transaction_lock.unlock(state.io);
+
         for (state.preload_root_indices.items) |preload_idx| {
             const preload_dyn_obj = &state.dyn_objects.values()[preload_idx];
             const preload_sym = getResolvedSymbolByName(preload_dyn_obj, sym_name, false, false, true) catch |err| switch (err) {
@@ -47,49 +53,101 @@ pub const DynamicLibrary = struct {
             };
 
             return .{
-                .addr = getRuntimeSymbolAddress(preload_sym),
+                .addr = try getRuntimeSymbolAddress(preload_sym),
             };
         }
 
         const dyn_obj = &state.dyn_objects.values()[lib.index];
         const sym = try getResolvedSymbolByName(dyn_obj, sym_name, false, false, true);
         return .{
-            .addr = getRuntimeSymbolAddress(sym),
+            .addr = try getRuntimeSymbolAddress(sym),
         };
     }
 
     // TODO expose public unloading with an explicit handle lifetime contract.
 };
 
-const InitOptions = struct {
-    allocator: std.mem.Allocator,
-    io: std.Io,
+pub const InitOptions = struct {
+    /// Borrowed process startup data; must outlive any NODELETE runtime.
     args: std.process.Args,
     environ: std.process.Environ,
     /// Runtime threshold. Debug output also requires the host's `std_options`
     /// to enable `.debug` for the `dyn_loader` log scope.
     log_level: logger.Level = .err,
+    /// Library TLS bytes, including slot alignment padding. Fixed at init.
+    tls_surplus_size: usize = 0x100000,
 };
+
+const Lifecycle = enum(u8) {
+    bootstrap,
+    initializing,
+    active,
+    finalizing,
+    retained,
+    deinitialized,
+};
+
+/// Controls whether managed callers may enter during finalization.
+/// Both modes accept active and NODELETE-retained runtimes.
+const Admission = enum {
+    active_only,
+    /// Also permits calls needed by finalizers, such as symbol lookup and joining workers.
+    allow_finalization,
+};
+
+var lifecycle: std.atomic.Value(Lifecycle) = .init(.bootstrap);
 
 // Loader state.
 // -------------
 
 const DynObjectList = std.AutoArrayHashMapUnmanaged(DynObjectId, DynObject);
 
-/// Process-wide state. Must remain at a stable address while active.
+/// Kernel-thread-owned recursive transaction lock. Callbacks may reenter on the
+/// owner thread; asynchronous signal-handler reentry is not supported.
+const LoaderLock = struct {
+    mutex: std.Io.Mutex = .init,
+    owner: std.atomic.Value(u32) = .init(0),
+    depth: usize = 0,
+
+    fn lock(self: *LoaderLock, io: std.Io) void {
+        const tid: u32 = @intCast(std.os.linux.gettid());
+        if (self.owner.load(.acquire) == tid) {
+            self.depth = std.math.add(usize, self.depth, 1) catch @panic("loader lock recursion exhausted");
+            return;
+        }
+
+        self.mutex.lockUncancelable(io);
+        self.depth = 1;
+        self.owner.store(tid, .release);
+    }
+
+    fn unlock(self: *LoaderLock, io: std.Io) void {
+        if (self.owner.load(.acquire) != std.os.linux.gettid() or self.depth == 0) {
+            @panic("loader transaction released by non-owner");
+        }
+
+        self.depth -= 1;
+        if (self.depth != 0) return;
+
+        self.owner.store(0, .release);
+        self.mutex.unlock(io);
+    }
+};
+
+/// Process-wide state. Must remain at a stable address while active or retained.
 /// Workers borrow `libc_runtime`. Teardown is terminal.
 const State = struct {
-    // Lifecycle and borrowed host context.
-    initialized: bool = false,
-    deinitializing: bool = false,
-    deinitialized: bool = false,
+    // Runtime storage and synchronous I/O; no backend task pool or signal handlers.
     allocator: std.mem.Allocator = undefined,
+    io_backend: std.Io.Threaded = .init_single_threaded,
     io: std.Io = undefined,
+    // Borrowed process startup data.
     args: std.process.Args = undefined,
     environ: std.process.Environ = undefined,
 
     // Object registry and lookup state.
     // Indices survive array reallocations; pointers into the registry do not.
+    transaction_lock: LoaderLock = .{},
     dyn_objects: DynObjectList = .empty,
     dyn_objects_sorted_indices: std.ArrayList(usize) = .empty,
     dyn_objects_init_indices: std.ArrayList(usize) = .empty,
@@ -104,14 +162,10 @@ const State = struct {
     libc_runtime: ?libc.Runtime = null,
 
     // Loader TLS bookkeeping; early executable TLS belongs to ElfTlsRuntime.
-    initial_tls_init_file_size: usize = undefined,
-    initial_tls_init_mem_size: usize = undefined,
-    initial_tls_offset: usize = undefined,
-    initial_tls_align: ?usize = null,
-    initial_tls_init_block: []const u8 = undefined,
     current_surplus_size: usize = 0x100000,
-    normal_current_tls_area_desc: ?ElfTlsRuntime.AreaDesc = null,
-    loader_thread_pointer: usize = 0,
+    main_thread_pointer: usize = 0,
+    tls_template: []u8 = &.{},
+    tls_used_below_tp: usize = 0,
 
     // Worker state.
     // Worker and allocation locks do not serialize the loader lifecycle.
@@ -120,6 +174,8 @@ const State = struct {
     thread_current_idx: usize = 1,
     thread_destructors: std.ArrayList(ThreadDestructor) = .empty,
     extra_threads: std.ArrayList(*std.Thread) = .empty,
+    object_lifetimes: std.ArrayList(ObjectLifetime) = .empty,
+    retirement_pending: bool = false,
 
     // Intercepted allocations and retained API results.
     alloc_allocator: std.mem.Allocator = undefined,
@@ -131,20 +187,66 @@ const State = struct {
 
 var state: State = .{};
 
+/// Uses direct syscalls: initialization must not start an Io worker while proving
+/// that the executable TLS allocation is still private to the initial thread.
+fn verifySoleThread() !void {
+    const linux = std.os.linux;
+    const opened = linux.openat(linux.AT.FDCWD, "/proc/self/task", .{ .DIRECTORY = true, .CLOEXEC = true }, 0);
+    if (linux.errno(opened) != .SUCCESS) return error.ThreadCountUnavailable;
+
+    const fd: linux.fd_t = @intCast(opened);
+    defer _ = linux.close(fd);
+
+    var buffer: [4096]u8 align(@alignOf(linux.dirent64)) = undefined;
+    var count: usize = 0;
+    while (true) {
+        const bytes = linux.getdents64(fd, &buffer, buffer.len);
+        if (linux.errno(bytes) != .SUCCESS) return error.ThreadCountUnavailable;
+        if (bytes == 0) break;
+
+        var offset: usize = 0;
+        while (offset < bytes) {
+            const entry: *align(1) const linux.dirent64 = @ptrCast(&buffer[offset]);
+            if (entry.reclen == 0 or entry.reclen > bytes - offset) return error.ThreadCountUnavailable;
+
+            const name_offset = offset + @offsetOf(linux.dirent64, "name");
+            if (name_offset >= offset + entry.reclen) return error.ThreadCountUnavailable;
+            if (buffer[name_offset] != '.') count += 1;
+            if (count > 1) return error.AdditionalThreadsPresent;
+
+            offset += entry.reclen;
+        }
+    }
+
+    if (count != 1) return error.ThreadCountUnavailable;
+}
+
 // Public lifecycle and loading API.
 // ---------------------------------
 
-// TODO synchronize loader lifecycle, registry mutation, and lookup while allowing
-// constructor and resolver callbacks to reenter the loader.
 /// Initializes the loader on the initial thread, before loading or spawning.
-/// Borrows the host context and allocator through `deinit`.
+/// Uses an internal allocator and I/O backend; borrows `args` and `environ`.
+/// Pointers into main executable TLS acquired before successful init go stale.
 /// Reinitialization after teardown is unsupported.
 pub fn init(options: InitOptions) !void {
-    if (state.deinitialized) return error.ReinitializationUnsupported;
-    if (state.initialized) return error.AlreadyInitialized;
+    try requireOwnerProcess();
+    if (std.os.linux.gettid() != ElfTlsRuntime.initial_tid) return error.InitialThreadRequired;
+    switch (lifecycle.load(.acquire)) {
+        .bootstrap => {},
+        .initializing, .active, .finalizing => return error.AlreadyInitialized,
+        .retained, .deinitialized => return error.ReinitializationUnsupported,
+    }
 
-    state.allocator = options.allocator;
-    state.io = options.io;
+    try verifySoleThread();
+    lifecycle.store(.initializing, .release);
+    errdefer lifecycle.store(.bootstrap, .release);
+
+    // NODELETE storage must survive host allocator teardown.
+    state.allocator = std.heap.smp_allocator;
+    try hooks.emit(.{ .allocator_initialized = &state.allocator });
+    state.io_backend = .init_single_threaded;
+    state.io = state.io_backend.io();
+    errdefer state.io_backend.deinit();
     logger.level = options.log_level;
 
     state.alloc_allocator = state.allocator;
@@ -152,22 +254,72 @@ pub fn init(options: InitOptions) !void {
     state.args = options.args;
     state.environ = options.environ;
 
-    // TODO enforce main-thread initialization and the required host linkage mode;
-    // the compile-time platform check already rejects hosts linked against libc.
-
-    state.initialized = true;
+    try ElfTlsRuntime.installPermanent(options.tls_surplus_size);
+    lifecycle.store(.active, .release);
     logger.info("loader.init: action=ready log_level={t}", .{logger.level});
 }
 
 /// Runs finalizers, then releases mappings and runtime state.
-/// The caller must first join all workers and stop native calls.
-/// Ignores recursive teardown and logs cleanup errors.
+/// The caller first joins host-owned workers and stops external native calls.
+/// NODELETE libraries retain their dependencies, I/O backend, and shared runtime.
+/// Borrowed host data must then remain valid until process exit.
+/// Repeated calls and reentry from finalizers are no-ops. Other loader callback
+/// reentry, wrong-thread calls, and live workers during full teardown panic.
+/// A fork child exits directly with status 127 without invoking inherited handlers.
 pub fn deinit() void {
-    if (!state.initialized or state.deinitializing) return;
-    logger.info("loader.deinit: action=begin objects={d} workers={d}", .{ state.dyn_objects.count(), state.thread_infos.count() });
+    // A fork child may have inherited locked logging/debug state too.
+    requireOwnerProcessOrExit();
+    if (std.os.linux.gettid() != ElfTlsRuntime.initial_tid) @panic("teardown requires the initial thread");
+    switch (lifecycle.load(.acquire)) {
+        .bootstrap, .finalizing, .retained, .deinitialized => return,
+        .initializing => @panic("teardown cannot interrupt initialization"),
+        .active => {},
+    }
+    if (state.transaction_lock.owner.load(.acquire) == std.os.linux.gettid()) {
+        @panic("teardown cannot interrupt a loader callback");
+    }
 
-    state.deinitializing = true;
-    defer state.deinitializing = false;
+    // The transaction lock must be released before its I/O backend is destroyed.
+    defer if (lifecycle.load(.acquire) == .deinitialized) state.io_backend.deinit();
+    state.transaction_lock.lock(state.io);
+    defer state.transaction_lock.unlock(state.io);
+
+    state.thread_mutex.lockUncancelable(state.io);
+    const initial_workers = state.thread_infos.count();
+    state.thread_mutex.unlock(state.io);
+    logger.info("loader.deinit: action=begin objects={d} workers={d}", .{ state.dyn_objects.count(), initial_workers });
+
+    lifecycle.store(.finalizing, .release);
+
+    var has_nodelete = false;
+    for (state.dyn_objects.values()) |object| {
+        if (!object.nodelete) continue;
+        has_nodelete = true;
+        logger.warn("loader.deinit: retaining NODELETE library {s} and its dependencies", .{object.name});
+    }
+    if (has_nodelete) {
+        logger.warn("loader.deinit: retained libraries remain operational; borrowed host resources supplied to init must remain valid until process exit", .{});
+        reapCompletedWorkers();
+        state.thread_mutex.lockUncancelable(state.io);
+        for (state.thread_infos.values()) |worker| {
+            if (worker.entry_object == null) @panic("host-owned managed workers must be joined before retained teardown");
+        }
+        state.thread_mutex.unlock(state.io);
+        for (state.dyn_objects.values()) |*object| {
+            const count = object.host_open_count;
+            object.host_open_count = 0;
+            for (object.deps_breadth_first.items) |dep_idx| {
+                const dependency = &state.dyn_objects.values()[dep_idx];
+                std.debug.assert(dependency.ref_count >= count);
+                dependency.ref_count -= count;
+            }
+        }
+        // Native handles, TLS destructor owners, and
+        // NODELETE roots continue to participate in the ordinary retention graph.
+        lifecycle.store(.retained, .release);
+        unloadObjects(.deinit) catch @panic("unable to retire unreferenced objects during retained teardown");
+        return;
+    }
 
     runThreadDestructors(libc.currentThreadPointer());
     for (state.dyn_objects.values()) |*dyn_object| {
@@ -196,7 +348,13 @@ pub fn deinit() void {
         state.dyn_objects.values()[dyn_object_idx].ref_count = 0;
     }
 
-    CustomSelfInfo.clearExtraElfs(state.allocator);
+    inspectTeardownWorkers();
+    state.thread_mutex.lockUncancelable(state.io);
+    const pending_destructors = state.thread_destructors.items.len;
+    state.thread_mutex.unlock(state.io);
+    if (pending_destructors != 0) @panic("library finalizers left new main-thread TLS callbacks pending");
+
+    CustomSelfInfo.clearExtraElfs(state.allocator, state.io);
 
     for (state.dyn_objects.values()) |*dyn_object| {
         dyn_object.binding_dependencies.deinit(state.allocator);
@@ -209,7 +367,6 @@ pub fn deinit() void {
 
         dyn_object.syms_array.deinit(state.allocator);
 
-        for (dyn_object.syms.values()) |*v| v.deinit(state.allocator);
         dyn_object.syms.deinit(state.allocator);
 
         dyn_object.relocs.deinit(state.allocator);
@@ -238,11 +395,8 @@ pub fn deinit() void {
     state.ifunc_resolved_addrs.clearAndFree(state.allocator);
     state.irel_resolved_targets.clearAndFree(state.allocator);
 
-    const current_tls_area_desc = ElfTlsRuntime.area_desc;
-    ElfTlsRuntime.publish(ElfTlsRuntime.executable_desc);
-
-    state.normal_current_tls_area_desc = null;
-    if (current_tls_area_desc.owns_template) state.allocator.free(current_tls_area_desc.block.init);
+    state.allocator.free(state.tls_template);
+    state.tls_template = &.{};
 
     for (state.extra_link_maps.items) |e| state.allocator.destroy(e);
     state.extra_link_maps.deinit(state.allocator);
@@ -252,10 +406,10 @@ pub fn deinit() void {
 
     last_dl_error = null;
 
-    for (state.thread_infos.values()) |entry| entry.libc_worker.releaseAfterJoin();
     state.thread_infos.clearAndFree(state.allocator);
 
     state.thread_destructors.deinit(state.allocator);
+    state.object_lifetimes.deinit(state.allocator);
 
     if (state.libc_runtime) |*specifics| specifics.deinit();
 
@@ -274,18 +428,19 @@ pub fn deinit() void {
     for (state.extra_strs_z.items) |e| state.allocator.free(e);
     state.extra_strs_z.deinit(state.allocator);
 
-    state.initialized = false;
-    state.deinitialized = true;
+    lifecycle.store(.deinitialized, .release);
     logger.info("loader.deinit: action=complete", .{});
 }
 
 /// Searches for a supported ELF library without loading it.
-/// The caller must free the returned path with the initialization allocator.
+/// The caller owns the returned path and must free it with `allocator`.
 /// Returns `null` if no candidate is found and propagates other errors.
-pub fn resolve(name: []const u8) !?[]const u8 {
-    if (!state.initialized) return error.Uninitialized;
+pub fn resolve(allocator: std.mem.Allocator, name: []const u8) !?[]const u8 {
+    try requireManaged(.active_only);
+    state.transaction_lock.lock(state.io);
+    defer state.transaction_lock.unlock(state.io);
 
-    return resolvePath(name, true, null, null, null) catch |err| switch (err) {
+    return resolvePath(allocator, name, true, null, null, null) catch |err| switch (err) {
         error.LibraryNotFound => null,
         else => |e| return e,
     };
@@ -293,14 +448,16 @@ pub fn resolve(name: []const u8) !?[]const u8 {
 
 /// Loads the first libc candidate found. Does not retry with another ABI on failure.
 pub fn loadSystemLibC() !DynamicLibrary {
-    if (!state.initialized) return error.Uninitialized;
+    try requireManaged(.active_only);
+    state.transaction_lock.lock(state.io);
+    defer state.transaction_lock.unlock(state.io);
 
     logger.debug("libc: searching system libc", .{});
 
     for (libc.system_libc_names) |candidate| {
         logger.debug("libc: trying {s}", .{candidate});
 
-        const path = resolvePath(candidate, true, null, null, null) catch |err| switch (err) {
+        const path = resolvePath(state.allocator, candidate, true, null, null, null) catch |err| switch (err) {
             error.LibraryNotFound => continue,
             else => |e| return e,
         };
@@ -316,18 +473,20 @@ pub fn loadSystemLibC() !DynamicLibrary {
 /// On failure, attempts to release unreferenced objects. Callback side effects and
 /// process-wide runtime initialization are not undone.
 pub fn load(f_path: []const u8) !DynamicLibrary {
-    return loadWithRootResolveContext(f_path, null, null);
+    return loadWithRootResolveContext(f_path, null, null, .host);
 }
 
 /// Resolves a name in the loader's global scope, including native IFUNC calls.
 /// Ordinary symbols borrow their defining mapping; TLS symbols borrow the
 /// calling thread's instance.
 pub fn getSymbol(sym_name: []const u8) !Symbol {
-    if (!state.initialized) return error.Uninitialized;
+    try requireManaged(.allow_finalization);
+    state.transaction_lock.lock(state.io);
+    defer state.transaction_lock.unlock(state.io);
 
     const sym = try getResolvedSymbolByName(null, sym_name, false, false, true);
     return .{
-        .addr = getRuntimeSymbolAddress(sym),
+        .addr = try getRuntimeSymbolAddress(sym),
     };
 }
 
@@ -476,23 +635,41 @@ fn loadPreloads() void {
     }
 }
 
-// Log every error after cleanup, including failures from the initial guards.
-fn loadWithRootResolveContext(f_path: []const u8, root_runpath: ?[]const u8, root_origin_dir: ?[]const u8) !DynamicLibrary {
-    return loadWithRootResolveContextInner(f_path, root_runpath, root_origin_dir) catch |err| {
+// Log owner-process load errors after cleanup.
+const LoadOwner = enum { host, native };
+
+fn loadWithRootResolveContext(f_path: []const u8, root_runpath: ?[]const u8, root_origin_dir: ?[]const u8, owner: LoadOwner) !DynamicLibrary {
+    // Reject before even the error logger: its host locks are not fork-repaired.
+    try requireOwnerProcess();
+
+    return loadWithRootResolveContextInner(f_path, root_runpath, root_origin_dir, owner) catch |err| {
         logger.err("load: request={s} error={t}", .{ f_path, err });
         return err;
     };
 }
 
-fn loadWithRootResolveContextInner(f_path: []const u8, root_runpath: ?[]const u8, root_origin_dir: ?[]const u8) !DynamicLibrary {
-    if (!state.initialized) return error.Uninitialized;
-    if (state.deinitializing) return error.LoaderDeinitializing;
+fn loadWithRootResolveContextInner(f_path: []const u8, root_runpath: ?[]const u8, root_origin_dir: ?[]const u8, owner: LoadOwner) !DynamicLibrary {
+    try requireManaged(.active_only);
+    state.transaction_lock.lock(state.io);
+    defer state.transaction_lock.unlock(state.io);
+
+    if (owner == .host and lifecycle.load(.acquire) == .retained) return error.LoaderDeinitialized;
 
     var phase: []const u8 = "dependencies";
 
     logger.debug("load: request={s} action=begin", .{f_path});
     errdefer {
+        if (state.libc_runtime) |*runtime| {
+            if (runtime.initial_fields_written and !runtime.initial_thread_initialized) {
+                @panic("load failed after native bootstrap commitment");
+            }
+        }
         logger.debug("load: request={s} action=rollback", .{f_path});
+        // Executed constructors may have published raw addresses or workers.
+        // Retain their state and dependency closure instead of guessing escape.
+        for (state.dyn_objects.values()) |*object| {
+            if (object.execution_started) object.pinned = true;
+        }
         unloadUnreferencedObjects() catch |err| logger.warn("load: request={s} action=rollback error={t}", .{ f_path, err });
     }
     errdefer logger.err("load: request={s} phase={s} action=failed", .{ f_path, phase });
@@ -531,30 +708,50 @@ fn loadWithRootResolveContextInner(f_path: []const u8, root_runpath: ?[]const u8
 
     logSummary("before_preparation", true);
 
-    // IFUNC resolvers may grow the registry. Snapshot indices, not pointers.
+    // Keep transaction-local work lists stable across later constructor recursion.
     phase = "relocation_order";
     const relocation_order = try state.allocator.dupe(usize, state.dyn_objects_sorted_indices.items);
     defer state.allocator.free(relocation_order);
+
+    for (relocation_order) |idx| {
+        const object = &state.dyn_objects.values()[idx];
+        if (object.relocated or object.mapped_at == 0 or object.tls_module_id != null) continue;
+        try reserveModuleTls(object);
+    }
 
     for (relocation_order) |idx| {
         const dyn_obj = &state.dyn_objects.values()[idx];
 
         if (dyn_obj.relocated or dyn_obj.mapped_at == 0) continue;
 
-        dyn_obj.pinned = libc.requiresLifetimePin(dyn_obj.name);
+        dyn_obj.runtime_pinned = libc.requiresLifetimePin(dyn_obj.name);
         phase = "libc_inspection";
-        logger.debug("load.prepare: object={s} object_index={d} pinned={}", .{ dyn_obj.name, idx, dyn_obj.pinned });
+        logger.debug("load.prepare: object={s} object_index={d} runtime_pinned={}", .{ dyn_obj.name, idx, dyn_obj.runtime_pinned });
         errdefer logger.err("load.prepare: object_index={d} phase={s} action=failed", .{ idx, phase });
         if (try libc.inspectObject(&libc_services, state.allocator, dyn_obj)) |specifics| {
             std.debug.assert(state.libc_runtime == null);
             state.libc_runtime = specifics;
         }
+    }
 
-        computeTcbOffset(dyn_obj);
+    // Early IFUNCs can execute during ordinary relocation. Establish the checked
+    // main descriptor and auxiliary-vector fields before any such callback.
+    if (state.libc_runtime) |*runtime| {
+        if (!runtime.initial_fields_written) {
+            runtime.updateRuntimeFields(state.main_thread_pointer) catch @panic("native write plan failed after commitment");
+            hooks.emit(.native_committed) catch @panic("hook failed after native commitment");
+            runtime.initial_fields_written = true;
+        }
+    }
+
+    for (relocation_order) |idx| {
+        const dyn_obj = &state.dyn_objects.values()[idx];
+        if (dyn_obj.relocated or dyn_obj.mapped_at == 0) continue;
+
         phase = "relocations";
         try processRelocations(dyn_obj);
         phase = "tls";
-        try mapTlsBlock(dyn_obj);
+        try publishModuleTls(dyn_obj);
         _dl_debug_state();
         phase = "irelative";
         try processIRelativeRelocations(dyn_obj);
@@ -576,8 +773,6 @@ fn loadWithRootResolveContextInner(f_path: []const u8, root_runpath: ?[]const u8
             try dyn_obj.updateSegmentsPermissions();
             _dl_debug_state();
 
-            dyn_obj.loaded = true;
-
             const dl_phdr_info = try state.allocator.create(std.posix.dl_phdr_info);
             var dl_phdr_info_registered = false;
             errdefer if (!dl_phdr_info_registered) state.allocator.destroy(dl_phdr_info);
@@ -594,13 +789,15 @@ fn loadWithRootResolveContextInner(f_path: []const u8, root_runpath: ?[]const u8
 
             logger.debug("unwinding: registering {s} at 0x{x}", .{ dyn_obj.name, dyn_obj.loaded_at.? });
 
-            try CustomSelfInfo.addExtraElf(state.allocator, dl_phdr_info);
+            try CustomSelfInfo.addExtraElf(state.allocator, state.io, dl_phdr_info);
             dl_phdr_info_registered = true;
             dyn_obj.phdr_info = dl_phdr_info;
             dyn_obj.phdr_name = owned_path_z;
+            dyn_obj.loaded = true;
         }
 
-        if (dyn_obj.ref_count == 0 or dyn_obj.init_called) continue;
+        if (dyn_obj.initialization_failed) return error.LibraryInitializationFailed;
+        if (dyn_obj.ref_count == 0 or dyn_obj.init_called or dyn_obj.initializing) continue;
 
         if (dyn_obj.current_epoch == std.math.maxInt(u30)) return error.LibraryGenerationExhausted;
 
@@ -613,21 +810,41 @@ fn loadWithRootResolveContextInner(f_path: []const u8, root_runpath: ?[]const u8
         try state.dyn_objects_init_indices.ensureUnusedCapacity(state.allocator, 1);
         dyn_obj.current_epoch += 1;
 
-        dyn_obj.init_called = true;
+        try publishObjectLifetime(idx);
+        dyn_obj.initializing = true;
+        dyn_obj.execution_started = true;
         phase = "constructors";
         var initializing_object = dyn_obj.*;
         callInitFunctions(&initializing_object) catch |err| {
-            state.dyn_objects.values()[idx].init_called = false;
+            const failed = &state.dyn_objects.values()[idx];
+            failed.initializing = false;
+            failed.initialization_failed = true;
+            failed.pinned = true;
             return err;
         };
 
+        state.dyn_objects.values()[idx].initializing = false;
+        state.dyn_objects.values()[idx].init_called = true;
+        const initialized = &state.dyn_objects.values()[idx];
+        initialized.nodelete = initialized.nodelete or initialized.nodelete_requested;
         try state.dyn_objects_init_indices.append(state.allocator, idx);
+        try hooks.emit(.{ .constructor_completed = initializing_object.name });
+    }
+
+    if (state.transaction_lock.depth == 1) {
+        state.thread_mutex.lockUncancelable(state.io);
+        const pending = state.retirement_pending;
+        state.retirement_pending = false;
+        state.thread_mutex.unlock(state.io);
+
+        if (pending) try unloadUnreferencedObjects();
     }
 
     logSummary("after_initialization", false);
 
     logger.info("load: request={s} object_index={d} action=ready", .{ f_path, lib.index });
 
+    if (owner == .host) state.dyn_objects.values()[lib.index].host_open_count += 1;
     return lib;
 }
 
@@ -702,9 +919,9 @@ fn loadDepTree(o_path: []const u8, root_runpath: ?[]const u8, root_origin_dir: ?
 
 // TODO implement current-directory semantics for empty/relative search entries
 // and define RPATH/RUNPATH inheritance and native search-path configuration.
-/// Returns an owned path. `check_mode` only changes missing-library diagnostics;
-/// every candidate is checked for the supported ELF class, machine, and type.
-fn resolvePath(requested_path: []const u8, check_mode: bool, requester_name: ?[]const u8, runpath: ?[]const u8, origin_dir: ?[]const u8) ![]const u8 {
+/// Returns an owned path allocated with `allocator`. `check_mode` only changes
+/// missing-library diagnostics; every candidate is checked for supported ELF format.
+fn resolvePath(allocator: std.mem.Allocator, requested_path: []const u8, check_mode: bool, requester_name: ?[]const u8, runpath: ?[]const u8, origin_dir: ?[]const u8) ![]const u8 {
     logger.debug("path.search: request={s} requester={?s} runpath={?s} origin={?s} probe={}", .{ requested_path, requester_name, runpath, origin_dir, check_mode });
     var buf: [std.fs.max_path_bytes]u8 = @splat(0);
 
@@ -725,7 +942,7 @@ fn resolvePath(requested_path: []const u8, check_mode: bool, requester_name: ?[]
                 continue;
             }
 
-            const path = try std.fmt.allocPrint(state.allocator, "{s}", .{a_path});
+            const path = try std.fmt.allocPrint(allocator, "{s}", .{a_path});
             logger.debug("found {s} via LD_LIBRARY_PATH: {s}", .{ requested_path, path });
             return path;
         }
@@ -742,7 +959,7 @@ fn resolvePath(requested_path: []const u8, check_mode: bool, requester_name: ?[]
                     logger.debug("path.candidate: path={s} result=unreadable error={t}", .{ a_path, err });
                 };
                 if (isSupportedElfPath(a_path)) {
-                    const path = try std.fmt.allocPrint(state.allocator, "{s}", .{a_path});
+                    const path = try std.fmt.allocPrint(allocator, "{s}", .{a_path});
                     logger.debug("found {s} next to libc: {s}", .{ requested_path, path });
                     return path;
                 }
@@ -775,7 +992,7 @@ fn resolvePath(requested_path: []const u8, check_mode: bool, requester_name: ?[]
                     continue;
                 }
 
-                const path = try std.fmt.allocPrint(state.allocator, "{s}", .{a_path});
+                const path = try std.fmt.allocPrint(allocator, "{s}", .{a_path});
                 logger.debug("found {s} via RUNPATH: {s}", .{ requested_path, path });
                 return path;
             }
@@ -811,7 +1028,7 @@ fn resolvePath(requested_path: []const u8, check_mode: bool, requester_name: ?[]
             continue;
         }
 
-        path = try std.fmt.allocPrint(state.allocator, "{s}", .{a_path});
+        path = try std.fmt.allocPrint(allocator, "{s}", .{a_path});
 
         logger.debug("found {s}: {s}", .{ requested_path, path.? });
 
@@ -833,7 +1050,7 @@ fn resolveDynObjectInfosByNameOrPath(name_or_path: []const u8, requester_name: ?
     const path: []const u8 = if (std.mem.findScalar(u8, name_or_path, '/') != null)
         try state.allocator.dupe(u8, name_or_path)
     else
-        try resolvePath(name_or_path, false, requester_name, runpath, origin_dir);
+        try resolvePath(state.allocator, name_or_path, false, requester_name, runpath, origin_dir);
     errdefer state.allocator.free(path);
 
     const f = try std.Io.Dir.openFileAbsolute(state.io, path, .{ .mode = .read_only });
@@ -1070,7 +1287,7 @@ fn loadDso(o_path: []const u8, root_runpath: ?[]const u8, root_origin_dir: ?[]co
     const path: []const u8 = if (std.mem.findScalar(u8, o_path, '/') != null)
         try state.allocator.dupe(u8, o_path)
     else
-        try resolvePath(o_path, false, null, root_runpath, root_origin_dir);
+        try resolvePath(state.allocator, o_path, false, null, root_runpath, root_origin_dir);
     defer state.allocator.free(path);
 
     const dyn_object_name = try state.allocator.dupe(u8, std.fs.path.basename(path));
@@ -1418,8 +1635,6 @@ fn loadDso(o_path: []const u8, root_runpath: ?[]const u8, root_origin_dir: ?[]co
 
     errdefer {
         syms_array.deinit(state.allocator);
-
-        for (syms.values()) |*v| v.deinit(state.allocator);
         syms.deinit(state.allocator);
     }
 
@@ -1454,8 +1669,7 @@ fn loadDso(o_path: []const u8, root_runpath: ?[]const u8, root_origin_dir: ?[]co
     const dyn_sym_count = dyn_symtab_size / @sizeOf(std.elf.Sym);
     logger.debug("{s}: dynamic symbol count: {d}", .{ dyn_object_name, dyn_sym_count });
 
-    try syms_array.ensureTotalCapacity(state.allocator, dyn_sym_count);
-    try syms.ensureTotalCapacity(state.allocator, dyn_sym_count);
+    try syms_array.ensureTotalCapacityPrecise(state.allocator, dyn_sym_count);
 
     for (0..dyn_sym_count) |j| {
         const sym: *std.elf.Elf64.Sym = @ptrFromInt(dyn_symtab_addr + j * @sizeOf(std.elf.Elf64.Sym));
@@ -1563,14 +1777,10 @@ fn loadDso(o_path: []const u8, root_runpath: ?[]const u8, root_origin_dir: ?[]co
             .size = sym.size,
         };
 
-        const ent = try syms.getOrPut(state.allocator, s.name);
-        if (!ent.found_existing) {
-            ent.value_ptr.* = .empty;
-        }
-
-        try ent.value_ptr.append(state.allocator, syms_array.items.len);
-        try syms_array.append(state.allocator, s);
+        syms_array.appendAssumeCapacity(s);
     }
+
+    try syms.build(state.allocator, syms_array.items);
 
     logger.debug("program headers offset: 0x{x}", .{eh.e_phoff});
     logger.debug("program headers:", .{});
@@ -1588,6 +1798,7 @@ fn loadDso(o_path: []const u8, root_runpath: ?[]const u8, root_origin_dir: ?[]co
     var eh_align: usize = 0;
 
     var init_addr: usize = 0;
+    var nodelete_requested = false;
     var fini_addr: usize = 0;
     var init_array_addr: usize = 0;
     var init_array_size: usize = 0;
@@ -1698,7 +1909,8 @@ fn loadDso(o_path: []const u8, root_runpath: ?[]const u8, root_origin_dir: ?[]co
                     std.elf.DT_FINI_ARRAY => fini_array_addr = entry.d_val,
                     std.elf.DT_FINI_ARRAYSZ => fini_array_size = entry.d_val,
                     // TODO handle or reject flags affecting lookup and lifetime.
-                    std.elf.DT_FLAGS, std.elf.DT_FLAGS_1 => {},
+                    std.elf.DT_FLAGS => {},
+                    std.elf.DT_FLAGS_1 => nodelete_requested = (entry.d_val & 0x8) != 0, // DF_1_NODELETE
                     // TODO record SONAME for object alias/reuse semantics.
                     std.elf.DT_SONAME => {},
                     // Consumed earlier, unused by this loader, or diagnostic-only.
@@ -1808,6 +2020,7 @@ fn loadDso(o_path: []const u8, root_runpath: ?[]const u8, root_origin_dir: ?[]co
             .init_called = false,
             .current_epoch = if (previous_dyn_object) |previous| previous.current_epoch else 0,
             .ref_count = 0,
+            .nodelete_requested = nodelete_requested,
             .loaded_at = null,
             .loaded_size = 0,
             .reservation = if (previous_dyn_object) |previous| previous.reservation else null,
@@ -1838,7 +2051,6 @@ fn loadDso(o_path: []const u8, root_runpath: ?[]const u8, root_origin_dir: ?[]co
         const current_path = current_dyn_object.path;
 
         current_dyn_object.syms_array.deinit(state.allocator);
-        for (current_dyn_object.syms.values()) |*v| v.deinit(state.allocator);
         current_dyn_object.syms.deinit(state.allocator);
         current_dyn_object.relocs.deinit(state.allocator);
         current_dyn_object.dependencies.deinit(state.allocator);
@@ -1876,7 +2088,6 @@ fn loadDso(o_path: []const u8, root_runpath: ?[]const u8, root_origin_dir: ?[]co
     if (previous_dyn_object) |previous| {
         var previous_to_free = previous;
         previous_to_free.syms_array.deinit(state.allocator);
-        for (previous_to_free.syms.values()) |*v| v.deinit(state.allocator);
         previous_to_free.syms.deinit(state.allocator);
         previous_to_free.relocs.deinit(state.allocator);
         previous_to_free.dependencies.deinit(state.allocator);
@@ -2072,11 +2283,6 @@ const ZigTcb = extern struct {
     dummy: usize,
 };
 
-const Dtv = extern struct {
-    len: usize = 1,
-    tls_block: [*]u8,
-};
-
 const TlsDesc = extern struct {
     tls_desc_resolver: *const fn () callconv(.naked) void,
     tls_desc_resolver_arg: isize,
@@ -2104,17 +2310,32 @@ comptime {
 const ElfTlsRuntime = struct {
     // Use `@trap` because panic handling can itself use TLS, allocation, or logging.
 
+    // Permanent per-thread TLS area, low to high addresses:
+    //
+    //   +------------------------------------------+
+    //   | Library TLS reserve + alignment padding  |
+    //   +------------------------------------------+
+    //   | Executable TLS + alignment padding       |
+    //   +------------------------------------------+ <- TP (FS base)
+    //   | Native descriptor reserve                |
+    //   | native_metadata_capacity bytes           |
+    //   +------------------------------------------+
+    //
+    // Library slots use offsets below TP; executable TLS keeps its original
+    // TP-relative offsets. The native reserve starts with the self-pointer.
+    // Before init, the bootstrap area contains only executable TLS, alignment
+    // padding, AbiTcb, and ZigTcb. The permanent initial-thread mapping lasts
+    // until process exit; Zig owns worker allocations and reclaims them on join.
+
     const AreaDesc = struct {
         size: usize,
         alignment: usize,
-        dtv: struct { offset: usize },
         abi_tcb: struct { offset: usize },
         block: struct {
             init: []const u8,
             offset: usize,
             size: usize,
         },
-        owns_template: bool,
     };
 
     const Index = extern struct {
@@ -2133,6 +2354,64 @@ const ElfTlsRuntime = struct {
     var area_desc: AreaDesc = undefined;
     var executable_desc: AreaDesc = undefined;
     var initial_area: [4096]u8 align(4096) = undefined;
+    var initial_tid: std.os.linux.pid_t = 0;
+    var initial_pid: std.os.linux.pid_t = 0;
+    var startup_fill = false;
+
+    // Zig's Linux thread allocation is page-aligned.
+    const maximum_alignment = 4096;
+    const native_metadata_capacity = 16 * 1024;
+
+    fn installPermanent(surplus_size: usize) !void {
+        const executable = executable_desc;
+        if (executable.alignment > maximum_alignment) return error.UnsupportedTlsAlignment;
+
+        const unaligned_tp = try std.math.add(usize, surplus_size, executable.abi_tcb.offset);
+        const padded_tp = try std.math.add(usize, unaligned_tp, maximum_alignment - 1);
+        const tp_offset = padded_tp & ~@as(usize, maximum_alignment - 1);
+        const allocation_size = try std.math.add(usize, tp_offset, native_metadata_capacity);
+
+        const template = try state.allocator.alloc(u8, tp_offset);
+        errdefer state.allocator.free(template);
+        @memset(template, 0);
+
+        const executable_offset = tp_offset - executable.abi_tcb.offset;
+        @memcpy(template[executable_offset..][0..executable.block.init.len], executable.block.init);
+
+        const mapping = try std.posix.mmap(null, allocation_size, .{ .READ = true, .WRITE = true }, .{ .TYPE = .PRIVATE, .ANONYMOUS = true }, -1, 0);
+        errdefer std.posix.munmap(mapping);
+
+        const desc: AreaDesc = .{
+            .size = allocation_size,
+            .alignment = maximum_alignment,
+            .abi_tcb = .{ .offset = tp_offset },
+            .block = .{
+                .init = executable.block.init,
+                .offset = executable_offset,
+                .size = executable.block.size,
+            },
+        };
+
+        const old_tp = libc.currentThreadPointer();
+        const new_tp = initializeAllocation(mapping.ptr, desc);
+        const live_executable: [*]const u8 = @ptrFromInt(old_tp - executable.abi_tcb.offset);
+        @memcpy(mapping[executable_offset..][0..executable.abi_tcb.offset], live_executable[0..executable.abi_tcb.offset]);
+
+        state.tls_template = template;
+        state.tls_used_below_tp = executable.abi_tcb.offset;
+        state.current_surplus_size = surplus_size;
+        state.main_thread_pointer = new_tp;
+        publish(desc);
+
+        // No fallible work or borrowed TLS address crosses this boundary. The
+        // active mapping deliberately belongs to the process until exit.
+        switchThreadPointer(new_tp);
+    }
+
+    noinline fn switchThreadPointer(tp: usize) void {
+        @disableInstrumentation();
+        if (std.os.linux.syscall2(.arch_prctl, std.os.linux.ARCH.SET_FS, tp) != 0) @trap();
+    }
 
     fn publish(desc: AreaDesc) void {
         @setRuntimeSafety(false);
@@ -2149,6 +2428,9 @@ const ElfTlsRuntime = struct {
     fn init(phdrs: [*]std.elf.ElfN.Phdr, phnum: usize) callconv(.c) void {
         @setRuntimeSafety(false);
         @disableInstrumentation();
+
+        initial_tid = @intCast(std.os.linux.syscall0(.gettid));
+        initial_pid = @intCast(std.os.linux.syscall0(.getpid));
 
         var load_base: usize = 0;
         var tls_header: ?std.elf.ElfN.Phdr = null;
@@ -2168,23 +2450,21 @@ const ElfTlsRuntime = struct {
             @as([*]const u8, @ptrFromInt(load_base + header.vaddr))[0..header.filesz]
         else
             &.{};
-        const metadata_size = @sizeOf(AbiTcb) + @sizeOf(ZigTcb) + @sizeOf(Dtv);
+        const metadata_size = @sizeOf(AbiTcb) + @sizeOf(ZigTcb);
+
         if (template.len > block_size or block_size > std.math.maxInt(usize) - alignment - metadata_size) @trap();
 
         const tp_offset = std.mem.alignForward(usize, block_size, alignment);
-        const dtv_offset = tp_offset + @sizeOf(AbiTcb) + @sizeOf(ZigTcb);
 
         executable_desc = .{
-            .size = dtv_offset + @sizeOf(Dtv),
+            .size = tp_offset + metadata_size,
             .alignment = alignment,
-            .dtv = .{ .offset = dtv_offset },
             .abi_tcb = .{ .offset = tp_offset },
             .block = .{
                 .init = template,
                 .offset = 0,
                 .size = block_size,
             },
-            .owns_template = false,
         };
         publish(executable_desc);
 
@@ -2202,7 +2482,9 @@ const ElfTlsRuntime = struct {
             break :mapping @ptrFromInt(std.mem.alignForward(usize, address, alignment));
         };
 
+        startup_fill = true;
         const thread_pointer = fill(area);
+        startup_fill = false;
 
         if (std.os.linux.syscall2(.arch_prctl, std.os.linux.ARCH.SET_FS, thread_pointer) != 0) @trap();
     }
@@ -2211,16 +2493,27 @@ const ElfTlsRuntime = struct {
         @setRuntimeSafety(false);
         @disableInstrumentation();
 
-        const desc = area_desc;
+        requireOwnerProcessOrExit();
+
+        if (!startup_fill) switch (lifecycle.load(.acquire)) {
+            .active, .retained => {},
+            .bootstrap, .initializing, .finalizing, .deinitialized => @trap(),
+        };
+
+        return initializeAllocation(area, area_desc);
+    }
+
+    fn initializeAllocation(area: [*]u8, desc: AreaDesc) usize {
+        @setRuntimeSafety(false);
+        @disableInstrumentation();
+
         @memset(area[0..desc.size], 0);
 
         const thread_pointer = @intFromPtr(area) + desc.abi_tcb.offset;
         @as(*usize, @ptrFromInt(thread_pointer)).* = thread_pointer;
 
-        const dtv: *[2]usize = @ptrCast(@alignCast(area + desc.dtv.offset));
-        dtv.* = .{ 1, @intFromPtr(area) + desc.block.offset };
-
         @memcpy(area[desc.block.offset..][0..desc.block.init.len], desc.block.init);
+
         return thread_pointer;
     }
 
@@ -2240,337 +2533,115 @@ const ElfTlsRuntime = struct {
     }
 };
 
-/// Assigns a positive distance below TP for x86-64 variant-II TLS.
-/// Reuses a retired slot only if its capacity and alignment satisfy the new object.
-fn computeTcbOffset(dyn_object: *DynObject) void {
-    logger.debug("computing tcb offset of library {s}", .{dyn_object.name});
+/// Append-only module identities. Storage never moves and IDs are never reused,
+/// including after failed loads. Publication follows initialization of every TLS
+/// participant. Reading a record does not extend its object's lifetime.
+const TlsLookup = struct {
+    const capacity = 65536;
 
-    if (dyn_object.tls_capacity >= dyn_object.tls_init_mem_size and
-        dyn_object.tls_slot_align >= dyn_object.tls_align and
-        dyn_object.tls_capacity != 0)
-    {
-        logger.debug("tls.slot: object={s} action=reuse offset_below_tp=0x{x} capacity={d} alignment={d}", .{ dyn_object.name, dyn_object.tls_offset, dyn_object.tls_capacity, dyn_object.tls_slot_align });
+    const Record = struct {
+        ready: std.atomic.Value(bool) = .init(false),
+        offset_below_tp: usize = 0,
+        size: usize = 0,
+    };
+
+    var records: [capacity]Record = @splat(.{});
+    var next_id: usize = 1;
+
+    /// Requires the loader transaction lock. Zero is not a module identity.
+    fn reserve() error{TlsModuleIdsExhausted}!DynObject.TlsModuleId {
+        if (next_id == records.len) return error.TlsModuleIdsExhausted;
+
+        const id = next_id;
+        next_id += 1;
+
+        return .{ .value = id };
+    }
+
+    /// Requires the transaction and participant locks, in that order, and an
+    /// unpublished identity returned by reserve. All participant bytes must be ready.
+    fn publish(id: DynObject.TlsModuleId, offset_below_tp: usize, size: usize) void {
+        const record = &records[id.value];
+
+        if (record.ready.load(.monotonic)) @panic("TLS module published twice");
+
+        record.offset_below_tp = offset_below_tp;
+        record.size = size;
+        record.ready.store(true, .release);
+    }
+
+    /// Accepts a raw module ID at the ELF ABI boundary. No allocation, logging,
+    /// registry access, or locks, including on malformed input.
+    fn address(raw_id: usize, offset: usize, tp: usize) ?*anyopaque {
+        if (raw_id == 0 or raw_id >= records.len) return null;
+
+        const record = &records[raw_id];
+        if (!record.ready.load(.acquire) or offset >= record.size) return null;
+
+        return @ptrFromInt(tp - record.offset_below_tp + offset);
+    }
+};
+
+/// Reserves a fresh module identity and a slot below TP under the transaction
+/// lock. Compatible retired slots may be reused. New reservations consume global
+/// capacity immediately, even if later loading fails; publication is separate.
+fn reserveModuleTls(dyn_object: *DynObject) !void {
+    const alignment = @max(dyn_object.tls_align, 1);
+
+    if (!std.math.isPowerOfTwo(alignment) or alignment > ElfTlsRuntime.maximum_alignment) return error.UnsupportedTlsAlignment;
+
+    if (dyn_object.tls_capacity != 0 and dyn_object.tls_capacity >= dyn_object.tls_init_mem_size and dyn_object.tls_slot_align >= alignment) {
+        dyn_object.tls_module_id = try TlsLookup.reserve();
         return;
     }
 
-    dyn_object.tls_capacity = 0;
+    const end = try std.math.add(usize, state.tls_used_below_tp, dyn_object.tls_init_mem_size);
+    const padded = try std.math.add(usize, end, alignment - 1);
+    const offset = padded & ~(alignment - 1);
+    const consumed = offset - state.tls_used_below_tp;
 
-    const current_tls_area_desc = state.normal_current_tls_area_desc orelse ElfTlsRuntime.area_desc;
+    if (consumed > state.current_surplus_size) return error.TlsSurplusExhausted;
 
-    var new_area_size: usize = 0;
-    new_area_size += dyn_object.tls_init_mem_size;
-    new_area_size = if (new_area_size > 0) std.mem.alignForward(usize, new_area_size, dyn_object.tls_align) else new_area_size;
-    new_area_size = if (new_area_size > 0) std.mem.alignForward(usize, new_area_size, current_tls_area_desc.alignment) else new_area_size;
-    new_area_size += current_tls_area_desc.block.size;
-    new_area_size = if (new_area_size > 0) std.mem.alignForward(usize, new_area_size, state.initial_tls_align orelse current_tls_area_desc.alignment) else new_area_size;
-    const new_abi_tcb_offset = new_area_size;
-
-    dyn_object.tls_offset = new_abi_tcb_offset;
-    logger.debug("tls.slot: object={s} action=assign offset_below_tp=0x{x} size={d} alignment={d}", .{ dyn_object.name, dyn_object.tls_offset, dyn_object.tls_init_mem_size, dyn_object.tls_align });
-}
-
-/// Adds TLS below the established thread pointer. The first load migrates host
-/// TLS; later loads consume reserved surplus so existing TP-relative pointers
-/// remain valid. Rebuilds the template from original initializers so new workers
-/// start with fresh TLS rather than another thread's state.
-fn mapTlsBlock(dyn_object: *DynObject) !void {
-    errdefer logger.err("tls.map: object={s} size={d} alignment={d} surplus={d} action=failed", .{ dyn_object.name, dyn_object.tls_init_mem_size, dyn_object.tls_align, state.current_surplus_size });
-    logger.debug("mapping tls block of library {s}", .{dyn_object.name});
-
-    if (dyn_object.tls_capacity != 0) {
-        try resetTlsSlot(dyn_object);
-        return;
-    }
-    if (dyn_object.tls_init_mem_size == 0 and state.normal_current_tls_area_desc != null) return;
-
-    const current_tls_area_desc = state.normal_current_tls_area_desc orelse ElfTlsRuntime.area_desc;
-
-    var new_area_size: usize = 0;
-    new_area_size += dyn_object.tls_init_mem_size;
-    new_area_size = if (new_area_size > 0) std.mem.alignForward(usize, new_area_size, dyn_object.tls_align) else new_area_size;
-    new_area_size = if (new_area_size > 0) std.mem.alignForward(usize, new_area_size, current_tls_area_desc.alignment) else new_area_size;
-    const prev_block_offset = new_area_size;
-    new_area_size += current_tls_area_desc.block.size;
-    new_area_size = if (new_area_size > 0) std.mem.alignForward(usize, new_area_size, state.initial_tls_align orelse current_tls_area_desc.alignment) else new_area_size;
-    const new_abi_tcb_offset = new_area_size;
-    new_area_size += @sizeOf(AbiTcb);
-    new_area_size += @sizeOf(ZigTcb);
-    new_area_size = std.mem.alignForward(usize, new_area_size, @alignOf(Dtv));
-    const new_dtv_offset = new_area_size;
-    new_area_size += @sizeOf(Dtv);
-
-    std.debug.assert(new_abi_tcb_offset == dyn_object.tls_offset);
-    std.debug.assert(current_tls_area_desc.abi_tcb.offset - current_tls_area_desc.block.offset == new_abi_tcb_offset - prev_block_offset);
-    std.debug.assert(prev_block_offset % current_tls_area_desc.alignment == 0);
-
-    logger.debug("tls: ({s}) tdata size: 0x{x}", .{ dyn_object.name, dyn_object.tls_init_file_size });
-    logger.debug("tls: ({s}) tbss size: 0x{x}", .{ dyn_object.name, dyn_object.tls_init_mem_size - dyn_object.tls_init_file_size });
-
-    const thread_storage_size = if (state.libc_runtime) |*specifics|
-        specifics.threadStorageSize()
-    else
-        libc.bootstrapThreadStorageSize();
-    logger.debug("tls: native thread storage reservation: 0x{x} ({d})", .{ thread_storage_size, thread_storage_size });
-
-    const old_tp = libc.currentThreadPointer();
-    const prev_area_addr = old_tp - (new_abi_tcb_offset - prev_block_offset);
-
-    logger.debug("tls: old_tp: 0x{x}, prev area: 0x{x}", .{ old_tp, prev_area_addr });
-
-    var new_area: ?[]u8 = null;
-    var owned_tls_mapping: ?[]align(std.heap.pageSize()) u8 = null;
-    errdefer if (owned_tls_mapping) |mapping| std.posix.munmap(mapping);
-
-    var area_was_extended = false;
-    var remaining_surplus_size = state.current_surplus_size;
-
-    if (!current_tls_area_desc.owns_template) {
-        logger.debug("tls: mapping new area (first time): size: 0x{x} (surplus) + 0x{x} (new_area_size) + 0x{x} (native thread storage)", .{ state.current_surplus_size, new_area_size, thread_storage_size });
-        const space = std.posix.mmap(null, state.current_surplus_size + new_area_size + thread_storage_size, .{ .READ = true, .WRITE = true }, .{ .TYPE = .PRIVATE, .ANONYMOUS = true }, -1, 0) catch |err| {
-            logger.err("failed to allocate tls space: {s}", .{@errorName(err)});
-            return err;
-        };
-        owned_tls_mapping = space;
-        logger.debug("tls: setting new area start at 0x{x} (0x{x})", .{ state.current_surplus_size, @intFromPtr(space.ptr) + state.current_surplus_size });
-        new_area = space[state.current_surplus_size..];
-    } else if (new_area_size > current_tls_area_desc.size and new_area_size <= current_tls_area_desc.size + state.current_surplus_size) {
-        logger.debug("tls: extending old area: size: 0x{x} (new_area_size) = 0x{x} (surplus) + 0x{x} (current_area_size)", .{ new_area_size, new_area_size - current_tls_area_desc.size, current_tls_area_desc.size });
-        logger.debug("tls: setting new area start at -0x{x} (0x{x})", .{ new_area_size - current_tls_area_desc.size, prev_area_addr - (new_area_size - current_tls_area_desc.size) });
-        new_area = @as([*]u8, @ptrFromInt(prev_area_addr - (new_area_size - current_tls_area_desc.size)))[0..new_area_size];
-        logger.debug("tls: setting new surplus size: 0x{x}", .{state.current_surplus_size - (new_area_size - current_tls_area_desc.size)});
-        remaining_surplus_size -= new_area_size - current_tls_area_desc.size;
-        area_was_extended = true;
-    } else if (new_area_size > current_tls_area_desc.size) {
-        // That would require relocating an established TP.
-        logger.err("tls: surplus exhausted: wanted size: 0x{x} (new_area_size) + 0x{x} (native thread storage)", .{ new_area_size, thread_storage_size });
-
-        return error.TlsSurplusExhausted;
-    }
-
-    if (new_area != null and dyn_object.tls_init_file_size > 0) {
-        logger.debug("tls: copying new block data: from 0x{x} to 0x{x} (size: 0x{x})", .{
-            0,
-            dyn_object.tls_init_file_size,
-            dyn_object.tls_init_file_size,
-        });
-        @memcpy(new_area.?[0..dyn_object.tls_init_file_size], @as([*]u8, @ptrFromInt(try dyn_object.virtualToLoadedAddress(dyn_object.tls_init_mem_offset, false))));
-    }
-
-    if (new_area != null and current_tls_area_desc.block.size > 0 and !area_was_extended) {
-        logger.debug("tls: copying previous area block data: from 0x{x} to 0x{x} (size: 0x{x})", .{
-            prev_block_offset,
-            prev_block_offset + current_tls_area_desc.block.size,
-            current_tls_area_desc.block.size,
-        });
-        @memcpy(new_area.?[prev_block_offset .. prev_block_offset + current_tls_area_desc.block.size], @as([*]u8, @ptrFromInt(old_tp - (new_abi_tcb_offset - prev_block_offset))));
-    }
-
-    if (!current_tls_area_desc.owns_template) {
-        state.initial_tls_init_file_size = current_tls_area_desc.block.init.len;
-        state.initial_tls_init_mem_size = current_tls_area_desc.block.size;
-        state.initial_tls_offset = current_tls_area_desc.abi_tcb.offset;
-        state.initial_tls_align = current_tls_area_desc.alignment;
-        state.initial_tls_init_block = current_tls_area_desc.block.init;
-
-        logger.debug("tls: copying previous area metadata: from 0x{x} to 0x{x} (size: 0x{x})", .{
-            new_abi_tcb_offset,
-            new_abi_tcb_offset + current_tls_area_desc.size - current_tls_area_desc.abi_tcb.offset,
-            current_tls_area_desc.size - current_tls_area_desc.abi_tcb.offset,
-        });
-        @memcpy(new_area.?[new_abi_tcb_offset..][0 .. current_tls_area_desc.size - current_tls_area_desc.abi_tcb.offset], @as([*]u8, @ptrFromInt(old_tp)));
-    }
-
-    logger.debug("tls: allocating new init block: size: 0x{x}", .{new_abi_tcb_offset});
-    const new_initial_block = init_blk: {
-        const block = try state.allocator.alloc(u8, new_abi_tcb_offset);
-        errdefer state.allocator.free(block);
-
-        @memset(block, 0);
-
-        logger.debug("tls: copying initial tdata: from 0x{x} to 0x{x} (size: 0x{x})", .{
-            new_abi_tcb_offset - state.initial_tls_offset,
-            new_abi_tcb_offset - state.initial_tls_offset + state.initial_tls_init_file_size,
-            state.initial_tls_init_file_size,
-        });
-        if (state.initial_tls_init_file_size > 0) {
-            @memcpy(block[new_abi_tcb_offset - state.initial_tls_offset ..][0..state.initial_tls_init_file_size], state.initial_tls_init_block);
-        }
-
-        logger.debug("tls: zeroing initial tbss: from 0x{x} to 0x{x} (size: 0x{x})", .{
-            new_abi_tcb_offset - state.initial_tls_offset + state.initial_tls_init_file_size,
-            new_abi_tcb_offset - state.initial_tls_offset + state.initial_tls_init_mem_size,
-            state.initial_tls_init_mem_size - state.initial_tls_init_file_size,
-        });
-        if (state.initial_tls_init_mem_size > 0) {
-            @memset(block[new_abi_tcb_offset - state.initial_tls_offset + state.initial_tls_init_file_size ..][0 .. state.initial_tls_init_mem_size - state.initial_tls_init_file_size], 0);
-        }
-
-        for (state.dyn_objects.values()) |*do| {
-            if (do.tls_mapped_at != 0) {
-                logger.debug("tls: copying {s} tdata: from 0x{x} to 0x{x} (size: 0x{x})", .{
-                    do.name,
-                    new_abi_tcb_offset - do.tls_offset,
-                    new_abi_tcb_offset - do.tls_offset + do.tls_init_file_size,
-                    do.tls_init_file_size,
-                });
-                if (do.tls_init_file_size > 0) {
-                    @memcpy(block[new_abi_tcb_offset - do.tls_offset ..][0..do.tls_init_file_size], @as([*]u8, @ptrFromInt(try do.virtualToLoadedAddress(do.tls_init_mem_offset, false))));
-                }
-
-                logger.debug("tls: zeroing {s} tbss: from 0x{x} to 0x{x} (size: 0x{x})", .{
-                    do.name,
-                    new_abi_tcb_offset - do.tls_offset + do.tls_init_file_size,
-                    new_abi_tcb_offset - do.tls_offset + do.tls_init_mem_size,
-                    do.tls_init_mem_size - do.tls_init_file_size,
-                });
-                if (do.tls_init_mem_size > 0) {
-                    @memset(block[new_abi_tcb_offset - do.tls_offset + do.tls_init_file_size ..][0 .. do.tls_init_mem_size - do.tls_init_file_size], 0);
-                }
-            }
-        }
-
-        logger.debug("tls: copying {s} tdata: from 0x{x} to 0x{x} (size: 0x{x})", .{
-            dyn_object.name,
-            0,
-            dyn_object.tls_init_file_size,
-            dyn_object.tls_init_file_size,
-        });
-        if (dyn_object.tls_init_file_size > 0) {
-            @memcpy(block[0..dyn_object.tls_init_file_size], @as([*]u8, @ptrFromInt(try dyn_object.virtualToLoadedAddress(dyn_object.tls_init_mem_offset, false))));
-        }
-
-        logger.debug("tls: zeroing {s} tbss: from 0x{x} to 0x{x} (size: 0x{x})", .{
-            dyn_object.name,
-            dyn_object.tls_init_file_size,
-            dyn_object.tls_init_mem_size,
-            dyn_object.tls_init_mem_size - dyn_object.tls_init_file_size,
-        });
-        if (dyn_object.tls_init_mem_size > 0) {
-            @memset(block[dyn_object.tls_init_file_size..dyn_object.tls_init_mem_size], 0);
-        }
-
-        break :init_blk block;
-    };
-
-    // Initial TLS area:
-    //
-    //                              --------------------------------------------
-    //                              | Executable TLS | ABI TCB | Zig TCB | DTV |
-    //                              --------------------------------------------
-    //                                               ^
-    //                                               TP
-    //
-    // New TLS area:
-    //
-    // -------------------------------------------------------------------------
-    // | Surplus | Other TLS blocks | Executable TLS | ABI TCB | libc metadata >
-    // -------------------------------------------------------------------------
-    //                                               ^
-    //                                               TP
-
-    const new_block_init = new_initial_block;
-    const new_block_offset: usize = 0;
-    const new_block_size = new_block_init.len;
-    const new_align_factor = @max(dyn_object.tls_align, current_tls_area_desc.alignment);
-
-    var new_tls_area_desc: @TypeOf(current_tls_area_desc) = .{
-        .size = new_area_size,
-        .alignment = new_align_factor,
-
-        .dtv = .{
-            .offset = new_dtv_offset,
-        },
-
-        .abi_tcb = .{
-            .offset = new_abi_tcb_offset,
-        },
-
-        .block = .{
-            .init = new_block_init,
-            .offset = new_block_offset,
-            .size = new_block_size,
-        },
-
-        .owns_template = true,
-    };
-
-    owned_tls_mapping = null;
-
-    // Keep logical offsets relative to the active TLS block. The descriptor
-    // published to `__zig_elf_static_tls_fill` additionally includes unused
-    // surplus before that block and native descriptor storage after TP.
-    state.normal_current_tls_area_desc = new_tls_area_desc;
-    state.current_surplus_size = remaining_surplus_size;
-
-    new_tls_area_desc.size = state.current_surplus_size + new_area_size + thread_storage_size;
-    new_tls_area_desc.dtv.offset += state.current_surplus_size;
-    new_tls_area_desc.abi_tcb.offset += state.current_surplus_size;
-    new_tls_area_desc.block.offset += state.current_surplus_size;
-
-    ElfTlsRuntime.publish(new_tls_area_desc);
-    logger.debug("tls.publish: object={s} template_bytes={d} area_bytes={d} alignment={d} surplus_bytes={d} native_storage_bytes={d}", .{ dyn_object.name, new_block_size, new_tls_area_desc.size, new_align_factor, state.current_surplus_size, thread_storage_size });
-
-    if (current_tls_area_desc.owns_template) state.allocator.free(current_tls_area_desc.block.init);
-
-    if (new_area) |area| {
-        const new_tp = @intFromPtr(area.ptr) + new_abi_tcb_offset;
-
-        const new_tcb: *usize = @ptrFromInt(new_tp);
-        new_tcb.* = new_tp;
-
-        logger.debug("tls: tls space mapped, new TP: 0x{x}", .{new_tp});
-
-        const e_set_fs = std.os.linux.syscall2(.arch_prctl, std.os.linux.ARCH.SET_FS, new_tp);
-        std.debug.assert(e_set_fs == 0);
-        logger.debug("tls.activate: object={s} previous_tp_host=0x{x} tp_host=0x{x} migrated={}", .{ dyn_object.name, old_tp, new_tp, old_tp != new_tp });
-        if (state.loader_thread_pointer == 0) state.loader_thread_pointer = new_tp;
-
-        if (state.libc_runtime) |*specifics| try specifics.updateRuntimeFields(new_tp);
-
-        dyn_object.tls_offset = new_abi_tcb_offset;
-        logger.debug("tls: tls offset: 0x{x}", .{new_abi_tcb_offset});
-
-        dyn_object.tls_mapped_at = @as(usize, @intFromPtr(area.ptr));
-    } else {
-        logger.debug("tls: {s}: no change to TLS area", .{dyn_object.name});
-    }
-
+    dyn_object.tls_module_id = try TlsLookup.reserve();
+    dyn_object.tls_offset = offset;
     dyn_object.tls_capacity = dyn_object.tls_init_mem_size;
-    dyn_object.tls_slot_align = dyn_object.tls_align;
-
-    if (dyn_object.tls_capacity != 0) try resetTlsSlot(dyn_object);
+    dyn_object.tls_slot_align = alignment;
+    state.tls_used_below_tp = offset;
+    state.current_surplus_size -= consumed;
 }
 
-/// Resets the template and every registered thread's slot when a module is loaded
-/// or reloaded. Registry locking protects worker membership during these copies;
-/// loader lifecycle serialization remains the caller's responsibility.
-fn resetTlsSlot(dyn_object: *DynObject) !void {
-    logger.debug("tls.reset: object={s} offset_below_tp=0x{x} capacity={d} initialized_bytes={d}", .{ dyn_object.name, dyn_object.tls_offset, dyn_object.tls_capacity, dyn_object.tls_init_file_size });
+/// Requires transaction ownership and a reserved slot. Initializes the template
+/// and every participant, then publishes the immutable resolver record under
+/// `thread_mutex`. Does not change allocation geometry or existing module values.
+fn publishModuleTls(dyn_object: *DynObject) !void {
+    if (dyn_object.tls_published) return;
 
-    const desc = state.normal_current_tls_area_desc.?;
-    const template = @as([*]u8, @constCast(desc.block.init.ptr))[desc.abi_tcb.offset - dyn_object.tls_offset ..][0..dyn_object.tls_capacity];
-    @memset(template, 0);
+    const source: []const u8 = if (dyn_object.tls_init_file_size == 0)
+        &.{}
+    else
+        @as([*]const u8, @ptrFromInt(try dyn_object.virtualToLoadedAddress(dyn_object.tls_init_mem_offset, false)))[0..dyn_object.tls_init_file_size];
 
-    if (dyn_object.tls_init_file_size != 0) {
-        const source: [*]const u8 = @ptrFromInt(try dyn_object.virtualToLoadedAddress(dyn_object.tls_init_mem_offset, false));
-        @memcpy(template[0..dyn_object.tls_init_file_size], source[0..dyn_object.tls_init_file_size]);
-    }
-
-    const tp = libc.currentThreadPointer();
-    @memcpy(@as([*]u8, @ptrFromInt(tp - dyn_object.tls_offset))[0..template.len], template);
-    dyn_object.tls_mapped_at = tp - dyn_object.tls_offset;
+    if (source.len > dyn_object.tls_capacity) return error.InvalidTlsInitializer;
 
     state.thread_mutex.lockUncancelable(state.io);
     defer state.thread_mutex.unlock(state.io);
 
+    const template_offset = ElfTlsRuntime.area_desc.abi_tcb.offset - dyn_object.tls_offset;
+    const template = state.tls_template[template_offset..][0..dyn_object.tls_capacity];
+    @memset(template, 0);
+    @memcpy(template[0..source.len], source);
+
+    const main_tp = state.main_thread_pointer;
+    @memcpy(@as([*]u8, @ptrFromInt(main_tp - dyn_object.tls_offset))[0..template.len], template);
+    dyn_object.tls_mapped_at = main_tp - dyn_object.tls_offset;
+
     for (state.thread_infos.values()) |entry| {
-        if (entry.handle == tp) continue;
+        if (!entry.tls_participant) continue;
         @memcpy(@as([*]u8, @ptrFromInt(entry.handle - dyn_object.tls_offset))[0..template.len], template);
     }
 
-    if (state.loader_thread_pointer != 0 and state.loader_thread_pointer != tp) {
-        @memcpy(@as([*]u8, @ptrFromInt(state.loader_thread_pointer - dyn_object.tls_offset))[0..template.len], template);
-    }
+    TlsLookup.publish(dyn_object.tls_module_id.?, dyn_object.tls_offset, dyn_object.tls_init_mem_size);
+    dyn_object.tls_published = true;
 }
 
 // The TLSDESC ABI passes the descriptor in `RAX`, not a System V argument
@@ -2584,24 +2655,15 @@ fn tlsDescResolver() callconv(.naked) void {
 }
 
 fn tlsGetAddressSubstitute(tls_index: *TlsIndex) callconv(.c) ?*anyopaque {
-    logger.debug("intercepted call: __tls_get_addr({})", .{tls_index});
-
-    const dyn_object_idx = tls_index.ti_module - 1;
-
-    const tp = libc.currentThreadPointer();
-
-    const dyn_object = &state.dyn_objects.values()[dyn_object_idx];
-    const addr = tp - dyn_object.tls_offset + tls_index.ti_offset;
-
-    logger.debug("intercepted call: success: __tls_get_addr({{.module = {s}, .offset = 0x{x}}}) = 0x{x}", .{ dyn_object.name, tls_index.ti_offset, addr });
-
-    return @ptrFromInt(addr);
+    return TlsLookup.address(tls_index.ti_module, tls_index.ti_offset, libc.currentThreadPointer());
 }
 
 fn dlGetTlsStaticInfoSubstitute(size: *usize, alignment: *usize) callconv(.c) void {
+    requireOwnerProcessOrExit();
+
     logger.debug("intercepted call: _dl_get_tls_static_info(0x{x}, 0x{x})", .{ @intFromPtr(size), @intFromPtr(alignment) });
-    size.* = state.normal_current_tls_area_desc.?.size + state.current_surplus_size;
-    alignment.* = state.normal_current_tls_area_desc.?.alignment;
+    size.* = ElfTlsRuntime.area_desc.size;
+    alignment.* = ElfTlsRuntime.area_desc.alignment;
     logger.debug("intercepted call: success: _dl_get_tls_static_info: size={d}, alignment={d}", .{ size.*, alignment.* });
 }
 
@@ -2709,7 +2771,7 @@ fn processRelocations(dyn_object: *DynObject) !void {
                 reloc_count += 1;
                 // R_X86_64_DTPMOD64: S (TLS module ID)
                 const sym = try resolveSymbol(dyn_object, reloc.sym_idx);
-                const tls_module_id = sym.dyn_object_idx + 1;
+                const tls_module_id = state.dyn_objects.values()[sym.dyn_object_idx].tls_module_id.?.value;
                 const value = @as(isize, @intCast(tls_module_id));
                 logger.debug("  DTPMOD64: 0x{x} (0x{x}): 0x{x} -> 0x{x} (0x{x}, {s}@{s} => [MODULE_TLS_ID]0x{x})", .{
                     reloc_addr,
@@ -2851,7 +2913,7 @@ fn processIRelativeRelocations(dyn_object: *DynObject) !void {
                 const resolver_addr = try dyn_object.virtualToLoadedAddress(@intCast(reloc.addend), false);
                 const resolver: *const fn () callconv(.c) usize = @ptrFromInt(resolver_addr);
                 logger.debug("  IRELATIVE: calling resolver at 0x{x} (0x{x})", .{ resolver_addr, reloc.addend });
-                const value = resolver();
+                const value = invokeResolver(resolver);
                 logger.debug("  IRELATIVE: 0x{x} (0x{x}): 0x{x} -> 0x{x}", .{ reloc_addr, reloc.offset, ptr.*, value });
                 try recordBindingDependency(dyn_object, value, null);
                 ptr.* = value;
@@ -2910,7 +2972,10 @@ fn lookupTlsSymbol(object: *DynObject, sym_idx: usize, allow_preload_override: b
 }
 
 /// Returns this thread's symbol address. The module's TLS must be installed.
-fn getRuntimeSymbolAddress(sym: ResolvedSymbol) usize {
+fn getRuntimeSymbolAddress(sym: ResolvedSymbol) !usize {
+    const owner = &state.dyn_objects.values()[sym.dyn_object_idx];
+    if (owner.initialization_failed) return error.LibraryInitializationFailed;
+
     return switch (sym.location) {
         .address => |address| address,
         .tls => blk: {
@@ -2931,7 +2996,7 @@ fn resolveLibcRuntimeSymbol(sym_name: []const u8) !ResolvedSymbol {
         const dep_object = entry.value_ptr;
 
         if (dep_object.syms.get(sym_name)) |dep_sym_list| {
-            for (dep_sym_list.items) |dep_sym_idx| {
+            for (dep_sym_list) |dep_sym_idx| {
                 const dep_sym = dep_object.syms_array.items[dep_sym_idx];
                 if (dep_sym.shidx != std.elf.SHN_UNDEF and !dep_sym.hidden) {
                     if (dep_sym.shidx == std.elf.SHN_ABS) {
@@ -2970,7 +3035,6 @@ fn resolveLibcRuntimeSymbol(sym_name: []const u8) !ResolvedSymbol {
 // TODO share scope traversal and IFUNC resolution between name, versioned-name,
 // and relocation lookup while preserving their distinct selection policies.
 
-// TODO synchronize IFUNC cache publication with lookup/load/unload and resolver reentrancy.
 /// Selects preload-only, object breadth-first, or global load-order scope. These
 /// modes are mutually exclusive where asserted below. `find_next` skips the first
 /// object in the supplied dependency scope; it is the current RTLD_NEXT policy.
@@ -2990,7 +3054,7 @@ fn getResolvedSymbolByName(maybe_dyn_object: ?*DynObject, sym_name: []const u8, 
             }
 
             if (dep_object.syms.get(sym_name)) |dep_sym_list| {
-                for (dep_sym_list.items) |dep_sym_idx| {
+                for (dep_sym_list) |dep_sym_idx| {
                     const dep_sym = dep_object.syms_array.items[dep_sym_idx];
                     if (dep_sym.shidx != std.elf.SHN_UNDEF and !dep_sym.hidden) {
                         if (dep_sym.shidx == std.elf.SHN_ABS) {
@@ -3009,7 +3073,7 @@ fn getResolvedSymbolByName(maybe_dyn_object: ?*DynObject, sym_name: []const u8, 
                             const resolver_addr = dep_addr;
                             const resolver: *const fn () callconv(.c) usize = @ptrFromInt(resolver_addr);
                             logger.debug("  IFUNC: calling resolver for {s} at 0x{x} (0x{x})", .{ dep_sym.name, resolver_addr, dep_sym_address });
-                            const value = resolver();
+                            const value = invokeResolver(resolver);
                             logger.debug("  IFUNC: {s}: 0x{x} (0x{x}): 0x{x}", .{ dep_sym.name, resolver_addr, dep_sym_address, value });
                             if (state.ifunc_resolved_addrs.get(resolver_addr)) |res_val| {
                                 std.debug.assert(res_val == value);
@@ -3052,7 +3116,7 @@ fn getResolvedSymbolByName(maybe_dyn_object: ?*DynObject, sym_name: []const u8, 
             }
 
             if (dep_object.syms.get(sym_name)) |dep_sym_list| {
-                for (dep_sym_list.items) |dep_sym_idx| {
+                for (dep_sym_list) |dep_sym_idx| {
                     const dep_sym = dep_object.syms_array.items[dep_sym_idx];
                     if (dep_sym.shidx != std.elf.SHN_UNDEF and !dep_sym.hidden) {
                         if (dep_sym.shidx == std.elf.SHN_ABS) {
@@ -3071,7 +3135,7 @@ fn getResolvedSymbolByName(maybe_dyn_object: ?*DynObject, sym_name: []const u8, 
                             const resolver_addr = dep_addr;
                             const resolver: *const fn () callconv(.c) usize = @ptrFromInt(resolver_addr);
                             logger.debug("  IFUNC: calling resolver for {s} at 0x{x} (0x{x})", .{ dep_sym.name, resolver_addr, dep_sym_address });
-                            const value = resolver();
+                            const value = invokeResolver(resolver);
                             logger.debug("  IFUNC: {s}: 0x{x} (0x{x}): 0x{x}", .{ dep_sym.name, resolver_addr, dep_sym_address, value });
                             if (state.ifunc_resolved_addrs.get(resolver_addr)) |res_val| {
                                 std.debug.assert(res_val == value);
@@ -3115,7 +3179,7 @@ fn getResolvedSymbolByName(maybe_dyn_object: ?*DynObject, sym_name: []const u8, 
             }
 
             if (dep_object.syms.get(sym_name)) |dep_sym_list| {
-                for (dep_sym_list.items) |dep_sym_idx| {
+                for (dep_sym_list) |dep_sym_idx| {
                     const dep_sym = dep_object.syms_array.items[dep_sym_idx];
                     if (dep_sym.shidx != std.elf.SHN_UNDEF and !dep_sym.hidden) {
                         if (dep_sym.shidx == std.elf.SHN_ABS) {
@@ -3134,7 +3198,7 @@ fn getResolvedSymbolByName(maybe_dyn_object: ?*DynObject, sym_name: []const u8, 
                             const resolver_addr = dep_addr;
                             const resolver: *const fn () callconv(.c) usize = @ptrFromInt(resolver_addr);
                             logger.debug("  IFUNC: calling resolver for {s} at 0x{x} (0x{x})", .{ dep_sym.name, resolver_addr, dep_sym_address });
-                            const value = resolver();
+                            const value = invokeResolver(resolver);
                             logger.debug("  IFUNC: {s}: 0x{x} (0x{x}): 0x{x}", .{ dep_sym.name, resolver_addr, dep_sym_address, value });
                             if (state.ifunc_resolved_addrs.get(resolver_addr)) |res_val| {
                                 std.debug.assert(res_val == value);
@@ -3192,7 +3256,7 @@ fn getResolvedSymbolByNameAndVersion(maybe_dyn_object: ?*DynObject, sym_name: []
             }
 
             if (dep_object.syms.get(sym_name)) |dep_sym_list| {
-                for (dep_sym_list.items) |dep_sym_idx| {
+                for (dep_sym_list) |dep_sym_idx| {
                     const dep_sym = dep_object.syms_array.items[dep_sym_idx];
                     if (std.mem.eql(u8, dep_sym.version, version) and dep_sym.shidx != std.elf.SHN_UNDEF and !dep_sym.hidden) {
                         if (dep_sym.shidx == std.elf.SHN_ABS) {
@@ -3211,7 +3275,7 @@ fn getResolvedSymbolByNameAndVersion(maybe_dyn_object: ?*DynObject, sym_name: []
                             const resolver_addr = dep_addr;
                             const resolver: *const fn () callconv(.c) usize = @ptrFromInt(resolver_addr);
                             logger.debug("  IFUNC: calling resolver for {s} at 0x{x} (0x{x})", .{ dep_sym.name, resolver_addr, dep_sym_address });
-                            const value = resolver();
+                            const value = invokeResolver(resolver);
                             logger.debug("  IFUNC: {s}: 0x{x} (0x{x}): 0x{x}", .{ dep_sym.name, resolver_addr, dep_sym_address, value });
                             if (state.ifunc_resolved_addrs.get(resolver_addr)) |res_val| {
                                 std.debug.assert(res_val == value);
@@ -3254,7 +3318,7 @@ fn getResolvedSymbolByNameAndVersion(maybe_dyn_object: ?*DynObject, sym_name: []
             }
 
             if (dep_object.syms.get(sym_name)) |dep_sym_list| {
-                for (dep_sym_list.items) |dep_sym_idx| {
+                for (dep_sym_list) |dep_sym_idx| {
                     const dep_sym = dep_object.syms_array.items[dep_sym_idx];
                     if (std.mem.eql(u8, dep_sym.version, version) and dep_sym.shidx != std.elf.SHN_UNDEF and !dep_sym.hidden) {
                         if (dep_sym.shidx == std.elf.SHN_ABS) {
@@ -3273,7 +3337,7 @@ fn getResolvedSymbolByNameAndVersion(maybe_dyn_object: ?*DynObject, sym_name: []
                             const resolver_addr = dep_addr;
                             const resolver: *const fn () callconv(.c) usize = @ptrFromInt(resolver_addr);
                             logger.debug("  IFUNC: calling resolver for {s} at 0x{x} (0x{x})", .{ dep_sym.name, resolver_addr, dep_sym_address });
-                            const value = resolver();
+                            const value = invokeResolver(resolver);
                             logger.debug("  IFUNC: {s}: 0x{x} (0x{x}): 0x{x}", .{ dep_sym.name, resolver_addr, dep_sym_address, value });
                             if (state.ifunc_resolved_addrs.get(resolver_addr)) |res_val| {
                                 std.debug.assert(res_val == value);
@@ -3317,7 +3381,7 @@ fn getResolvedSymbolByNameAndVersion(maybe_dyn_object: ?*DynObject, sym_name: []
             }
 
             if (dep_object.syms.get(sym_name)) |dep_sym_list| {
-                for (dep_sym_list.items) |dep_sym_idx| {
+                for (dep_sym_list) |dep_sym_idx| {
                     const dep_sym = dep_object.syms_array.items[dep_sym_idx];
                     if (std.mem.eql(u8, dep_sym.version, version) and dep_sym.shidx != std.elf.SHN_UNDEF and !dep_sym.hidden) {
                         if (dep_sym.shidx == std.elf.SHN_ABS) {
@@ -3336,7 +3400,7 @@ fn getResolvedSymbolByNameAndVersion(maybe_dyn_object: ?*DynObject, sym_name: []
                             const resolver_addr = dep_addr;
                             const resolver: *const fn () callconv(.c) usize = @ptrFromInt(resolver_addr);
                             logger.debug("  IFUNC: calling resolver for {s} at 0x{x} (0x{x})", .{ dep_sym.name, resolver_addr, dep_sym_address });
-                            const value = resolver();
+                            const value = invokeResolver(resolver);
                             logger.debug("  IFUNC: {s}: 0x{x} (0x{x}): 0x{x}", .{ dep_sym.name, resolver_addr, dep_sym_address, value });
                             if (state.ifunc_resolved_addrs.get(resolver_addr)) |res_val| {
                                 std.debug.assert(res_val == value);
@@ -3457,7 +3521,7 @@ fn resolveSymbolInner(dyn_object: *DynObject, sym_idx: usize) !ResolvedBinding {
             const resolver_addr = addr;
             const resolver: *const fn () callconv(.c) usize = @ptrFromInt(resolver_addr);
             logger.debug("  IFUNC: calling resolver for {s} at 0x{x} (0x{x})", .{ sym.name, resolver_addr, sym_address });
-            const value = resolver();
+            const value = invokeResolver(resolver);
             logger.debug("  IFUNC: {s}: 0x{x} (0x{x}): 0x{x}", .{ sym.name, resolver_addr, sym_address, value });
             if (state.ifunc_resolved_addrs.get(resolver_addr)) |res_val| {
                 std.debug.assert(res_val == value);
@@ -3489,7 +3553,7 @@ fn resolveSymbolInner(dyn_object: *DynObject, sym_idx: usize) !ResolvedBinding {
         }
 
         if (dep_object.syms.get(sym.name)) |dep_sym_list| {
-            for (dep_sym_list.items) |dep_sym_idx| {
+            for (dep_sym_list) |dep_sym_idx| {
                 const dep_sym = dep_object.syms_array.items[dep_sym_idx];
                 const unversioned = sym.version.len == 0 or std.mem.eql(u8, sym.version, "GLOBAL") or
                     (sym.shidx == std.elf.SHN_UNDEF and sym.bind != .LOCAL and std.mem.eql(u8, sym.version, "LOCAL"));
@@ -3522,7 +3586,7 @@ fn resolveSymbolInner(dyn_object: *DynObject, sym_idx: usize) !ResolvedBinding {
                         const resolver_addr = dep_addr;
                         const resolver: *const fn () callconv(.c) usize = @ptrFromInt(resolver_addr);
                         logger.debug("  IFUNC: calling resolver for {s} at 0x{x} (0x{x})", .{ dep_sym.name, resolver_addr, dep_sym_address });
-                        const value = resolver();
+                        const value = invokeResolver(resolver);
                         logger.debug("  IFUNC: {s}: 0x{x} (0x{x}): 0x{x}", .{ dep_sym.name, resolver_addr, dep_sym_address, value });
                         if (state.ifunc_resolved_addrs.get(resolver_addr)) |res_val| {
                             std.debug.assert(res_val == value);
@@ -3634,9 +3698,24 @@ fn findDynObjectSegmentForLoadedAddr(addr: usize) !DynObjectSegmentResult {
 // Object initialization and retirement.
 // -------------------------------------
 
+// Rejects loader API reentry from IFUNC/IRELATIVE resolvers, which may run during partial relocation.
+threadlocal var resolver_active: bool = false;
+
+fn invokeResolver(resolver: *const fn () callconv(.c) usize) usize {
+    if (findDynObjectForLoadedAddr(@intFromPtr(resolver))) |owner| {
+        state.dyn_objects.values()[owner.dyn_object_index].execution_started = true;
+    }
+
+    const previous = resolver_active;
+    resolver_active = true;
+    defer resolver_active = previous;
+
+    return resolver();
+}
+
 fn callInitFunctions(dyn_obj: *DynObject) !void {
     errdefer logger.err("init: object={s} action=failed", .{dyn_obj.name});
-    if (state.libc_runtime) |*specifics| try specifics.beforeConstructors(dyn_obj.name);
+    if (state.libc_runtime) |*specifics| specifics.beforeConstructors(dyn_obj.name);
 
     if (dyn_obj.init_addr != 0) {
         const initial_addr = dyn_obj.init_addr;
@@ -3719,17 +3798,53 @@ fn callFiniFunctions(dyn_obj: *DynObject) !void {
 /// Binding edges retain redirected implementations outside declared dependencies.
 /// Runs all retiring finalizers before removing any of their mappings.
 fn unloadUnreferencedObjects() !void {
+    return unloadObjects(.release);
+}
+
+/// The caller has already released its references. `.release` uses normal lifetime
+/// rules; `.deinit` drops host-lifetime pins while preserving the NODELETE runtime.
+fn unloadObjects(mode: enum { release, deinit }) !void {
     const keep = try state.allocator.alloc(bool, state.dyn_objects.count());
     defer state.allocator.free(keep);
+    const deinitializing = mode == .deinit;
+
+    state.thread_mutex.lockUncancelable(state.io);
+    for (state.object_lifetimes.items) |entry| {
+        state.dyn_objects.values()[entry.object_idx].tls_destructors = entry.destructors;
+    }
+    state.thread_mutex.unlock(state.io);
 
     for (state.dyn_objects.values(), keep) |dyn_object, *live| {
-        live.* = dyn_object.ref_count != 0 or dyn_object.pinned or dyn_object.finalizing or dyn_object.tls_destructors != 0;
+        // Escaped-load pins last until host teardown; native runtime pins must
+        // also survive retained teardown because backend state borrows them.
+        const escaped_pin = dyn_object.pinned and !deinitializing;
+        const destructor_pin = dyn_object.tls_destructors != 0 and !deinitializing;
+        live.* = dyn_object.ref_count != 0 or escaped_pin or dyn_object.runtime_pinned or dyn_object.nodelete or dyn_object.finalizing or destructor_pin;
         logger.debug("unload.roots: object={s} retained={} references={d} pinned={} finalizing={} tls_destructors={d}", .{ dyn_object.name, live.*, dyn_object.ref_count, dyn_object.pinned, dyn_object.finalizing, dyn_object.tls_destructors });
     }
 
     var changed = true;
     while (changed) {
         changed = false;
+        if (deinitializing) {
+            // Keep main-thread callbacks and callbacks of retained workers.
+            // Other libraries' finalizers can stop/join their own workers first.
+            state.thread_mutex.lockUncancelable(state.io);
+            for (state.thread_destructors.items) |destructor| {
+                var retained_thread = destructor.tp == state.main_thread_pointer;
+                for (state.thread_infos.values()) |worker| {
+                    if (worker.handle != destructor.tp) continue;
+                    if (worker.entry_object) |owner| retained_thread = keep[owner];
+                    break;
+                }
+                if (retained_thread and !keep[destructor.object_idx]) {
+                    keep[destructor.object_idx] = true;
+                    changed = true;
+                }
+            }
+            state.thread_mutex.unlock(state.io);
+        }
+
         for (state.dyn_objects.values(), keep) |dyn_object, live| {
             if (!live) continue;
 
@@ -3787,6 +3902,16 @@ fn unloadUnreferencedObjects() !void {
         };
     }
 
+    // Finalizers may stop and join their workers. Do not unload an entry point
+    // that still has a live worker after those finalizers return.
+    state.thread_mutex.lockUncancelable(state.io);
+    for (state.thread_infos.values()) |worker| {
+        const owner = worker.entry_object orelse continue;
+        if (worker.authorized and std.mem.findScalar(usize, retiring.items, owner) != null)
+            @panic("library finalizer left a worker executing retiring code");
+    }
+    state.thread_mutex.unlock(state.io);
+
     for (retiring.items) |idx| try retireObject(idx);
 
     for (state.dyn_objects.values(), 0..) |*dyn_object, idx| {
@@ -3804,10 +3929,18 @@ fn unloadUnreferencedObjects() !void {
 /// Keeps the address reservation and TLS capacity for reuse under a new epoch.
 fn retireObject(idx: usize) !void {
     const dyn_object = &state.dyn_objects.values()[idx];
+    state.thread_mutex.lockUncancelable(state.io);
+
+    for (state.object_lifetimes.items) |*entry| {
+        if (entry.object_idx == idx) entry.active = false;
+    }
+
+    state.thread_mutex.unlock(state.io);
+
     logger.debug("unload.retire: object={s} object_index={d} epoch={d} action=begin", .{ dyn_object.name, idx, dyn_object.current_epoch });
     errdefer logger.err("unload.retire: object={s} object_index={d} action=failed", .{ dyn_object.name, idx });
 
-    if (dyn_object.phdr_info) |info| CustomSelfInfo.removeExtraElf(state.allocator, info);
+    if (dyn_object.phdr_info) |info| CustomSelfInfo.removeExtraElf(state.allocator, state.io, info);
     dyn_object.phdr_info = null;
 
     if (dyn_object.phdr_name) |name| state.allocator.free(name);
@@ -3862,9 +3995,12 @@ fn retireObject(idx: usize) !void {
     dyn_object.load_requested = false;
     dyn_object.finalizing = false;
     dyn_object.tls_mapped_at = 0;
+    dyn_object.tls_module_id = null;
+    dyn_object.nodelete = false;
+    dyn_object.tls_published = false;
+    dyn_object.execution_started = false;
 
     dyn_object.syms_array.clearRetainingCapacity();
-    for (dyn_object.syms.values()) |*indices| indices.deinit(state.allocator);
     dyn_object.syms.clearRetainingCapacity();
 
     dyn_object.relocs.clearRetainingCapacity();
@@ -3872,9 +4008,12 @@ fn retireObject(idx: usize) !void {
     dyn_object.binding_dependencies.clearRetainingCapacity();
 
     if (dyn_object.tls_capacity != 0) {
-        const desc = state.normal_current_tls_area_desc.?;
-        @memset(@as([*]u8, @constCast(desc.block.init.ptr))[desc.abi_tcb.offset - dyn_object.tls_offset ..][0..dyn_object.tls_capacity], 0);
+        state.thread_mutex.lockUncancelable(state.io);
+        const offset = ElfTlsRuntime.area_desc.abi_tcb.offset - dyn_object.tls_offset;
+        @memset(state.tls_template[offset..][0..dyn_object.tls_capacity], 0);
+        state.thread_mutex.unlock(state.io);
     }
+
     logger.info("unload.retire: object={s} object_index={d} action=complete reserved_bytes={d} tls_capacity={d}", .{ dyn_object.name, idx, reservation.len, dyn_object.tls_capacity });
 }
 
@@ -3909,6 +4048,7 @@ fn reuseRetiredObjectSlot(key: DynObjectId, path: []const u8) void {
 // These callbacks borrow registry entries only for the duration of inspection.
 // Native runtime state retains mapped addresses rather than pointers into the map.
 const libc_services: libc.Services = .{
+    .native_metadata_capacity = ElfTlsRuntime.native_metadata_capacity,
     .lookupSymbol = &lookupRuntimeSymbol,
     .lookupRuntimeSymbol = &resolveLibcRuntimeSymbol,
     .definingObject = &runtimeSymbolOwner,
@@ -3937,6 +4077,7 @@ fn runtimeSymbolOwner(symbol: ResolvedSymbol) *DynObject {
 fn inspectRuntimeSymbol(object: *DynObject, name: []const u8) !DynObject.Definition {
     const symbol = try lookupRuntimeSymbol(object, name, true);
     const owner = runtimeSymbolOwner(symbol);
+
     return .{
         .object = owner,
         .symbol = &owner.syms_array.items[symbol.sym_idx],
@@ -3944,17 +4085,30 @@ fn inspectRuntimeSymbol(object: *DynObject, name: []const u8) !DynObject.Definit
 }
 
 fn runtimeValues() libc.RuntimeValues {
-    const tls = state.normal_current_tls_area_desc orelse ElfTlsRuntime.area_desc;
+    const tls = ElfTlsRuntime.area_desc;
+
     return .{
         .args = state.args,
         .environ = state.environ,
         .auxv_address = @intFromPtr(ElfTlsRuntime.__zig_elf_auxv),
-        .tls_size = tls.size + state.current_surplus_size,
+        .tls_size = tls.size,
         .tls_align = tls.alignment,
     };
 }
 
 const substitutes = std.StaticStringMap(*const anyopaque).initComptime([_]struct { []const u8, *const anyopaque }{
+    // Process-wide native coordination cannot include unregistered host threads.
+    .{ "_Fork", @ptrCast(&unsupportedProcessOperation) },
+    .{ "vfork", @ptrCast(&unsupportedProcessOperation) },
+    .{ "setuid", @ptrCast(&unsupportedCredentialChange) },
+    .{ "setgid", @ptrCast(&unsupportedCredentialChange) },
+    .{ "seteuid", @ptrCast(&unsupportedCredentialChange) },
+    .{ "setegid", @ptrCast(&unsupportedCredentialChange) },
+    .{ "setreuid", @ptrCast(&unsupportedCredentialPair) },
+    .{ "setregid", @ptrCast(&unsupportedCredentialPair) },
+    .{ "setresuid", @ptrCast(&unsupportedCredentialTriple) },
+    .{ "setresgid", @ptrCast(&unsupportedCredentialTriple) },
+    .{ "setgroups", @ptrCast(&unsupportedGroupChange) },
     // Allocation
     .{ "malloc", @ptrCast(&mallocSubstitute) },
     .{ "free", @ptrCast(&freeSubstitute) },
@@ -4080,6 +4234,8 @@ fn getSubstituteAddress(sym: ResolvedSymbol, for_obj: *DynObject, allow_preload_
 }
 
 fn unsubstitutedTrap() callconv(.c) noreturn {
+    requireOwnerProcessOrExit();
+
     logger.err("intercepted call: failed: unsupported library function", .{});
     @panic("unsupported library function called");
 }
@@ -4284,6 +4440,7 @@ fn reallocSubstitute(p: ?*anyopaque, size: usize) callconv(.c) ?*anyopaque {
     };
 
     logger.debug("intercepted call: success: realloc(0x{x}, {d}) = 0x{x}", .{ @intFromPtr(p), size, @intFromPtr(result) });
+
     return result;
 }
 
@@ -4314,6 +4471,7 @@ fn reallocateTracked(p: ?*anyopaque, requested_size: usize) !*anyopaque {
                 .requested_size = requested_size,
                 .alignment = allocation.alignment,
             });
+
             return @ptrFromInt(address);
         }
     }
@@ -4351,6 +4509,7 @@ fn reallocarraySubstitute(p: ?*anyopaque, n: usize, size: usize) callconv(.c) ?*
     };
 
     logger.debug("intercepted call: success: reallocarray(0x{x}, {d}, {d}) = 0x{x}", .{ @intFromPtr(p), n, size, @intFromPtr(result) });
+
     return result;
 }
 
@@ -4396,21 +4555,21 @@ const rtld_flags = struct {
     const noload: c_int = 0x00004;
     const global: c_int = 0x00100;
     const local: c_int = 0x00000;
+    const nodelete: c_int = 0x01000;
 };
 
 threadlocal var last_dl_error: ?[:0]const u8 = null;
 threadlocal var dl_error_buffer: [2048]u8 = undefined;
 threadlocal var dlerror_cleared: bool = true;
 
-// TODO synchronize handle/refcount changes and retained diagnostic allocations
-// with object lifetime; dlerror storage itself is already thread-local.
-
 fn dlerrorSubstitute() callconv(.c) ?[*:0]const u8 {
-    logger.debug("intercepted call: dlerror()", .{});
+    // Reading a rejection diagnostic needs only executable TLS, even in a child.
+    const can_log = isOwnerProcess();
+    if (can_log) logger.debug("intercepted call: dlerror()", .{});
 
     const err = if (!dlerror_cleared and last_dl_error != null) last_dl_error.?.ptr else null;
     dlerror_cleared = true;
-    logger.debug("intercepted call: success: dlerror() = {?s}", .{err});
+    if (can_log) logger.debug("intercepted call: success: dlerror() = {?s}", .{err});
 
     return err;
 }
@@ -4425,7 +4584,32 @@ fn formatDlError(comptime format: []const u8, args: anytype) [:0]const u8 {
     return dl_error_buffer[0..message.len :0];
 }
 
+fn acquireResidentLibrary(path: []const u8) !DynamicLibrary {
+    const index = state.load_request_cache.get(path) orelse blk: {
+        for (state.dyn_objects.values(), 0..) |object, idx| {
+            if (!object.loaded) continue;
+            if (std.mem.eql(u8, object.path, path) or std.mem.eql(u8, object.name, path)) break :blk idx;
+        }
+
+        return error.LibraryNotFound;
+    };
+
+    const object = &state.dyn_objects.values()[index];
+    if (!object.loaded or object.finalizing or object.initialization_failed) return error.LibraryNotFound;
+
+    for (object.deps_breadth_first.items) |idx| state.dyn_objects.values()[idx].ref_count += 1;
+
+    return .{ .index = index };
+}
+
 fn dlopenSubstitute(path: ?[*:0]const u8, flags: c_int) callconv(.c) ?*anyopaque {
+    requireManaged(.active_only) catch |err| {
+        last_dl_error = formatDlError("dlopen: {}", .{err});
+        return null;
+    };
+    state.transaction_lock.lock(state.io);
+    defer state.transaction_lock.unlock(state.io);
+
     const caller_addr = @returnAddress();
     logger.debug("intercepted call: dlopen(\"{?s}\", 0x{x})", .{ path, flags });
 
@@ -4447,9 +4631,11 @@ fn dlopenSubstitute(path: ?[*:0]const u8, flags: c_int) callconv(.c) ?*anyopaque
         logger.debug("dlopen caller at 0x{x} is not a dynamically loaded object", .{caller_addr});
     }
 
-    // TODO implement resident-object lookup for RTLD_NOLOAD before loading or constructors,
-    // including successful-handle reference accounting and flag semantics.
-    const lib = loadWithRootResolveContext(requested_path, caller_runpath, caller_origin_dir) catch |err| {
+    const loaded = if ((flags & rtld_flags.noload) != 0)
+        acquireResidentLibrary(requested_path)
+    else
+        loadWithRootResolveContext(requested_path, caller_runpath, caller_origin_dir, .native);
+    const lib = loaded catch |err| {
         if ((flags & rtld_flags.noload) == 0) {
             last_dl_error = formatDlError("unable to load library {s}: {}", .{ requested_path, err });
             dlerror_cleared = false;
@@ -4494,12 +4680,23 @@ fn dlopenSubstitute(path: ?[*:0]const u8, flags: c_int) callconv(.c) ?*anyopaque
         };
     }
 
+    // A failed handle registration must not promote an otherwise unloadable object.
+    if ((flags & rtld_flags.nodelete) != 0) dyn_object.nodelete = true;
+
     logger.debug("intercepted call: success: dlopen(\"{?s}\", 0x{x}) = 0x{x}", .{ path, flags, handle_raw });
 
     return @ptrFromInt(@as(usize, @intCast(handle_raw)));
 }
 
 fn dlcloseSubstitute(lib: *anyopaque) callconv(.c) c_int {
+    requireManaged(.allow_finalization) catch |err| {
+        last_dl_error = formatDlError("dlclose: {}", .{err});
+        return -1;
+    };
+
+    state.transaction_lock.lock(state.io);
+    defer state.transaction_lock.unlock(state.io);
+
     logger.debug("intercepted call: dlclose(0x{x})", .{@intFromPtr(lib)});
 
     const handle_raw: u64 = @intCast(@intFromPtr(lib));
@@ -4561,6 +4758,7 @@ fn dlcloseSubstitute(lib: *anyopaque) callconv(.c) c_int {
     if (dyn_object.ref_count == 0) {
         metadata.open_count -= 1;
         logger.debug("intercepted call: success: dlclose(0x{x} [{s}]) = 0 (already unloaded)", .{ handle_raw, dyn_object.name });
+
         return 0;
     }
 
@@ -4576,6 +4774,7 @@ fn dlcloseSubstitute(lib: *anyopaque) callconv(.c) c_int {
         last_dl_error = formatDlError("unable to close library handle 0x{x}: {}", .{ handle_raw, err });
         dlerror_cleared = false;
         logger.warn("intercepted call: failed: dlclose(0x{x}): {}", .{ handle_raw, err });
+
         return 1;
     };
 
@@ -4595,6 +4794,14 @@ fn dlvsymSubstitute(lib_handle: ?*anyopaque, sym_name: [*:0]const u8, version: [
 // Capture the caller address in the C entry points: RTLD_NEXT and preload policy
 // need the native caller, not the wrapper's call into this helper.
 fn lookupDlSymbol(lib_handle: ?*anyopaque, sym_name: []const u8, version: ?[]const u8, caller_addr: usize) ?*anyopaque {
+    requireManaged(.allow_finalization) catch |err| {
+        last_dl_error = formatDlError("symbol lookup: {}", .{err});
+        return null;
+    };
+
+    state.transaction_lock.lock(state.io);
+    defer state.transaction_lock.unlock(state.io);
+
     const operation = if (version != null) "dlvsym" else "dlsym";
     const version_separator = if (version != null) "@" else "";
     const version_name = version orelse "";
@@ -4688,7 +4895,11 @@ fn lookupDlSymbol(lib_handle: ?*anyopaque, sym_name: []const u8, version: ?[]con
         return null;
     };
 
-    const address = getRuntimeSymbolAddress(sym);
+    const address = getRuntimeSymbolAddress(sym) catch |err| {
+        last_dl_error = formatDlError("symbol lookup: {}", .{err});
+        return null;
+    };
+
     logger.debug("intercepted call: success: {s}({d} [{s}], \"{s}{s}{s}\") = 0x{x}", .{ operation, @intFromPtr(lib_handle), if (dyn_object) |do| do.name else "NULL", sym_name, version_separator, version_name, address });
 
     return @ptrFromInt(address);
@@ -4748,6 +4959,10 @@ fn discardDiagnosticAllocations(string_count: usize, link_map_count: usize) void
 // TODO factor out the shared address lookup and DlInfo construction in dladdrSubstitute
 // and dladdr1Substitute, preserving rollback across the complete dladdr1 operation.
 fn dladdrSubstitute(addr: *anyopaque, dl_info: *DlInfo) callconv(.c) c_int {
+    requireManaged(.allow_finalization) catch return 0;
+    state.transaction_lock.lock(state.io);
+    defer state.transaction_lock.unlock(state.io);
+
     logger.debug("intercepted call: dladdr(0x{x}, dl_info: *DlInfo [0x{x}])", .{ @intFromPtr(addr), @intFromPtr(dl_info) });
 
     const string_count = state.extra_strs_z.items.len;
@@ -4757,7 +4972,6 @@ fn dladdrSubstitute(addr: *anyopaque, dl_info: *DlInfo) callconv(.c) c_int {
 
     const infos = findDynObjectSegmentForLoadedAddr(@intFromPtr(addr)) catch |err| {
         last_dl_error = formatDlError("unable to get infos for address 0x{x}: {}", .{ @intFromPtr(addr), err });
-
         logger.warn("intercepted call: failed: dladdr(0x{x}): {}", .{ @intFromPtr(addr), err });
 
         return 0;
@@ -4766,6 +4980,7 @@ fn dladdrSubstitute(addr: *anyopaque, dl_info: *DlInfo) callconv(.c) c_int {
     const owned_path = retainDiagnosticString(infos.dyn_object.path) catch {
         last_dl_error = formatDlError("dladdr: out of memory", .{});
         logger.warn("intercepted call: failed: dladdr(0x{x}): out of memory", .{@intFromPtr(addr)});
+
         return 0;
     };
 
@@ -4779,6 +4994,7 @@ fn dladdrSubstitute(addr: *anyopaque, dl_info: *DlInfo) callconv(.c) c_int {
         const owned_sym_name = retainDiagnosticString(sym.name) catch {
             last_dl_error = formatDlError("dladdr: out of memory", .{});
             logger.warn("intercepted call: failed: dladdr(0x{x}): out of memory", .{@intFromPtr(addr)});
+
             return 0;
         };
 
@@ -4802,6 +5018,11 @@ fn dladdrSubstitute(addr: *anyopaque, dl_info: *DlInfo) callconv(.c) c_int {
 }
 
 fn dladdr1Substitute(addr: *anyopaque, dl_info: *DlInfo, extra_infos: *anyopaque, flags: c_int) callconv(.c) c_int {
+    requireManaged(.allow_finalization) catch return 0;
+
+    state.transaction_lock.lock(state.io);
+    defer state.transaction_lock.unlock(state.io);
+
     logger.debug("intercepted call: dladdr1(0x{x}, 0x{x}, 0x{x}, flags={d})", .{ @intFromPtr(addr), @intFromPtr(dl_info), @intFromPtr(extra_infos), flags });
 
     const string_count = state.extra_strs_z.items.len;
@@ -4827,6 +5048,7 @@ fn dladdr1Substitute(addr: *anyopaque, dl_info: *DlInfo, extra_infos: *anyopaque
     const owned_path = retainDiagnosticString(infos.dyn_object.path) catch {
         last_dl_error = formatDlError("dladdr1: out of memory", .{});
         logger.warn("intercepted call: failed: dladdr1(0x{x}): out of memory", .{@intFromPtr(addr)});
+
         return 0;
     };
 
@@ -4840,6 +5062,7 @@ fn dladdr1Substitute(addr: *anyopaque, dl_info: *DlInfo, extra_infos: *anyopaque
         const owned_sym_name = retainDiagnosticString(sym.name) catch {
             last_dl_error = formatDlError("dladdr1: out of memory", .{});
             logger.warn("intercepted call: failed: dladdr1(0x{x}): out of memory", .{@intFromPtr(addr)});
+
             return 0;
         };
 
@@ -4907,6 +5130,8 @@ fn dladdr1Substitute(addr: *anyopaque, dl_info: *DlInfo, extra_infos: *anyopaque
 }
 
 fn dlinfoSubstitute(lib: *anyopaque, request: c_int, info: *anyopaque) callconv(.c) c_int {
+    requireManaged(.allow_finalization) catch return -1;
+
     logger.debug("intercepted call: dlinfo(0x{x}, 0x{x}, 0x{x})", .{ @intFromPtr(lib), request, @intFromPtr(info) });
     // TODO define supported dlinfo requests and their output/error contracts.
     logger.err("intercepted call: failed: dlinfo(0x{x}, 0x{x}, 0x{x}): unimplemented", .{ @intFromPtr(lib), request, @intFromPtr(info) });
@@ -4914,6 +5139,8 @@ fn dlinfoSubstitute(lib: *anyopaque, request: c_int, info: *anyopaque) callconv(
 }
 
 fn dlmopenSubstitute(lmid: c_long, path: ?[*:0]u8, flags: c_int) callconv(.c) ?*anyopaque {
+    requireManaged(.active_only) catch return null;
+
     logger.debug("intercepted call: dlmopen({d}, \"{?s}\", 0x{x})", .{ lmid, path, flags });
     // TODO implement namespace-aware loading and LM_ID validation.
     logger.err("intercepted call: failed: dlmopen({d}, \"{?s}\", 0x{x}): unimplemented", .{ lmid, path, flags });
@@ -4921,6 +5148,10 @@ fn dlmopenSubstitute(lmid: c_long, path: ?[*:0]u8, flags: c_int) callconv(.c) ?*
 }
 
 fn dlFindObjectSubstitute(pc: *anyopaque, result: *DlFindObject) callconv(.c) c_int {
+    requireManaged(.allow_finalization) catch return -1;
+    state.transaction_lock.lock(state.io);
+    defer state.transaction_lock.unlock(state.io);
+
     logger.debug("intercepted call: _dl_find_object(0x{x}, *DlFindObject [0x{x}])", .{ @intFromPtr(pc), @intFromPtr(result) });
 
     const infos = findDynObjectSegmentForLoadedAddr(@intFromPtr(pc)) catch |err| {
@@ -4938,6 +5169,10 @@ fn dlFindObjectSubstitute(pc: *anyopaque, result: *DlFindObject) callconv(.c) c_
 }
 
 fn dlFindDsoForObjectSubstitute(addr: *anyopaque) callconv(.c) ?*DlLinkMap {
+    requireManaged(.allow_finalization) catch return null;
+    state.transaction_lock.lock(state.io);
+    defer state.transaction_lock.unlock(state.io);
+
     logger.debug("intercepted call: _dl_find_dso_for_object(0x{x})", .{@intFromPtr(addr)});
 
     const string_count = state.extra_strs_z.items.len;
@@ -4962,6 +5197,7 @@ fn dlFindDsoForObjectSubstitute(addr: *anyopaque) callconv(.c) ?*DlLinkMap {
     const link_map = retainLinkMap() catch {
         last_dl_error = formatDlError("_dl_find_dso_for_object: out of memory", .{});
         logger.warn("intercepted call: failed: _dl_find_dso_for_object(0x{x}): out of memory", .{@intFromPtr(addr)});
+
         return null;
     };
 
@@ -4974,10 +5210,15 @@ fn dlFindDsoForObjectSubstitute(addr: *anyopaque) callconv(.c) ?*DlLinkMap {
 
     completed = true;
     logger.debug("intercepted call: success: _dl_find_dso_for_object(0x{x}) = 0x{x}", .{ @intFromPtr(addr), @intFromPtr(link_map) });
+
     return link_map;
 }
 
 fn dlIteratePhdrSubstitute(callback: *const fn (*anyopaque, c_uint, *anyopaque) callconv(.c) c_int, data: *anyopaque) callconv(.c) c_int {
+    requireManaged(.allow_finalization) catch return -1;
+    state.transaction_lock.lock(state.io);
+    defer state.transaction_lock.unlock(state.io);
+
     logger.debug("intercepted call: dl_iterate_phdr(callback: 0x{x}, data: 0x{x})", .{ @intFromPtr(callback), @intFromPtr(data) });
 
     const object_count = state.dyn_objects.count();
@@ -4986,6 +5227,10 @@ fn dlIteratePhdrSubstitute(callback: *const fn (*anyopaque, c_uint, *anyopaque) 
         if (!dyn_obj.loaded) continue;
         const registered_info = dyn_obj.phdr_info orelse continue;
 
+        // Same-thread callbacks may close handles and recursively load. Retain
+        // this object's dependency closure until the borrowed headers return.
+        dyn_obj.ref_count += 1;
+        defer state.dyn_objects.values()[index].ref_count -= 1;
         var info = registered_info.*;
         const ret = callback(&info, @sizeOf(std.posix.dl_phdr_info), data);
         if (ret != 0) {
@@ -4999,61 +5244,203 @@ fn dlIteratePhdrSubstitute(callback: *const fn (*anyopaque, c_uint, *anyopaque) 
     return 0;
 }
 
-// Thread lifecycle and thread-local destructors.
-// ----------------------------------------------
+// Thread lifecycle and C++ TLS destructors.
+// ---------------------------------------
 
 const ThreadInfos = struct {
+    entry_object: ?usize = null,
     idx: usize,
     thread: *std.Thread,
-    result: *anyopaque,
+    result: ?*anyopaque,
     handle: c_ulong,
     joining: bool = false,
     libc_worker: libc.Runtime.Worker,
+    tid: std.os.linux.pid_t = 0,
+    tls_participant: bool = false,
+    authorized: bool = false,
 };
 const ThreadInfosMap = std.AutoArrayHashMapUnmanaged(usize, ThreadInfos);
 
 const ThreadRoutineContext = struct {
     idx: usize,
     thread: *std.Thread,
-    function: *const fn (?*anyopaque) callconv(.c) *anyopaque,
+    function: *const fn (argument: ?*anyopaque) callconv(.c) ?*anyopaque,
     argument: ?*anyopaque,
     libc_worker: libc.Runtime.Worker,
+    startup: *WorkerStartup,
 };
 
-const ThreadDestructor = struct {
-    tp: usize,
-    object_idx: usize,
-    function: *const fn (?*anyopaque) callconv(.c) void,
-    argument: ?*anyopaque,
+const WorkerStartup = struct {
+    ready: std.atomic.Value(u32) = .init(0),
+    tp: usize = 0,
+    failure: ?anyerror = null,
+
+    fn publish(self: *WorkerStartup, tp: usize) void {
+        self.tp = tp;
+        // This is the last access to creator-owned startup storage.
+        self.ready.store(1, .release);
+    }
+
+    fn wait(self: *WorkerStartup) void {
+        while (self.ready.load(.acquire) == 0) {
+            _ = std.os.linux.syscall0(.sched_yield);
+        }
+    }
 };
 
-fn cxaThreadAtExitSubstitute(function: *const fn (?*anyopaque) callconv(.c) void, argument: ?*anyopaque, dso: ?*anyopaque) callconv(.c) c_int {
-    logger.debug("intercepted call: __cxa_thread_atexit_impl(0x{x}, 0x{x}, 0x{x})", .{ @intFromPtr(function), @intFromPtr(argument), @intFromPtr(dso) });
+/// A single join obligation. Copies alias that obligation; detach is unsupported.
+pub const Thread = struct {
+    index: usize,
+    native_handle: c_ulong,
 
-    const object = findDynObjectForLoadedAddr(@intFromPtr(dso)) orelse findDynObjectForLoadedAddr(@intFromPtr(function)) orelse {
-        logger.warn("intercepted call: failed: __cxa_thread_atexit_impl: defining object not found", .{});
-        return -1;
+    /// Requires a managed caller, including during controlled finalization.
+    /// Consumes the single join obligation shared by all copies. Invalid, stale,
+    /// duplicate, or self joins panic; fork children terminate with status 127.
+    pub fn join(self: Thread) void {
+        requireOwnerProcessOrExit();
+        if (joinThread(self.native_handle, self.index, null) != 0) @panic("invalid managed join ownership");
+    }
+};
+
+/// Runs a void-returning Zig routine with executable and native library TLS.
+/// Requires a managed caller, active or retained loader, and ready native threading.
+/// Arguments are copied by value; pointed-to data remains borrowed by the worker. A failed
+/// startup returns an error only after reclaiming any failed child and resources.
+pub fn spawn(config: std.Thread.SpawnConfig, comptime function: anytype, args: anytype) !Thread {
+    const Context = struct {
+        arguments: @TypeOf(args),
+
+        fn run(raw: ?*anyopaque) callconv(.c) ?*anyopaque {
+            const context: *@This() = @ptrCast(@alignCast(raw.?));
+            const arguments = context.arguments;
+            state.allocator.destroy(context);
+
+            const result = @call(.auto, function, arguments);
+            if (@TypeOf(result) != void) @compileError("dyn_loader.spawn requires a void-returning routine");
+
+            return null;
+        }
     };
+
+    try requireManaged(.active_only);
+    const context = try state.allocator.create(Context);
+    errdefer state.allocator.destroy(context);
+    context.* = .{ .arguments = args };
+
+    return spawnManaged(config, &Context.run, context);
+}
+
+/// Native fork repairs libc's state, not the loader's or the host allocator's.
+/// Check kernel process identity before touching any inherited synchronization.
+fn isOwnerProcess() bool {
+    @disableInstrumentation();
+
+    return std.os.linux.syscall0(.getpid) == @as(usize, @intCast(ElfTlsRuntime.initial_pid));
+}
+
+fn requireOwnerProcess() error{ForkChildUnsupported}!void {
+    if (!isOwnerProcess()) return error.ForkChildUnsupported;
+}
+
+fn requireOwnerProcessOrExit() void {
+    @disableInstrumentation();
+
+    // Even @trap may invoke Zig's inherited signal handler and debug locks.
+    // This child cannot recover host state; terminate without running callbacks.
+    if (!isOwnerProcess()) std.os.linux.exit_group(127);
+}
+
+fn requireManaged(admission: Admission) !void {
+    try requireOwnerProcess();
+    if (resolver_active) return error.UnsupportedResolverOperation;
+    switch (lifecycle.load(.acquire)) {
+        .bootstrap, .initializing => return error.Uninitialized,
+        .deinitialized => return error.LoaderDeinitialized,
+        .finalizing => switch (admission) {
+            .active_only => return error.LoaderDeinitializing,
+            .allow_finalization => {},
+        },
+        .active, .retained => {},
+    }
+
+    const tid = std.os.linux.gettid();
+    const tp = libc.currentThreadPointer();
+    if (tid == ElfTlsRuntime.initial_tid and tp == state.main_thread_pointer) return;
 
     state.thread_mutex.lockUncancelable(state.io);
     defer state.thread_mutex.unlock(state.io);
 
-    state.thread_destructors.append(state.allocator, .{
-        .tp = libc.currentThreadPointer(),
-        .object_idx = object.dyn_object_index,
-        .function = function,
-        .argument = argument,
-    }) catch |err| {
-        logger.warn("intercepted call: failed: __cxa_thread_atexit_impl: {}", .{err});
+    hooks.emit(.managed_membership_locked) catch @panic("hook failed while managed membership locked");
+    for (state.thread_infos.values()) |entry| {
+        if (entry.tid == tid and entry.handle == tp and entry.authorized) return;
+    }
+
+    return error.UnregisteredThread;
+}
+
+const ThreadDestructor = struct {
+    tp: usize,
+    object_idx: usize,
+    function: *const fn (argument: ?*anyopaque) callconv(.c) void,
+    argument: ?*anyopaque,
+};
+
+const ObjectLifetime = struct {
+    object_idx: usize,
+    base: usize,
+    size: usize,
+    destructors: usize = 0,
+    active: bool = true,
+};
+
+/// Transaction owner publishes address ranges before callbacks can register TLS
+/// destructors. Worker-side accounting never touches the growable object registry.
+fn publishObjectLifetime(idx: usize) !void {
+    const object = &state.dyn_objects.values()[idx];
+
+    state.thread_mutex.lockUncancelable(state.io);
+    defer state.thread_mutex.unlock(state.io);
+
+    for (state.object_lifetimes.items) |entry| {
+        if (entry.object_idx == idx and entry.active) return;
+    }
+
+    try state.object_lifetimes.append(state.allocator, .{
+        .object_idx = idx,
+        .base = object.loaded_at.?,
+        .size = object.loaded_size,
+    });
+}
+
+fn cxaThreadAtExitSubstitute(function: *const fn (?*anyopaque) callconv(.c) void, argument: ?*anyopaque, dso: ?*anyopaque) callconv(.c) c_int {
+    requireManaged(.allow_finalization) catch return -1;
+
+    state.thread_mutex.lockUncancelable(state.io);
+    defer state.thread_mutex.unlock(state.io);
+
+    const owner = owner: {
+        for ([_]usize{ @intFromPtr(dso), @intFromPtr(function) }) |address| {
+            for (state.object_lifetimes.items) |*entry| {
+                if (entry.active and address >= entry.base and address - entry.base < entry.size) break :owner entry;
+            }
+        }
+
         return -1;
     };
-    state.dyn_objects.values()[object.dyn_object_index].tls_destructors += 1;
 
-    logger.debug("intercepted call: success: __cxa_thread_atexit_impl(0x{x}, 0x{x}, 0x{x}) = 0", .{ @intFromPtr(function), @intFromPtr(argument), @intFromPtr(dso) });
+    state.thread_destructors.append(state.allocator, .{
+        .tp = libc.currentThreadPointer(),
+        .object_idx = owner.object_idx,
+        .function = function,
+        .argument = argument,
+    }) catch return -1;
+
+    owner.destructors += 1;
+
     return 0;
 }
 
-/// Runs this thread's destructors in reverse registration order.
+/// Runs this thread's registered C++ TLS destructors in reverse registration order.
 /// Unlocks for reentrant callbacks, retaining each owner until its callback returns.
 fn runThreadDestructors(tp: usize) void {
     while (true) {
@@ -5068,12 +5455,24 @@ fn runThreadDestructors(tp: usize) void {
             state.thread_mutex.unlock(state.io);
             return;
         };
+
         state.thread_mutex.unlock(state.io);
 
         logger.debug("tls.destructor: tp_host=0x{x} object_index={d} function_host=0x{x} action=call", .{ tp, entry.object_idx, @intFromPtr(entry.function) });
         entry.function(entry.argument);
         logger.debug("tls.destructor: tp_host=0x{x} object_index={d} function_host=0x{x} action=returned", .{ tp, entry.object_idx, @intFromPtr(entry.function) });
-        state.dyn_objects.values()[entry.object_idx].tls_destructors -= 1;
+
+        state.thread_mutex.lockUncancelable(state.io);
+
+        for (state.object_lifetimes.items) |*owner| {
+            if (owner.object_idx == entry.object_idx and owner.active) {
+                owner.destructors -= 1;
+                state.retirement_pending = true;
+                break;
+            }
+        }
+
+        state.thread_mutex.unlock(state.io);
     }
 }
 
@@ -5081,7 +5480,28 @@ fn runThreadDestructors(tp: usize) void {
 fn threadRoutine(ctx: ThreadRoutineContext) void {
     const new_tp = libc.currentThreadPointer();
 
-    logger.debug("worker.start: worker={d} tp_host=0x{x}", .{ ctx.idx, new_tp });
+    state.thread_mutex.lockUncancelable(state.io);
+
+    const participant = state.thread_infos.getPtr(ctx.idx).?;
+    const library_size = ElfTlsRuntime.area_desc.block.offset;
+    const allocation: [*]u8 = @ptrFromInt(new_tp - ElfTlsRuntime.area_desc.abi_tcb.offset);
+    @memcpy(allocation[0..library_size], state.tls_template[0..library_size]);
+
+    participant.handle = new_tp;
+    participant.tid = std.os.linux.gettid();
+    participant.tls_participant = true;
+
+    state.thread_mutex.unlock(state.io);
+
+    hooks.emit(.child_preflight) catch |err| {
+        state.thread_mutex.lockUncancelable(state.io);
+        state.thread_infos.getPtr(ctx.idx).?.tls_participant = false;
+        state.thread_mutex.unlock(state.io);
+
+        ctx.startup.failure = err;
+        ctx.startup.publish(new_tp);
+        return;
+    };
 
     ctx.libc_worker.register(new_tp) catch |err| {
         logger.err("worker.start: worker={d} tp_host=0x{x} error={t}", .{ ctx.idx, new_tp, err });
@@ -5091,152 +5511,330 @@ fn threadRoutine(ctx: ThreadRoutineContext) void {
     state.thread_mutex.lockUncancelable(state.io);
 
     const entry = state.thread_infos.getPtr(ctx.idx).?;
-    std.debug.assert(entry.handle == new_tp);
-    std.debug.assert(entry.thread == ctx.thread);
+    if (entry.handle != new_tp or entry.thread != ctx.thread or entry.authorized) {
+        @panic("invalid worker startup transition");
+    }
+    entry.authorized = true;
 
     state.thread_mutex.unlock(state.io);
 
+    ctx.startup.publish(new_tp);
     ctx.libc_worker.enterUserCode();
 
     logger.debug("worker.user: worker={d} tp_host=0x{x} function_host=0x{x} action=call", .{ ctx.idx, new_tp, @intFromPtr(ctx.function) });
     const ret = ctx.function(ctx.argument);
+
+    // Returning in a fork child must not enter inherited worker cleanup locks.
+    requireOwnerProcessOrExit();
     logger.debug("worker.user: worker={d} tp_host=0x{x} action=returned result=0x{x}", .{ ctx.idx, new_tp, @intFromPtr(ret) });
     runThreadDestructors(new_tp);
 
     ctx.libc_worker.unregister(new_tp);
 
     state.thread_mutex.lockUncancelable(state.io);
+
     const entry_after = state.thread_infos.getPtr(ctx.idx).?;
+    if (!entry_after.authorized or !entry_after.tls_participant) @panic("duplicate worker exit");
+
+    entry_after.authorized = false;
+    entry_after.tls_participant = false;
     entry_after.result = ret;
+
     state.thread_mutex.unlock(state.io);
 
     logger.debug("worker.exit: worker={d} tp_host=0x{x} action=result_published result=0x{x}", .{ ctx.idx, new_tp, @intFromPtr(ret) });
 }
 
-fn pthreadCreateSubstitute(newthread: *c_ulong, attr: ?*const anyopaque, start_routine: *const fn (?*anyopaque) callconv(.c) *anyopaque, arg: ?*anyopaque) callconv(.c) c_int {
+const TeardownWorkerState = enum { sleeping, stopped, exited, running, unknown };
+
+fn parseWorkerState(stat: []const u8) TeardownWorkerState {
+    // comm can itself contain spaces and parentheses; state follows the last ')'.
+    const end = std.mem.lastIndexOfScalar(u8, stat, ')') orelse return .unknown;
+    if (stat.len <= end + 3 or stat[end + 1] != ' ' or stat[end + 3] != ' ') return .unknown;
+
+    return switch (stat[end + 2]) {
+        'S', 'D', 'I' => .sleeping,
+        'T', 't' => .stopped,
+        'Z', 'X', 'x' => .exited,
+        'R' => .running,
+        else => .unknown,
+    };
+}
+
+fn observeWorkerState(tid: std.os.linux.pid_t) TeardownWorkerState {
+    const linux = std.os.linux;
+    var path_buffer: [64]u8 = undefined;
+    const path = std.fmt.bufPrint(&path_buffer, "/proc/self/task/{d}/stat\x00", .{tid}) catch return .unknown;
+
+    const opened = linux.openat(linux.AT.FDCWD, @ptrCast(path.ptr), .{ .CLOEXEC = true }, 0);
+    switch (linux.errno(opened)) {
+        .SUCCESS => {},
+        .NOENT => return .exited,
+        else => return .unknown,
+    }
+
+    const fd: linux.fd_t = @intCast(opened);
+    defer _ = linux.close(fd);
+
+    var buffer: [4096]u8 = undefined;
+    while (true) {
+        const count = linux.read(fd, &buffer, buffer.len);
+        switch (linux.errno(count)) {
+            .SUCCESS => return parseWorkerState(buffer[0..count]),
+            .INTR => continue,
+            else => return .unknown,
+        }
+    }
+}
+
+fn reapCompletedWorkers() void {
+    var index: usize = 0;
+    while (true) {
+        state.thread_mutex.lockUncancelable(state.io);
+        if (index == state.thread_infos.count()) {
+            state.thread_mutex.unlock(state.io);
+            return;
+        }
+        const worker = state.thread_infos.values()[index];
+        state.thread_mutex.unlock(state.io);
+
+        if (worker.entry_object == null and !worker.authorized and !worker.joining) {
+            if (joinThread(worker.handle, worker.idx, null) != 0) @panic("unable to reap completed worker during teardown");
+        } else index += 1;
+    }
+}
+
+fn inspectTeardownWorkers() void {
+    const index: usize = 0;
+    while (true) {
+        state.thread_mutex.lockUncancelable(state.io);
+        if (index == state.thread_infos.count()) {
+            state.thread_mutex.unlock(state.io);
+            return;
+        }
+        const worker = state.thread_infos.values()[index];
+        state.thread_mutex.unlock(state.io);
+
+        const observed = if (!worker.authorized) TeardownWorkerState.exited else observeWorkerState(worker.tid);
+        switch (observed) {
+            .exited => {
+                if (joinThread(worker.handle, worker.idx, null) != 0) @panic("unable to reap completed worker during teardown");
+                // Joining swap-removes the entry; inspect its replacement next.
+            },
+            .sleeping, .stopped, .running, .unknown => {
+                logger.err("loader.deinit: worker={d} tid={d} observed={t}", .{ worker.idx, worker.tid, observed });
+                @panic("library finalizers left a live or uninspectable worker");
+            },
+        }
+    }
+}
+
+fn pthreadAttributeFunction(comptime T: type, name: []const u8) !T {
+    const symbol = try resolveLibcRuntimeSymbol(name);
+    state.dyn_objects.values()[symbol.dyn_object_idx].runtime_pinned = true;
+
+    return @ptrFromInt(try getRuntimeSymbolAddress(symbol));
+}
+
+fn pthreadSpawnConfig(attr: *const anyopaque) !std.Thread.SpawnConfig {
+    state.transaction_lock.lock(state.io);
+    defer state.transaction_lock.unlock(state.io);
+
+    const GetInt = *const fn (*const anyopaque, *c_int) callconv(.c) c_int;
+    const get_detach = try pthreadAttributeFunction(GetInt, "pthread_attr_getdetachstate");
+    const get_inherit = try pthreadAttributeFunction(GetInt, "pthread_attr_getinheritsched");
+    const get_scope = try pthreadAttributeFunction(GetInt, "pthread_attr_getscope");
+    var detach: c_int = undefined;
+    var inherit: c_int = undefined;
+    var scope: c_int = undefined;
+
+    if (get_detach(attr, &detach) != 0 or get_inherit(attr, &inherit) != 0 or get_scope(attr, &scope) != 0) return error.UnsupportedThreadAttributes;
+    // Linux glibc and musl use zero for JOINABLE, INHERIT_SCHED, and SCOPE_SYSTEM.
+    if (detach != 0 or inherit != 0 or scope != 0) return error.UnsupportedThreadAttributes;
+
+    const get_stack = try pthreadAttributeFunction(*const fn (*const anyopaque, *?*anyopaque, *usize) callconv(.c) c_int, "pthread_attr_getstack");
+    const get_guard = try pthreadAttributeFunction(*const fn (*const anyopaque, *usize) callconv(.c) c_int, "pthread_attr_getguardsize");
+
+    var stack: ?*anyopaque = null;
+    var stack_size: usize = undefined;
+    var guard_size: usize = undefined;
+    const stack_result = get_stack(attr, &stack, &stack_size);
+
+    if (stack_result == @backingInt(std.os.linux.E.INVAL)) {
+        // musl reports EINVAL when no caller-owned stack was supplied.
+        const get_size = try pthreadAttributeFunction(*const fn (*const anyopaque, *usize) callconv(.c) c_int, "pthread_attr_getstacksize");
+        if (get_size(attr, &stack_size) != 0) return error.UnsupportedThreadAttributes;
+    } else if (stack_result != 0) return error.UnsupportedThreadAttributes;
+
+    if (get_guard(attr, &guard_size) != 0) return error.UnsupportedThreadAttributes;
+
+    // Zig owns the stack allocation and always provides a one-page guard.
+    // glibc reports -stack_size when only a size, not an address, was set.
+    const stack_end = @intFromPtr(stack) +% stack_size;
+    if ((stack != null and stack_end != 0) or guard_size != std.heap.pageSize()) return error.UnsupportedThreadAttributes;
+
+    const GetAffinity = *const fn (*const anyopaque, usize, [*]u8) callconv(.c) c_int;
+    const get_affinity = pthreadAttributeFunction(GetAffinity, "pthread_attr_getaffinity_np") catch |err| switch (err) {
+        error.UnresolvedSymbol => null,
+        else => return err,
+    };
+
+    if (get_affinity) |get| {
+        var mask: [128]u8 align(@alignOf(usize)) = undefined;
+        if (get(attr, mask.len, &mask) != 0) return error.UnsupportedThreadAttributes;
+        // The default native attribute has no CPU restriction.
+        for (mask) |byte| if (byte != 0xff) return error.UnsupportedThreadAttributes;
+    }
+
+    const GetSignalMask = *const fn (*const anyopaque, *anyopaque) callconv(.c) c_int;
+    const get_signal_mask = pthreadAttributeFunction(GetSignalMask, "pthread_attr_getsigmask_np") catch |err| switch (err) {
+        error.UnresolvedSymbol => null,
+        else => return err,
+    };
+
+    if (get_signal_mask) |get| {
+        var mask: [128]u8 align(@alignOf(usize)) = undefined;
+        // glibc's PTHREAD_ATTR_NO_SIGMASK_NP means inherit the creator's mask.
+        if (get(attr, &mask) != -1) return error.UnsupportedThreadAttributes;
+    }
+
+    return .{ .stack_size = if (stack_size == 0) std.Thread.SpawnConfig.default_stack_size else stack_size };
+}
+
+fn pthreadCreateSubstitute(newthread: *c_ulong, attr: ?*const anyopaque, start_routine: *const fn (?*anyopaque) callconv(.c) ?*anyopaque, arg: ?*anyopaque) callconv(.c) c_int {
+    requireManaged(.active_only) catch return @backingInt(std.os.linux.E.PERM);
+
     const errno_location = state.libc_runtime.?.getErrnoLocation();
     const entry_errno = errno_location.*;
     defer errno_location.* = entry_errno;
-    logger.debug("intercepted call: pthread_create(0x{x}, 0x{x}, 0x{x}, 0x{x})", .{ @intFromPtr(newthread), @intFromPtr(attr), @intFromPtr(start_routine), @intFromPtr(arg) });
 
-    const specifics = &state.libc_runtime.?;
-    if (!specifics.supportsWorkers()) {
-        logger.warn("worker.create: result=ENOSYS reason=native_thread_support_not_loaded", .{});
-        return @backingInt(std.os.linux.E.NOSYS);
-    }
+    const config = if (attr) |attributes|
+        pthreadSpawnConfig(attributes) catch return @backingInt(std.os.linux.E.OPNOTSUPP)
+    else
+        std.Thread.SpawnConfig{};
 
-    // Mirror Zig's default stack/TLS placement to expose TP as native pthread_t.
-    // This depends on the current Zig thread implementation, not a libc ABI.
-    const page_size = std.heap.pageSize();
-    const default_stack_size = std.Thread.SpawnConfig.default_stack_size;
-
-    var bytes: usize = page_size;
-    bytes += @max(page_size, default_stack_size);
-    bytes = std.mem.alignForward(usize, bytes, page_size);
-    bytes = std.mem.alignForward(usize, bytes, ElfTlsRuntime.area_desc.alignment);
-    const tls_offset = bytes + ElfTlsRuntime.area_desc.abi_tcb.offset;
-
-    var libc_worker = libc.Runtime.Worker.init(specifics);
-    defer libc_worker.restoreCreatorSignals();
-
-    state.thread_mutex.lockUncancelable(state.io);
-    var registry_locked = true;
-    defer if (registry_locked) state.thread_mutex.unlock(state.io);
-
-    // Reserve everything before spawning.
-    state.thread_infos.ensureUnusedCapacity(state.allocator, 1) catch {
-        logger.warn("intercepted call: failed: pthread_create: EAGAIN (thread registry allocation)", .{});
-        return @backingInt(std.os.linux.E.AGAIN);
-    };
-    state.extra_threads.ensureUnusedCapacity(state.allocator, 1) catch {
-        logger.warn("intercepted call: failed: pthread_create: EAGAIN (thread list allocation)", .{});
-        return @backingInt(std.os.linux.E.AGAIN);
-    };
-    const thread = state.allocator.create(std.Thread) catch {
-        logger.warn("intercepted call: failed: pthread_create: EAGAIN (thread allocation)", .{});
-        return @backingInt(std.os.linux.E.AGAIN);
-    };
-
-    libc_worker.prepare() catch |err| {
-        logger.warn("worker.create: phase=prepare result=EAGAIN error={t}", .{err});
-        state.allocator.destroy(thread);
-        return @backingInt(std.os.linux.E.AGAIN);
-    };
-
-    const idx = @atomicRmw(usize, &state.thread_current_idx, .Add, 1, .seq_cst);
-    logger.debug("worker.create: worker={d} parent_tp_host=0x{x} action=spawn", .{ idx, libc_worker.parent_tp });
-
-    libc_worker.beginSpawn();
-    const context: ThreadRoutineContext = .{
-        .idx = idx,
-        .thread = thread,
-        .function = start_routine,
-        .argument = arg,
-        .libc_worker = libc_worker,
-    };
-
-    thread.* = std.Thread.spawn(.{}, threadRoutine, .{context}) catch |err| {
-        libc_worker.spawnFailed();
-        state.allocator.destroy(thread);
-
-        logger.warn("intercepted call: failed: pthread_create(0x{x}, 0x{x}, 0x{x}, 0x{x}): EAGAIN ({})", .{ @intFromPtr(newthread), @intFromPtr(attr), @intFromPtr(start_routine), @intFromPtr(arg), err });
-
+    const thread = spawnManaged(config, start_routine, arg) catch |err| {
         return @backingInt(switch (err) {
-            error.OutOfMemory, error.SystemResources, error.ThreadQuotaExceeded, error.LockedMemoryLimitExceeded => std.os.linux.E.AGAIN,
-            error.Unexpected => std.os.linux.E.AGAIN,
+            error.NativeThreadingUnavailable => std.os.linux.E.NOSYS,
+            error.LoaderDeinitializing, error.UnregisteredThread => std.os.linux.E.PERM,
+            else => std.os.linux.E.AGAIN,
         });
     };
-    libc_worker.endSpawn();
 
-    const newthread_handle: *c_ulong = @ptrCast(@alignCast(newthread));
-    newthread_handle.* = @intFromPtr(thread.impl.thread.mapped.ptr) + tls_offset;
-
-    state.extra_threads.appendAssumeCapacity(thread);
-    state.thread_infos.putAssumeCapacity(idx, .{
-        .idx = idx,
-        .handle = newthread_handle.*,
-        .thread = thread,
-        .result = undefined,
-        .libc_worker = libc_worker,
-    });
-
-    // The worker needs `thread_mutex` to finish startup. Release it before waiting;
-    // the creator reference keeps startup storage alive even if a join races us.
-    state.thread_mutex.unlock(state.io);
-    registry_locked = false;
-
-    libc_worker.finishStartup();
-
-    logger.debug("intercepted call: success: pthread_create(0x{x}, 0x{x}, 0x{x}, 0x{x}) = 0", .{ @intFromPtr(newthread), @intFromPtr(attr), @intFromPtr(start_routine), @intFromPtr(arg) });
+    newthread.* = thread.native_handle;
 
     return 0;
 }
 
-fn pthreadExitSubstitute() callconv(.c) void {
+fn spawnManaged(config: std.Thread.SpawnConfig, function: *const fn (argument: ?*anyopaque) callconv(.c) ?*anyopaque, argument: ?*anyopaque) !Thread {
+    try requireManaged(.active_only);
+
+    const runtime = if (state.libc_runtime) |*runtime| runtime else return error.NativeThreadingUnavailable;
+    if (runtime.readiness.load(.acquire) != .ready) return error.NativeThreadingUnavailable;
+
+    const entry_object = blk: {
+        state.transaction_lock.lock(state.io);
+        defer state.transaction_lock.unlock(state.io);
+        const owner = findDynObjectForLoadedAddr(@intFromPtr(function)) orelse break :blk null;
+        break :blk @as(?usize, owner.dyn_object_index);
+    };
+
+    const thread = try state.allocator.create(std.Thread);
+    errdefer state.allocator.destroy(thread);
+
+    var worker = libc.Runtime.Worker.init(runtime);
+    defer worker.restoreCreatorSignals();
+
+    try worker.prepare();
+    errdefer worker.spawnFailed();
+
+    try hooks.emit(.worker_preflight);
+
+    var startup: WorkerStartup = .{};
+    state.thread_mutex.lockUncancelable(state.io);
+    var locked = true;
+    defer if (locked) state.thread_mutex.unlock(state.io);
+
+    try state.thread_infos.ensureUnusedCapacity(state.allocator, 1);
+    try state.extra_threads.ensureUnusedCapacity(state.allocator, 1);
+    const idx = state.thread_current_idx;
+    state.thread_current_idx = try std.math.add(usize, idx, 1);
+
+    worker.beginSpawn();
+
+    thread.* = try std.Thread.spawn(config, threadRoutine, .{ThreadRoutineContext{
+        .idx = idx,
+        .thread = thread,
+        .function = function,
+        .argument = argument,
+        .libc_worker = worker,
+        .startup = &startup,
+    }});
+
+    worker.endSpawn();
+
+    state.extra_threads.appendAssumeCapacity(thread);
+    state.thread_infos.putAssumeCapacity(idx, .{
+        .entry_object = entry_object,
+        .idx = idx,
+        .handle = 0,
+        .thread = thread,
+        .result = undefined,
+        .libc_worker = worker,
+    });
+    state.thread_mutex.unlock(state.io);
+    locked = false;
+
+    startup.wait();
+    if (startup.failure) |err| {
+        // Result publication is not kernel completion. Join before returning
+        // creator ownership to the error guards or destroying native resources.
+        thread.join();
+
+        state.thread_mutex.lockUncancelable(state.io);
+
+        _ = state.thread_infos.swapRemove(idx);
+        const position = std.mem.findScalar(*std.Thread, state.extra_threads.items, thread).?;
+        _ = state.extra_threads.swapRemove(position);
+        state.thread_mutex.unlock(state.io);
+
+        return err;
+    }
+
+    worker.finishStartup();
+
+    return .{ .index = idx, .native_handle = startup.tp };
+}
+
+fn pthreadExitSubstitute(_: ?*anyopaque) callconv(.c) noreturn {
+    requireOwnerProcessOrExit();
+
     logger.debug("intercepted call: pthread_exit()", .{});
-    // TODO implement the native signature and worker-exit cleanup/result handoff.
+    // Zig's entry trampoline owns exit; native pthread_exit cannot bypass it.
     logger.err("intercepted call: failed: pthread_exit(): unimplemented", .{});
+
     @panic("unimplemented pthread_exit");
 }
 
-fn pthreadCancelSubstitute() callconv(.c) void {
-    logger.debug("intercepted call: pthread_cancel()", .{});
-    // TODO implement the native signature, cancellation state, and cancellation-point cleanup.
-    logger.err("intercepted call: failed: pthread_cancel(): unimplemented", .{});
-    @panic("unimplemented pthread_cancel");
+fn pthreadCancelSubstitute(_: c_ulong) callconv(.c) c_int {
+    return @backingInt(std.os.linux.E.NOSYS);
 }
 
-fn pthreadDetachSubstitute() callconv(.c) void {
-    logger.debug("intercepted call: pthread_detach()", .{});
-    // TODO implement the native signature and detached-worker resource reclamation.
-    logger.err("intercepted call: failed: pthread_detach(): unimplemented", .{});
-    @panic("unimplemented pthread_detach");
+fn pthreadDetachSubstitute(_: c_ulong) callconv(.c) c_int {
+    return @backingInt(std.os.linux.E.NOSYS);
 }
 
-fn pthreadJoinSubstitute(thread_handle: c_ulong, retval: ?**anyopaque) callconv(.c) c_int {
+fn pthreadJoinSubstitute(thread_handle: c_ulong, retval: ?*?*anyopaque) callconv(.c) c_int {
+    return joinThread(thread_handle, null, retval);
+}
+
+fn joinThread(thread_handle: c_ulong, expected_index: ?usize, retval: ?*?*anyopaque) c_int {
+    requireManaged(.allow_finalization) catch return @backingInt(std.os.linux.E.PERM);
+
     const errno_location = state.libc_runtime.?.getErrnoLocation();
     const entry_errno = errno_location.*;
     defer errno_location.* = entry_errno;
+
     logger.debug("intercepted call: pthread_join(0x{x}, 0x{x})", .{ thread_handle, @intFromPtr(retval) });
 
     if (thread_handle == libc.currentThreadPointer()) {
@@ -5248,6 +5846,9 @@ fn pthreadJoinSubstitute(thread_handle: c_ulong, retval: ?**anyopaque) callconv(
 
     for (state.thread_infos.values()) |*entry| {
         if (entry.handle != thread_handle or entry.joining) continue;
+        if (expected_index) |index| {
+            if (entry.idx != index) continue;
+        }
 
         const thread = entry.thread;
         const idx = entry.idx;
@@ -5277,8 +5878,6 @@ fn pthreadJoinSubstitute(thread_handle: c_ulong, retval: ?**anyopaque) callconv(
         state.allocator.destroy(thread);
         libc_worker.releaseAfterJoin();
 
-        unloadUnreferencedObjects() catch |err| logger.warn("pthread_join: deferred unload failed: {}", .{err});
-
         logger.debug("intercepted call: success: pthread_join(0x{x}, 0x{x})", .{ thread_handle, @intFromPtr(retval) });
 
         return 0;
@@ -5287,14 +5886,36 @@ fn pthreadJoinSubstitute(thread_handle: c_ulong, retval: ?**anyopaque) callconv(
     state.thread_mutex.unlock(state.io);
 
     logger.warn("intercepted call: failed: pthread_join(0x{x}, 0x{x}): ESRCH (thread not found)", .{ thread_handle, @intFromPtr(retval) });
+
     return @backingInt(std.os.linux.E.SRCH);
 }
 
-fn pthreadKillSubstitute() callconv(.c) void {
-    logger.debug("intercepted call: pthread_kill()", .{});
-    // TODO implement the native signature, thread-handle validation, and signal/error semantics.
-    logger.err("intercepted call: failed: pthread_kill(): unimplemented", .{});
-    @panic("unimplemented pthread_kill");
+fn pthreadKillSubstitute(_: c_ulong, _: c_int) callconv(.c) c_int {
+    return @backingInt(std.os.linux.E.NOSYS);
+}
+
+fn unsupportedProcessOperation() callconv(.c) c_int {
+    requireManaged(.allow_finalization) catch return -1;
+
+    state.libc_runtime.?.getErrnoLocation().* = @backingInt(std.os.linux.E.NOSYS);
+
+    return -1;
+}
+
+fn unsupportedCredentialChange(_: c_uint) callconv(.c) c_int {
+    return unsupportedProcessOperation();
+}
+
+fn unsupportedCredentialPair(_: c_uint, _: c_uint) callconv(.c) c_int {
+    return unsupportedProcessOperation();
+}
+
+fn unsupportedCredentialTriple(_: c_uint, _: c_uint, _: c_uint) callconv(.c) c_int {
+    return unsupportedProcessOperation();
+}
+
+fn unsupportedGroupChange(_: usize, _: ?[*]const c_uint) callconv(.c) c_int {
+    return unsupportedProcessOperation();
 }
 
 // Timer and queue notifications.
@@ -5322,6 +5943,7 @@ fn TimerCreateSubstitute(comptime binding_index: usize) type {
             } else {
                 logger.warn("intercepted call: failed: timer_create({d}, 0x{x}, 0x{x}) = {d}, errno={d}", .{ clock, @intFromPtr(event), @intFromPtr(timer_id), result, result_errno });
             }
+
             return result;
         }
     };
@@ -5342,6 +5964,7 @@ fn mqNotifySubstitute(queue: c_int, event: ?*const NotificationEvent) callconv(.
     } else {
         logger.warn("intercepted call: failed: mq_notify({d}, 0x{x}) = {d}, errno={d}", .{ queue, @intFromPtr(event), result, result_errno });
     }
+
     return result;
 }
 
@@ -5534,6 +6157,9 @@ export fn _dl_debug_state() callconv(.c) void {
     logger.debug("_dl_debug_state called", .{});
 }
 
+// Tests
+// -----
+
 const ReallocationTestAllocator = struct {
     const Self = @This();
     const Mode = enum { in_place, move, reject };
@@ -5616,6 +6242,72 @@ test {
     _ = @import("CodeView.zig");
     _ = @import("InstructionFlow.zig");
     _ = @import("libc.zig");
+}
+
+test "worker stat classification handles comm delimiters and unknown states" {
+    try std.testing.expectEqual(TeardownWorkerState.sleeping, parseWorkerState("123 (pool ) name) S 1 2"));
+    try std.testing.expectEqual(TeardownWorkerState.sleeping, parseWorkerState("123 (worker) D 1"));
+    try std.testing.expectEqual(TeardownWorkerState.stopped, parseWorkerState("123 (worker) t 1"));
+    try std.testing.expectEqual(TeardownWorkerState.running, parseWorkerState("123 (worker) R 1"));
+    try std.testing.expectEqual(TeardownWorkerState.exited, parseWorkerState("123 (worker) Z 1"));
+    for ([_][]const u8{ "", "123 (worker)", "123 (worker) Q 1", "123 (worker) S" }) |stat| {
+        try std.testing.expectEqual(TeardownWorkerState.unknown, parseWorkerState(stat));
+    }
+    try std.testing.expectEqual(TeardownWorkerState.exited, observeWorkerState(std.math.maxInt(std.os.linux.pid_t)));
+}
+
+test "shared symbol indices preserve order and rebuild without stale names" {
+    try exerciseSymbolIndex(std.testing.allocator);
+}
+
+test "shared symbol index allocation failures clean up" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, exerciseSymbolIndex, .{});
+}
+
+fn exerciseSymbolIndex(allocator: std.mem.Allocator) !void {
+    var index: DynSymList = .empty;
+    defer index.deinit(allocator);
+    var symbols: [96]DynSym = @splat(std.mem.zeroes(DynSym));
+    for (&symbols, 0..) |*symbol, i| {
+        symbol.name = if (i % 2 == 0) "versioned" else "other";
+    }
+    symbols[3].name = "removed";
+    try index.build(allocator, symbols[0..5]);
+    try std.testing.expectEqualSlices(usize, &.{ 0, 2, 4 }, index.get("versioned").?);
+    try std.testing.expectEqualSlices(usize, &.{1}, index.get("other").?);
+    try std.testing.expectEqualSlices(usize, &.{3}, index.get("removed").?);
+    try std.testing.expect(index.get("absent") == null);
+
+    symbols[3].name = "other";
+    index.build(allocator, &symbols) catch |err| {
+        try std.testing.expectEqual(@as(usize, 0), index.count());
+        try std.testing.expect(index.get("versioned") == null);
+        return err;
+    };
+    try std.testing.expect(index.get("removed") == null);
+    try std.testing.expectEqual(@as(usize, 48), index.get("versioned").?.len);
+    try std.testing.expectEqual(@as(usize, 48), index.get("other").?.len);
+    for (index.get("versioned").?, 0..) |value, i| try std.testing.expectEqual(i * 2, value);
+    for (index.get("other").?, 0..) |value, i| try std.testing.expectEqual(i * 2 + 1, value);
+    try index.build(allocator, &.{});
+    try std.testing.expectEqual(@as(usize, 0), index.count());
+    try std.testing.expect(index.get("other") == null);
+}
+
+test "published module identities stay distinct and invalid lookups fail" {
+    const first = try TlsLookup.reserve();
+    try std.testing.expect(TlsLookup.address(first.value, 0, 0x10000) == null);
+    TlsLookup.publish(first, 0x100, 16);
+
+    const second = try TlsLookup.reserve();
+    TlsLookup.publish(second, 0x200, 32);
+    try std.testing.expect(second.value > first.value);
+    try std.testing.expectEqual(@as(usize, 0xff07), @intFromPtr(TlsLookup.address(first.value, 7, 0x10000)));
+    try std.testing.expectEqual(@as(usize, 0xfe1f), @intFromPtr(TlsLookup.address(second.value, 31, 0x10000)));
+    try std.testing.expect(TlsLookup.address(first.value, 16, 0x10000) == null);
+    try std.testing.expect(TlsLookup.address(0, 0, 0x10000) == null);
+    try std.testing.expect(TlsLookup.address(TlsLookup.capacity, 0, 0x10000) == null);
+    try std.testing.expect(TlsLookup.address(std.math.maxInt(usize), 0, 0x10000) == null);
 }
 
 test "tracked realloc preserves payload and alignment across remap and fallback" {
@@ -5750,14 +6442,19 @@ test "dl symbol lookup respects versions, caller scopes, and handle validity" {
     logger.level = .err;
     defer logger.level = previous_log_level;
 
-    state = .{ .allocator = std.testing.allocator };
+    state = .{
+        .allocator = std.testing.allocator,
+        .io = std.testing.io,
+        .main_thread_pointer = libc.currentThreadPointer(),
+    };
+    const previous_lifecycle = lifecycle.swap(.active, .acq_rel);
+    defer lifecycle.store(previous_lifecycle, .release);
     defer {
         for (state.dyn_objects.values()) |*object| {
             object.segments.deinit(state.allocator);
             object.deps_breadth_first.deinit(state.allocator);
             object.binding_dependencies.deinit(state.allocator);
             object.syms_array.deinit(state.allocator);
-            for (object.syms.values()) |*indices| indices.deinit(state.allocator);
             object.syms.deinit(state.allocator);
         }
         state.dyn_objects.deinit(state.allocator);
@@ -5798,10 +6495,8 @@ test "dl symbol lookup respects versions, caller scopes, and handle validity" {
                 .value = 0x20 + symbol_index * 0x10,
                 .size = 1,
             });
-            const entry = try object.syms.getOrPut(state.allocator, "lookup-test");
-            if (!entry.found_existing) entry.value_ptr.* = .empty;
-            try entry.value_ptr.append(state.allocator, symbol_index);
         }
+        try object.syms.build(state.allocator, object.syms_array.items);
     }
 
     const root = &state.dyn_objects.values()[0];
@@ -5856,7 +6551,6 @@ test "binding retention follows resolution provenance and declared reachability"
             object.dependencies.deinit(state.allocator);
             object.deps_breadth_first.deinit(state.allocator);
             object.syms_array.deinit(state.allocator);
-            for (object.syms.values()) |*indices| indices.deinit(state.allocator);
             object.syms.deinit(state.allocator);
         }
         state.dyn_objects.deinit(state.allocator);
@@ -5925,9 +6619,7 @@ test "binding retention follows resolution provenance and declared reachability"
     try requester.syms_array.append(state.allocator, reference); // ELF symbol zero is reserved.
     try requester.syms_array.append(state.allocator, reference);
     try provider.syms_array.append(state.allocator, definition);
-    const indices = try provider.syms.getOrPut(state.allocator, definition.name);
-    indices.value_ptr.* = .empty;
-    try indices.value_ptr.append(state.allocator, 0);
+    try provider.syms.build(state.allocator, provider.syms_array.items);
 
     requester.binding_dependencies.clearRetainingCapacity();
     try std.testing.expectEqual(@as(usize, 0x2020), try (try resolveSymbol(requester, 1)).getStaticAddress());

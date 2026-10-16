@@ -153,8 +153,6 @@ pub fn runCase(init: std.process.Init, cases: []const Case, name: []const u8, re
     }
 
     try dyn_loader.init(.{
-        .allocator = init.gpa,
-        .io = init.io,
         .args = init.minimal.args,
         .environ = init.minimal.environ,
         .log_level = .none,

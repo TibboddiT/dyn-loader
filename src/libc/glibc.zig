@@ -41,6 +41,7 @@ const State = struct {
 const vtable: common.VTable = .{
     .destroyState = &destroyState,
     .initInitialThread = &initInitialThread,
+    .prepareThreads = &prepareThreads,
     .supportsWorkers = &supportsWorkers,
     .prepareObject = &prepareObject,
     .threadStorageSize = &threadStorageSize,
@@ -105,6 +106,7 @@ pub fn create(services: *const Services, allocator: std.mem.Allocator, object: *
         error.CodePatternMismatch => return error.UnrecognizedGlibcThreadLayout,
         else => return err,
     };
+    if (threads) |layout_info| try validateThreadStorage(layout_info, services.native_metadata_capacity);
 
     logger.debug("glibc.inspect: object={s} integrated_threads={} early_init={} ctype_init={} errno_function_host=0x{x}", .{ object.name, threads != null, early_init != null, ctype_init != null, try errno_symbol.getStaticAddress() });
     capability = "runtime_state";
@@ -154,6 +156,17 @@ fn supportsWorkers(runtime: *const common.Runtime) bool {
     return getState(runtime).threads != null;
 }
 
+fn prepareThreads(runtime: *common.Runtime) !void {
+    const threads = &getState(runtime).threads.?;
+    try initGlibcInitialThread(threads);
+
+    // Native list/descriptor setup above and these process flags are permanent.
+    // Worker counts belong to attempted creations, never to this transition.
+    const multiple_threads: *c_int = @ptrFromInt(currentThreadPointer() + 24);
+    multiple_threads.* = 1;
+    if (threads.single_threaded) |flag| @atomicStore(u8, flag, 0, .release);
+}
+
 /// Discovers thread support when an older glibc's libpthread is prepared.
 /// Pins that object because the retained list and lock addresses belong to it.
 fn prepareObject(runtime: *common.Runtime, object: *DynObject) !void {
@@ -161,11 +174,13 @@ fn prepareObject(runtime: *common.Runtime, object: *DynObject) !void {
     if (state.threads != null or !isThreadSupportName(object.name)) return;
 
     logger.debug("glibc.threads: object={s} mode=legacy action=inspect", .{object.name});
-    state.threads = detectLegacyGlibcThreadLayout(runtime.allocator, runtime.services, object) catch |err| switch (err) {
+    const layout = detectLegacyGlibcThreadLayout(runtime.allocator, runtime.services, object) catch |err| switch (err) {
         error.CodePatternMismatch => return error.UnrecognizedGlibcThreadLayout,
         else => return err,
     };
-    object.pinned = true;
+    try validateThreadStorage(layout, runtime.services.native_metadata_capacity);
+    state.threads = layout;
+    object.runtime_pinned = true;
     logger.debug("glibc.threads: object={s} mode=legacy action=validated pinned=true evidence={any}", .{ object.name, state.threads });
 }
 
@@ -196,15 +211,9 @@ fn initWorker(runtime: *common.Runtime) common.WorkerHandle {
     };
 }
 
-/// Runs in the creator under the loader registry lock, before Zig spawns.
+/// Atomically reserves one native thread count before Zig spawns.
 fn prepareWorker(worker: *common.WorkerHandle) !void {
     const threads = &getState(worker.runtime).threads.?;
-    // x86-64 `tcbhead_t.multiple_threads` disables per-thread single-thread fast
-    // paths. Detection checks `pthread_create`'s store to `fs:24`. The separate
-    // process flag serves newer glibc callers that do not read the TCB flag.
-    const multiple_threads: *c_int = @ptrFromInt(worker.parent_tp + 24);
-    multiple_threads.* = 1;
-    if (threads.single_threaded) |flag| @atomicStore(u8, flag, 0, .seq_cst);
     _ = @atomicRmw(u32, threads.nthreads, .Add, 1, .seq_cst);
 }
 
@@ -310,6 +319,16 @@ const GlibcForkLists = struct {
     cache: usize,
     ownership: GlibcThreadLayout.Ownership,
 };
+
+fn validateThreadStorage(layout: GlibcThreadLayout, capacity: usize) !void {
+    if (layout.list_offset > capacity - @sizeOf(GlibcThreadList)) return error.NativeMetadataCapacityExceeded;
+
+    const ownership_end = switch (layout.ownership) {
+        .byte_flag => |offset| try std.math.add(usize, offset, 1),
+        .word_mode => |mode| try std.math.add(usize, mode.offset, @sizeOf(u32)),
+    };
+    if (ownership_end > capacity) return error.NativeMetadataCapacityExceeded;
+}
 
 /// Reads one scalar debugger descriptor: bit size, element count, byte offset.
 /// Validates both its shape and its containing structure before using the offset.

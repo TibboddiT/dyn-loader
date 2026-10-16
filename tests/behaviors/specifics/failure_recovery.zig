@@ -5,10 +5,14 @@ const std = @import("std");
 
 const dyn_loader = @import("dyn_loader");
 const support = @import("behavior_support");
+const control = @import("../control.zig");
 
 const Allocator = std.mem.Allocator;
 const FailingAllocator = std.testing.FailingAllocator;
 const backing_alignment: std.mem.Alignment = .@"16";
+
+// Retained runtime state may keep this allocator after the case returns.
+var test_allocator: OffsetAllocator = .{ .failing = .init(std.heap.smp_allocator, .{}) };
 
 const DlInfo = extern struct {
     name: [*:0]const u8,
@@ -94,10 +98,10 @@ fn countObjects(_: *anyopaque, _: c_uint, data: ?*anyopaque) callconv(.c) c_int 
 }
 
 pub fn run(init: std.process.Init, fixtures: support.SpecificContext) !void {
-    var memory: OffsetAllocator = .{ .failing = .init(init.gpa, .{}) };
+    const memory = &test_allocator;
+    control.allocator = memory.allocator();
+    defer control.allocator = null;
     try dyn_loader.init(.{
-        .allocator = memory.allocator(),
-        .io = init.io,
         .args = init.minimal.args,
         .environ = init.minimal.environ,
         .log_level = .none,
@@ -225,6 +229,13 @@ pub fn run(init: std.process.Init, fixtures: support.SpecificContext) !void {
         }
     }
 
+    // Warm registry capacity independently of backend preparation's allocation
+    // count. The failure below isolates thread-mapping rollback, not retained
+    // registry growth during its first attempted creation.
+    var warm_handle: usize = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), bridge.startThread(&warm_handle, &threadCallback, pointer));
+    try std.testing.expectEqual(@as(c_int, 0), bridge.joinThread(warm_handle));
+
     // Force std.Thread.spawn's mapping to fail after bookkeeping is prepared.
     const previous_limit = try std.posix.getrlimit(.AS);
     const live_bytes = memory.failing.allocated_bytes - memory.failing.freed_bytes;
@@ -242,10 +253,10 @@ pub fn run(init: std.process.Init, fixtures: support.SpecificContext) !void {
 }
 
 pub fn runReallocarray(init: std.process.Init, fixtures: support.SpecificContext) !void {
-    var memory: OffsetAllocator = .{ .failing = .init(init.gpa, .{}) };
+    const memory = &test_allocator;
+    control.allocator = memory.allocator();
+    defer control.allocator = null;
     try dyn_loader.init(.{
-        .allocator = memory.allocator(),
-        .io = init.io,
         .args = init.minimal.args,
         .environ = init.minimal.environ,
         .log_level = .none,

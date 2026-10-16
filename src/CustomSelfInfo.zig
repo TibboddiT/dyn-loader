@@ -1,40 +1,91 @@
 // Based on lib/std/debug/SelfInfo/Elf.zig @ 79bb28aa57b3712116dc75288d60f2d29ba31cfb.
 // https://codeberg.org/ziglang/zig/commits/branch/master/lib/std/debug/SelfInfo/Elf.zig
 
+// DynLoader extensions.
+// ---------------------
+
+const ExtraState = struct {
+    names: std.StringHashMapUnmanaged(void) = .empty,
+    cached_revision: usize = 0,
+
+    /// Interned names remain valid until deinit.
+    fn internName(extra: *ExtraState, gpa: Allocator, name: []const u8) Allocator.Error![]const u8 {
+        if (extra.names.getKey(name)) |existing| return existing;
+        const owned = try gpa.dupe(u8, name);
+        errdefer gpa.free(owned);
+        try extra.names.putNoClobber(gpa, owned, {});
+        return owned;
+    }
+
+    fn deinit(extra: *ExtraState, gpa: Allocator) void {
+        var names = extra.names.keyIterator();
+        while (names.next()) |name| gpa.free(name.*);
+        extra.names.deinit(gpa);
+    }
+};
+
 var extra_phdr_infos: std.ArrayList(*std.posix.dl_phdr_info) = .empty;
 var extra_elf_revision: usize = 0;
+// Keeps published unwind data mapped while debug readers use it.
+var publication_lock: Io.RwLock = .init;
 
-pub fn addExtraElf(gpa: std.mem.Allocator, dl_phdr_info: *std.posix.dl_phdr_info) !void {
-    // TODO thread safety
-    try extra_phdr_infos.append(gpa, dl_phdr_info);
+// Publication writers require external serialization. Names and headers remain
+// borrowed until removeExtraElf or clearExtraElfs returns.
+
+/// Takes ownership of the info allocation on success.
+pub fn addExtraElf(gpa: std.mem.Allocator, io: Io, dl_phdr_info: *std.posix.dl_phdr_info) !void {
+    // Allocate outside the lock: a debugging allocator may unwind through here.
+    var replacement: @TypeOf(extra_phdr_infos) = .empty;
+    try replacement.ensureTotalCapacity(gpa, extra_phdr_infos.items.len + 1);
+    replacement.appendSliceAssumeCapacity(extra_phdr_infos.items);
+    replacement.appendAssumeCapacity(dl_phdr_info);
+
+    publication_lock.lockUncancelable(io);
+    var previous = extra_phdr_infos;
+    extra_phdr_infos = replacement;
     extra_elf_revision +%= 1;
+    publication_lock.unlock(io);
+
+    previous.deinit(gpa);
 }
 
-pub fn removeExtraElf(gpa: std.mem.Allocator, info: *std.posix.dl_phdr_info) void {
+pub fn removeExtraElf(gpa: std.mem.Allocator, io: Io, info: *std.posix.dl_phdr_info) void {
+    publication_lock.lockUncancelable(io);
+
     for (extra_phdr_infos.items, 0..) |entry, i| {
         if (entry != info) continue;
         _ = extra_phdr_infos.orderedRemove(i);
-        gpa.destroy(entry);
         extra_elf_revision +%= 1;
+        publication_lock.unlock(io);
+
+        gpa.destroy(entry);
         return;
     }
+    publication_lock.unlock(io);
 }
 
-pub fn clearExtraElfs(gpa: std.mem.Allocator) void {
-    // TODO thread safety
-    for (extra_phdr_infos.items) |e| {
+pub fn clearExtraElfs(gpa: std.mem.Allocator, io: Io) void {
+    publication_lock.lockUncancelable(io);
+    var previous = extra_phdr_infos;
+    extra_phdr_infos = .empty;
+    extra_elf_revision +%= 1;
+    publication_lock.unlock(io);
+
+    for (previous.items) |e| {
         gpa.destroy(e);
     }
-
-    extra_phdr_infos.clearAndFree(gpa);
-    extra_elf_revision +%= 1;
+    previous.deinit(gpa);
 }
+
+extra: ExtraState = .{},
+
+// Upstream implementation.
+// ------------------------
 
 rwlock: Io.RwLock,
 
 modules: std.ArrayList(Module),
 ranges: std.ArrayList(Module.Range),
-cached_extra_elf_revision: usize = 0,
 
 unwind_cache: if (can_unwind) ?[]Dwarf.SelfUnwinder.CacheEntry else ?noreturn,
 
@@ -44,6 +95,7 @@ pub const init: SelfInfo = .{
     .ranges = .empty,
     .unwind_cache = null,
 };
+/// Requires all readers to have finished.
 pub fn deinit(si: *SelfInfo, io: Io) void {
     _ = io;
     const gpa = std.debug.getDebugInfoAllocator();
@@ -60,6 +112,7 @@ pub fn deinit(si: *SelfInfo, io: Io) void {
 
     si.modules.deinit(gpa);
     si.ranges.deinit(gpa);
+    si.extra.deinit(gpa);
     if (si.unwind_cache) |cache| gpa.free(cache);
 }
 
@@ -72,6 +125,9 @@ pub fn getSymbols(
     resolve_inline_callers: bool,
     symbols: *std.ArrayList(std.debug.Symbol),
 ) Error!void {
+    publication_lock.lockSharedUncancelable(io);
+    defer publication_lock.unlockShared(io);
+
     const gpa = std.debug.getDebugInfoAllocator();
     const module = try si.findModule(gpa, io, address, .exclusive);
     defer si.rwlock.unlock(io);
@@ -133,7 +189,11 @@ pub fn getSymbols(
     // After searching the symtab, still report the DWARF error.
     if (dwarf_err) |e| return e;
 }
+/// Returned names remain valid until deinit.
 pub fn getModuleName(si: *SelfInfo, io: Io, address: usize) Error![]const u8 {
+    publication_lock.lockSharedUncancelable(io);
+    defer publication_lock.unlockShared(io);
+
     const gpa = std.debug.getDebugInfoAllocator();
     const module = try si.findModule(gpa, io, address, .shared);
     defer si.rwlock.unlockShared(io);
@@ -141,6 +201,9 @@ pub fn getModuleName(si: *SelfInfo, io: Io, address: usize) Error![]const u8 {
     return module.name;
 }
 pub fn getModuleSlide(si: *SelfInfo, io: Io, address: usize) Error!usize {
+    publication_lock.lockSharedUncancelable(io);
+    defer publication_lock.unlockShared(io);
+
     const gpa = std.debug.getDebugInfoAllocator();
     const module = try si.findModule(gpa, io, address, .shared);
     defer si.rwlock.unlockShared(io);
@@ -242,13 +305,16 @@ comptime {
 }
 pub const UnwindContext = Dwarf.SelfUnwinder;
 pub fn unwindFrame(si: *SelfInfo, io: Io, context: *UnwindContext) Error!usize {
+    publication_lock.lockSharedUncancelable(io);
+    defer publication_lock.unlockShared(io);
+
     comptime assert(can_unwind);
     const gpa = std.debug.getDebugInfoAllocator();
 
     {
         si.rwlock.lockSharedUncancelable(io);
         defer si.rwlock.unlockShared(io);
-        if (si.cached_extra_elf_revision == extra_elf_revision) if (si.unwind_cache) |cache| {
+        if (si.extra.cached_revision == extra_elf_revision) if (si.unwind_cache) |cache| {
             if (Dwarf.SelfUnwinder.CacheEntry.find(cache, context.pc)) |entry| {
                 return context.next(gpa, entry);
             }
@@ -299,10 +365,10 @@ const Module = struct {
     build_id: ?[]const u8,
     gnu_eh_frame: ?[]const u8,
 
-    /// `null` until unwind information is loaded.
+    /// `null` means unwind information has not yet been loaded.
     unwind: ?(Error!UnwindSections),
 
-    /// `null` until the ELF file is loaded.
+    /// `null` means the ELF file has not yet been loaded.
     loaded_elf: ?(Error!LoadedElf),
 
     const LoadedElf = struct {
@@ -318,11 +384,11 @@ const Module = struct {
     const Range = struct {
         start: usize,
         len: usize,
-        /// Index into `modules`.
+        /// Index into `modules`
         module_index: usize,
     };
 
-    /// Requires the exclusive lock.
+    /// Assumes we already hold an exclusive lock.
     fn getUnwindSections(mod: *Module, gpa: Allocator, io: Io) Error![]Dwarf.Unwind {
         if (mod.unwind == null) mod.unwind = loadUnwindSections(mod, gpa, io);
         const us = &(mod.unwind.? catch |err| return err);
@@ -336,7 +402,7 @@ const Module = struct {
         if (mod.gnu_eh_frame) |section_bytes| {
             const section_vaddr: u64 = @intFromPtr(section_bytes.ptr) - mod.load_offset;
             const header = Dwarf.Unwind.EhFrameHeader.parse(section_vaddr, section_bytes, @sizeOf(usize), native_endian) catch |err| switch (err) {
-                error.ReadFailed => unreachable, // Reads only fixed buffers.
+                error.ReadFailed => unreachable, // it's all fixed buffers
                 error.InvalidDebugInfo => |e| return e,
                 error.EndOfStream, error.Overflow => return error.InvalidDebugInfo,
                 error.UnsupportedAddrSize => return error.UnsupportedDebugInfo,
@@ -344,11 +410,11 @@ const Module = struct {
             us.buf[us.len] = .initEhFrameHdr(header, section_vaddr, @ptrFromInt(@as(usize, @intCast(mod.load_offset + header.eh_frame_vaddr))));
             us.len += 1;
         } else {
-            // Without `.eh_frame_hdr`, load the binary to find any `.eh_frame`
-            // or `.debug_frame` sections.
+            // There is no `.eh_frame_hdr` section. There may still be an `.eh_frame` or `.debug_frame`
+            // section, but we'll have to load the binary to get at it.
             const loaded = try mod.getLoadedElf(gpa, io);
-            // Unwind information may be split between both sections. Prefer
-            // `.debug_frame`, which is likely to be more complete.
+            // If both are present, we can't just pick one -- the info could be split between them.
+            // `.debug_frame` is likely to be the more complete section, so we'll prioritize that one.
             if (loaded.file.debug_frame) |*debug_frame| {
                 us.buf[us.len] = .initSection(.debug_frame, debug_frame.vaddr, debug_frame.bytes);
                 us.len += 1;
@@ -360,7 +426,7 @@ const Module = struct {
         }
         errdefer for (us.buf[0..us.len]) |*u| u.deinit(gpa);
         for (us.buf[0..us.len]) |*u| u.prepare(gpa, @sizeOf(usize), native_endian, true, false) catch |err| switch (err) {
-            error.ReadFailed => unreachable, // Reads only fixed buffers.
+            error.ReadFailed => unreachable, // it's all fixed buffers
             error.InvalidDebugInfo,
             error.MissingDebugInfo,
             error.OutOfMemory,
@@ -379,7 +445,7 @@ const Module = struct {
         return us;
     }
 
-    /// Requires the exclusive lock.
+    /// Assumes we already hold an exclusive lock.
     fn getLoadedElf(mod: *Module, gpa: Allocator, io: Io) Error!*LoadedElf {
         if (mod.loaded_elf == null) mod.loaded_elf = loadElf(mod, gpa, io);
         return if (mod.loaded_elf.?) |*elf| elf else |err| err;
@@ -438,17 +504,19 @@ const Module = struct {
 };
 
 fn findModule(si: *SelfInfo, gpa: Allocator, io: Io, address: usize, lock: enum { shared, exclusive }) Error!*Module {
+    // With the requested lock, scan the module ranges looking for `address`.
     switch (lock) {
         .shared => si.rwlock.lockSharedUncancelable(io),
         .exclusive => si.rwlock.lockUncancelable(io),
     }
-    if (si.cached_extra_elf_revision == extra_elf_revision) for (si.ranges.items) |*range| {
+    if (si.extra.cached_revision == extra_elf_revision) for (si.ranges.items) |*range| {
         if (address >= range.start and address < range.start + range.len) {
             return &si.modules.items[range.module_index];
         }
     };
 
-    // A newly loaded module may contain the address.
+    // The address wasn't in a known range or publication changed. Rebuild the
+    // module/range lists, upgrading to an exclusive lock if necessary.
     switch (lock) {
         .shared => {
             si.rwlock.unlockShared(io);
@@ -456,6 +524,7 @@ fn findModule(si: *SelfInfo, gpa: Allocator, io: Io, address: usize, lock: enum 
         },
         .exclusive => {},
     }
+    // Rebuild module list with the exclusive lock.
     {
         errdefer si.rwlock.unlock(io);
         if (si.unwind_cache) |cache| {
@@ -479,9 +548,9 @@ fn findModule(si: *SelfInfo, gpa: Allocator, io: Io, address: usize, lock: enum 
         for (extra_phdr_infos.items) |info| {
             try DlIterContext.callback(info, @sizeOf(std.posix.dl_phdr_info), &ctx);
         }
-        si.cached_extra_elf_revision = extra_elf_revision;
+        si.extra.cached_revision = extra_elf_revision;
     }
-
+    // Downgrade the lock back to shared if necessary.
     switch (lock) {
         .shared => {
             si.rwlock.unlock(io);
@@ -489,12 +558,13 @@ fn findModule(si: *SelfInfo, gpa: Allocator, io: Io, address: usize, lock: enum 
         },
         .exclusive => {},
     }
+    // Scan the newly rebuilt module ranges.
     for (si.ranges.items) |*range| {
         if (address >= range.start and address < range.start + range.len) {
             return &si.modules.items[range.module_index];
         }
     }
-
+    // Still nothing; unlock and error.
     switch (lock) {
         .shared => si.rwlock.unlockShared(io),
         .exclusive => si.rwlock.unlock(io),
@@ -511,9 +581,11 @@ const DlIterContext = struct {
         var build_id: ?[]const u8 = null;
         var gnu_eh_frame: ?[]const u8 = null;
 
+        // Populate `build_id` and `gnu_eh_frame`
         for (info.phdr[0..info.phnum]) |phdr| {
             switch (phdr.type) {
                 .NOTE => {
+                    // Look for .note.gnu.build-id
                     const segment_ptr: [*]const u8 = @ptrFromInt(info.addr + phdr.vaddr);
                     var r: std.Io.Reader = .fixed(segment_ptr[0..phdr.memsz]);
                     const name_size = r.takeInt(u32, native_endian) catch continue;
@@ -539,8 +611,8 @@ const DlIterContext = struct {
         const module_index = si.modules.items.len;
         try si.modules.append(gpa, .{
             .load_offset = info.addr,
-            // Android libc uses NULL instead of "" to mark the main program.
-            .name = std.mem.sliceTo(info.name, 0) orelse "",
+            // Android libc uses NULL instead of "" to mark the main program
+            .name = try si.extra.internName(gpa, std.mem.sliceTo(info.name, 0) orelse ""),
             .build_id = build_id,
             .gnu_eh_frame = gnu_eh_frame,
             .unwind = null,
@@ -550,7 +622,7 @@ const DlIterContext = struct {
         for (info.phdr[0..info.phnum]) |phdr| {
             if (phdr.type != .LOAD) continue;
             try context.si.ranges.append(gpa, .{
-                // Wrapping addition handles VDSOs with vaddr = 0xffffffffff700000.
+                // Overflowing addition handles VSDOs having vaddr = 0xffffffffff700000
                 .start = info.addr +% phdr.vaddr,
                 .len = phdr.memsz,
                 .module_index = module_index,

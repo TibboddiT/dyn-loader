@@ -187,8 +187,6 @@ pub fn runCase(init: std.process.Init, cases: []const Case, name: []const u8, re
     defer std.Io.Dir.cwd().deleteFile(init.io, mutated_path) catch {};
 
     try dyn_loader.init(.{
-        .allocator = init.gpa,
-        .io = init.io,
         .args = init.minimal.args,
         .environ = init.minimal.environ,
         .log_level = .none,

@@ -28,8 +28,6 @@ pub fn runVersioned(init: std.process.Init, fixtures: support.SpecificContext) !
 
 fn runLookup(init: std.process.Init, fixtures: support.SpecificContext, mode: std.meta.Tag(Lookup)) !void {
     try dyn_loader.init(.{
-        .allocator = init.gpa,
-        .io = init.io,
         .args = init.minimal.args,
         .environ = init.minimal.environ,
         .log_level = .none,

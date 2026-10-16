@@ -8,7 +8,10 @@ const dyn_loader = @import("dyn_loader");
 const elf = @import("elf_runner");
 const elf_cases = @import("elf_cases").cases;
 const lifecycle = @import("lifecycle_runner");
-const lifecycle_cases = @import("lifecycle_cases").cases;
+const lifecycle_catalog = @import("lifecycle_cases");
+const lifecycle_cases = lifecycle_catalog.cases;
+
+pub const dynLoaderHook = lifecycle_catalog.onLoaderEvent;
 
 pub const debug = struct {
     pub const SelfInfo = dyn_loader.CustomSelfInfo;
@@ -51,6 +54,10 @@ fn validateFixtures(init: std.process.Init, resources_dir: []const u8) !void {
 
 pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(init.arena.allocator());
+    if (args.len == 4 and std.mem.eql(u8, args[1], "--threads-child")) {
+        return lifecycle_catalog.runThreadContractChild(init, args[2], args[3]);
+    }
+
     const list_only = args.len == 2 and std.mem.eql(u8, args[1], "--list");
     const validate_and_list = args.len == 4 and std.mem.eql(u8, args[2], "--list");
 

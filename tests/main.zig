@@ -44,8 +44,20 @@ const libc_filenames = [_][]const u8{
     "runpath/scope/leaf/libmatrix_leaf.so",
 };
 
+const growth_filenames = blk: {
+    var names: [12][]const u8 = undefined;
+    for (&names, 0..) |*name, index| name.* = std.fmt.comptimePrint("growth_{d}.so", .{index});
+    break :blk names;
+};
+
 const regression_filenames = [_][]const u8{
     "target.so",
+    "constructor_workers.so",
+    "resolver_context.so",
+    "nodelete_dep.so",
+    "nodelete.so",
+    "nodelete_plain.so",
+    "nodelete_broken.so",
     "target_optimized.so",
     "target_large_tls.so",
     "target_excess_tls.so",
@@ -56,7 +68,7 @@ const regression_filenames = [_][]const u8{
     "relative_addends.so",
     "layout.so",
     "capabilities.json",
-};
+} ++ growth_filenames;
 
 const Options = struct {
     project_dir: []const u8 = "",
@@ -757,6 +769,12 @@ const Matrix = struct {
 
         const recipes = [_][]const []const u8{
             &.{ "/src/regression/target.c", "-Wl,-soname,target.so", "-o", "target.so" },
+            &.{ "/src/regression/constructor_workers.c", "-ldl", "-pthread", "-Wl,-rpath,$ORIGIN", "-Wl,-soname,constructor_workers.so", "-o", "constructor_workers.so" },
+            &.{ "/src/regression/resolver_context.c", "-ldl", "-Wl,-soname,resolver_context.so", "-o", "resolver_context.so" },
+            &.{ "/src/regression/nodelete_dep.c", "-Wl,-soname,nodelete_dep.so", "-o", "nodelete_dep.so" },
+            &.{ "/src/regression/nodelete.c", "-L.", "-l:nodelete_dep.so", "-ldl", "-pthread", "-Wl,-rpath,$ORIGIN", "-Wl,-z,nodelete", "-Wl,-soname,nodelete.so", "-o", "nodelete.so" },
+            &.{ "/src/regression/nodelete.c", "-L.", "-l:nodelete_dep.so", "-ldl", "-pthread", "-Wl,-rpath,$ORIGIN", "-Wl,-soname,nodelete_plain.so", "-o", "nodelete_plain.so" },
+            &.{ "/src/regression/nodelete.c", "-DNODELETE_UNRESOLVED", "-L.", "-l:nodelete_dep.so", "-ldl", "-pthread", "-Wl,-rpath,$ORIGIN", "-Wl,-z,nodelete", "-Wl,-soname,nodelete_broken.so", "-o", "nodelete_broken.so" },
             &.{ "/src/regression/target.c", "-O2", "-Wl,-soname,target_optimized.so", "-o", "target_optimized.so" },
             &.{ "/src/regression/target.c", "-DTLS_BYTES=65536", "-Wl,--version-script=/src/regression/tls.map", "-Wl,-soname,target_large_tls.so", "-o", "target_large_tls.so" },
             &.{ "/src/regression/target.c", "-DTLS_BYTES=2097152", "-Wl,-soname,target_excess_tls.so", "-o", "target_excess_tls.so" },
@@ -826,6 +844,10 @@ const Matrix = struct {
             "tests/main.zig",
             "tests/fixture_layout.zig",
             "tests/resources/regression/target.c",
+            "tests/resources/regression/constructor_workers.c",
+            "tests/resources/regression/resolver_context.c",
+            "tests/resources/regression/nodelete.c",
+            "tests/resources/regression/nodelete_dep.c",
             "tests/resources/regression/tls.map",
             "tests/resources/regression/abi.h",
             "tests/resources/regression/bridge.c",
@@ -894,6 +916,11 @@ const Matrix = struct {
             try context.saveJson(capabilities_path, try json.cloneViaSerialization(allocator, .{ .relr = relr_supported }));
 
             const target_path = try std.fs.path.join(allocator, &.{ regression_dir, "target.so" });
+            for (growth_filenames) |name| {
+                const copy_path = try std.fs.path.join(allocator, &.{ regression_dir, name });
+                try context.copyFile(target_path, copy_path);
+            }
+
             const layout_path = try std.fs.path.join(allocator, &.{ regression_dir, "layout.so" });
 
             const target_bytes = try context.readFile(target_path);
@@ -1309,6 +1336,7 @@ fn runMatrix(matrix: *Matrix, selected_runtimes: []const Runtime, options: Optio
         "build.zig",
         "build.zig.zon",
         "src/dyn_loader.zig",
+        "src/hooks.zig",
         "src/CodeView.zig",
         "src/DynObject.zig",
         "src/logger.zig",
@@ -1332,6 +1360,17 @@ fn runMatrix(matrix: *Matrix, selected_runtimes: []const Runtime, options: Optio
         "tests/elf/cases.zig",
         "tests/elf/runner.zig",
         "tests/behaviors/cases.zig",
+        "tests/behaviors/control.zig",
+        "tests/behaviors/specifics/managed_threads.zig",
+        "tests/behaviors/specifics/constructor_workers.zig",
+        "tests/behaviors/specifics/contract_failures.zig",
+        "tests/behaviors/specifics/fork_scope.zig",
+        "tests/behaviors/specifics/resolver_context.zig",
+        "tests/behaviors/specifics/nodelete.zig",
+        "tests/resources/regression/nodelete.c",
+        "tests/resources/regression/nodelete_dep.c",
+        "tests/resources/regression/constructor_workers.c",
+        "tests/resources/regression/resolver_context.c",
         "tests/behaviors/runner.zig",
         "tests/resources/regression/abi.zig",
     };
