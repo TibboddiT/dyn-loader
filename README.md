@@ -77,14 +77,23 @@ pub fn deinit() void;
 It establishes the fixed TLS layout. Pointers into executable thread-local variables obtained
 before successful initialization become stale.
 
-`InitOptions` has the following fields:
+```zig
+pub const InitOptions = struct {
+    // Required startup data.
+    // Normally init.minimal.args and init.minimal.environ, respectively.
+    args: std.process.Args,
+    environ: std.process.Environ,
 
-| Field | Type / values | Default | Purpose |
-| --- | --- | --- | --- |
-| `args` | `std.process.Args` | Required | Process arguments, normally `init.minimal.args`. |
-| `environ` | `std.process.Environ` | Required | Process environment, normally `init.minimal.environ`. |
-| `log_level` | `.debug`, `.info`, `.warn`, `.err`, `.none` | `.err` | Runtime logging threshold. Host `std.log` filtering also applies. |
-| `tls_surplus_size` | `usize` | `0x100000` (1 MiB) | Reserved library TLS bytes, including alignment padding. Fixed at initialization. |
+    // Runtime logging level: .debug, .info, .warn, .err, or .none.
+    // Host std.log filtering also applies: debug output requires the host's
+    // std_options to enable .debug for the dyn_loader log scope.
+    log_level: logger.Level = .err,
+
+    // Reserved library TLS bytes, including alignment padding.
+    // Fixed at initialization. Defaults to 1 MiB.
+    tls_surplus_size: usize = 0x100000,
+};
+```
 
 Before calling `deinit`, join application-owned managed workers and stop external calls into
 loaded libraries. Teardown runs eligible finalizers and frees resources. Libraries marked
@@ -95,7 +104,7 @@ Repeated `deinit` calls are no-op. Reinitialization after teardown is unsupporte
 
 ```zig
 pub fn resolve(allocator: std.mem.Allocator, name: []const u8) !?[]const u8;
-pub fn load(f_path: []const u8) !DynamicLibrary;
+pub fn load(name_or_path: []const u8) !DynamicLibrary;
 pub fn loadSystemLibC() !DynamicLibrary;
 ```
 
@@ -109,10 +118,15 @@ pub fn loadSystemLibC() !DynamicLibrary;
 For example, within an initialized loader:
 
 ```zig
-if (try dyn_loader.resolve(init.gpa, "libvulkan.so.1")) |path| {
-    defer init.gpa.free(path);
-    _ = try dyn_loader.load(path);
-}
+const libvulkan = try dyn_loader.load("libvulkan.so.1");
+```
+
+Or:
+
+```zig
+const path = try dyn_loader.resolve(init.gpa, "libvulkan.so.1") orelse return error.VulkanNotFound;
+defer init.gpa.free(path);
+const libvulkan = try dyn_loader.load(path);
 ```
 
 `DynamicLibrary` is a handle to a loaded library and its dependency scope. Copies refer to

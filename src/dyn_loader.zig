@@ -472,8 +472,8 @@ pub fn loadSystemLibC() !DynamicLibrary {
 /// Loads a library and its dependencies, returning after constructors finish.
 /// On failure, attempts to release unreferenced objects. Callback side effects and
 /// process-wide runtime initialization are not undone.
-pub fn load(f_path: []const u8) !DynamicLibrary {
-    return loadWithRootResolveContext(f_path, null, null, .host);
+pub fn load(name_or_path: []const u8) !DynamicLibrary {
+    return loadWithRootResolveContext(name_or_path, null, null, .host);
 }
 
 /// Resolves a name in the loader's global scope, including native IFUNC calls.
@@ -638,17 +638,17 @@ fn loadPreloads() void {
 // Log owner-process load errors after cleanup.
 const LoadOwner = enum { host, native };
 
-fn loadWithRootResolveContext(f_path: []const u8, root_runpath: ?[]const u8, root_origin_dir: ?[]const u8, owner: LoadOwner) !DynamicLibrary {
+fn loadWithRootResolveContext(name_or_path: []const u8, root_runpath: ?[]const u8, root_origin_dir: ?[]const u8, owner: LoadOwner) !DynamicLibrary {
     // Reject before even the error logger: its host locks are not fork-repaired.
     try requireOwnerProcess();
 
-    return loadWithRootResolveContextInner(f_path, root_runpath, root_origin_dir, owner) catch |err| {
-        logger.err("load: request={s} error={t}", .{ f_path, err });
+    return loadWithRootResolveContextInner(name_or_path, root_runpath, root_origin_dir, owner) catch |err| {
+        logger.err("load: request={s} error={t}", .{ name_or_path, err });
         return err;
     };
 }
 
-fn loadWithRootResolveContextInner(f_path: []const u8, root_runpath: ?[]const u8, root_origin_dir: ?[]const u8, owner: LoadOwner) !DynamicLibrary {
+fn loadWithRootResolveContextInner(name_or_path: []const u8, root_runpath: ?[]const u8, root_origin_dir: ?[]const u8, owner: LoadOwner) !DynamicLibrary {
     try requireManaged(.active_only);
     state.transaction_lock.lock(state.io);
     defer state.transaction_lock.unlock(state.io);
@@ -657,34 +657,34 @@ fn loadWithRootResolveContextInner(f_path: []const u8, root_runpath: ?[]const u8
 
     var phase: []const u8 = "dependencies";
 
-    logger.debug("load: request={s} action=begin", .{f_path});
+    logger.debug("load: request={s} action=begin", .{name_or_path});
     errdefer {
         if (state.libc_runtime) |*runtime| {
             if (runtime.initial_fields_written and !runtime.initial_thread_initialized) {
                 @panic("load failed after native bootstrap commitment");
             }
         }
-        logger.debug("load: request={s} action=rollback", .{f_path});
+        logger.debug("load: request={s} action=rollback", .{name_or_path});
         // Executed constructors may have published raw addresses or workers.
         // Retain their state and dependency closure instead of guessing escape.
         for (state.dyn_objects.values()) |*object| {
             if (object.execution_started) object.pinned = true;
         }
-        unloadUnreferencedObjects() catch |err| logger.warn("load: request={s} action=rollback error={t}", .{ f_path, err });
+        unloadUnreferencedObjects() catch |err| logger.warn("load: request={s} action=rollback error={t}", .{ name_or_path, err });
     }
-    errdefer logger.err("load: request={s} phase={s} action=failed", .{ f_path, phase });
+    errdefer logger.err("load: request={s} phase={s} action=failed", .{ name_or_path, phase });
 
     loadPreloads();
 
     const lib: DynamicLibrary = blk: {
-        if (state.load_request_cache.get(f_path)) |cached_lib_idx| {
-            logger.debug("load: request={s} action=cache_hit object_index={d}", .{ f_path, cached_lib_idx });
+        if (state.load_request_cache.get(name_or_path)) |cached_lib_idx| {
+            logger.debug("load: request={s} action=cache_hit object_index={d}", .{ name_or_path, cached_lib_idx });
             break :blk .{ .index = cached_lib_idx };
         }
 
-        const loaded_lib = try loadDepTree(f_path, root_runpath, root_origin_dir);
+        const loaded_lib = try loadDepTree(name_or_path, root_runpath, root_origin_dir);
 
-        const owned_cache_key = try state.allocator.dupe(u8, f_path);
+        const owned_cache_key = try state.allocator.dupe(u8, name_or_path);
         errdefer state.allocator.free(owned_cache_key);
 
         try state.load_request_cache.putNoClobber(state.allocator, owned_cache_key, loaded_lib.index);
@@ -842,7 +842,7 @@ fn loadWithRootResolveContextInner(f_path: []const u8, root_runpath: ?[]const u8
 
     logSummary("after_initialization", false);
 
-    logger.info("load: request={s} object_index={d} action=ready", .{ f_path, lib.index });
+    logger.info("load: request={s} object_index={d} action=ready", .{ name_or_path, lib.index });
 
     if (owner == .host) state.dyn_objects.values()[lib.index].host_open_count += 1;
     return lib;
