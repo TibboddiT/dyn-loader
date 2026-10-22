@@ -136,10 +136,10 @@ registry identifier. There is currently no public per-library unload function.
 ### Looking up symbols
 
 ```zig
-// Module-level lookup:
+// Global scope lookup:
 pub fn getSymbol(sym_name: []const u8) !Symbol;
 
-// DynamicLibrary method:
+// Local scope lookup:
 pub fn getSymbol(lib: DynamicLibrary, sym_name: []const u8) !Symbol;
 ```
 

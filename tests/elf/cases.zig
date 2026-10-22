@@ -19,7 +19,53 @@ const initial_state: LibraryState = .{
 
 pub const cases: []const runner.Case = &.{
     .{
+        .name = "symbol-one-past-segment",
+        .library = .symbol_boundaries,
+        .expect = .{ .loaded = &.{
+            expectReturn(c_int, "check_end", 42),
+            .{
+                .symbol = "_end",
+                .verify = &struct {
+                    fn verify(address: usize) !void {
+                        try std.testing.expect(address != 0);
+                    }
+                }.verify,
+            },
+        } },
+    },
+    .{
+        .name = "identification-short-linker-script",
+        .contents = "INPUT(libexample.so)\n",
+        .expect = .{ .load_error = error.NotAnElfFile },
+    },
+    .{
+        .name = "identification-short-config",
+        .contents = "include /etc/ld.so.conf.d/*.conf\n",
+        .expect = .{ .load_error = error.NotAnElfFile },
+    },
+    .{
+        .name = "identification-empty",
+        .contents = "",
+        .expect = .{ .load_error = error.NotAnElfFile },
+    },
+    .{
+        .name = "identification-truncated-header",
+        .contents = "\x7fELF\x02",
+        .expect = .{ .load_error = error.InvalidElfFileRange },
+    },
+    .{
+        .name = "identification-elf32",
+        .contents = "\x7fELF\x01",
+        .expect = .{ .load_error = error.UnsupportedElfClass },
+    },
+    .{
         .name = "non-identity-layout",
+        .expect = .{ .loaded = &.{expectOutParam(LibraryState, "readState", initial_state)} },
+    },
+    .{
+        .name = "load-alignment-above-page-size",
+        .library = .identity,
+        .mutation = .{ .first_load_alignment = 0x8000 },
         .expect = .{ .loaded = &.{expectOutParam(LibraryState, "readState", initial_state)} },
     },
     .{

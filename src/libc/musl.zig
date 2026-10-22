@@ -465,38 +465,21 @@ fn detectMuslAllocatorCall(services: *const Services, dyn_object: *DynObject, na
         // entries. Their overflow check and size multiplication must agree, and
         // their `malloc` calls must lead to the same implementation. Equal entry
         // addresses alone therefore cannot establish this binding.
-        const allocation_prefix =
-            "\x41\x54" ++ // `push r12`
-            "\x49\x89\xf4" ++ // `mov r12,rsi`
-            "\x55" ++ // `push rbp`
-            "\x53" ++ // `push rbx`
-            "\x48\x85\xf6" ++ // `test rsi,rsi`
-            "\x74\x08" ++ // `je` past overflow check
-            "\x48\x89\xf0" ++ // `mov rax,rsi`
-            "\x48\xf7\xe7" ++ // `mul rdi`
-            "\x70\x3f" ++ // `jo` allocation failure
-            "\x4c\x0f\xaf\xe7" ++ // `imul r12,rdi`
-            "\x4c\x89\xe7" ++ // `mov rdi,r12`
-            "\xe8"; // `call rel32` (the displacement follows this prefix)
-        const result_check =
-            "\x48\x89\xc3" ++ // `mov rbx,rax`
-            "\x48\x85\xc0"; // `test rax,rax`
+        const public_body = try skipEndbr64(public_code);
+        const internal_entry = try CodeView.fromDynObject(dyn_object, target_address, 4);
+        const internal_address = (try skipEndbr64(internal_entry)).address;
 
-        const sequence_size = allocation_prefix.len + 4 + result_check.len;
-        const internal_code = try CodeView.fromDynObject(dyn_object, target_address, sequence_size);
+        const public_match = try matchGccCallocPrefix(public_body);
+        const internal_code = try CodeView.fromDynObject(dyn_object, internal_address, public_match.sequence_size_bytes);
+        const internal_match = try matchGccCallocPrefix(internal_code);
+        if (public_match.call_operand_offset_bytes != internal_match.call_operand_offset_bytes) return error.UnrecognizedAllocatorTarget;
 
-        const public_match = try public_code.findUnique(allocation_prefix, 4, result_check);
-        if (public_match != 0) return error.UnrecognizedAllocatorTarget;
-
-        const internal_match = try internal_code.findUnique(allocation_prefix, 4, result_check);
-        if (internal_match != 0) return error.UnrecognizedAllocatorTarget;
-
-        const public_malloc_target = try public_code.relativeTarget(allocation_prefix.len);
+        const public_malloc_target = try public_body.relativeTarget(public_match.call_operand_offset_bytes);
         const malloc_slot = try findPltSlot(dyn_object, public_malloc_target, "malloc");
         if (malloc_slot == null) return error.UnrecognizedAllocatorTarget;
 
         const malloc_code = try CodeView.fromSymbol(services.inspect(dyn_object), "malloc");
-        const internal_malloc_target = try internal_code.relativeTarget(allocation_prefix.len);
+        const internal_malloc_target = try internal_code.relativeTarget(internal_match.call_operand_offset_bytes);
         const internal_implementation = try resolveEntryJump(dyn_object, internal_malloc_target);
         const public_implementation = try resolveEntryJump(dyn_object, malloc_code.address);
 
@@ -506,6 +489,68 @@ fn detectMuslAllocatorCall(services: *const Services, dyn_object: *DynObject, na
     }
 
     return .{ .internal = .{ .target_address = target_address } };
+}
+
+const CallocPrefixMatch = struct {
+    call_operand_offset_bytes: usize,
+    sequence_size_bytes: usize,
+};
+
+/// Matches the overflow guard, size multiplication, malloc call, and result check.
+/// Matching just the allocation call is insufficient evidence for calloc.
+fn matchGccCallocPrefix(code: CodeView) !CallocPrefixMatch {
+    const Pattern = struct {
+        before_call_operand: []const u8,
+        result_check: []const u8,
+    };
+
+    const patterns = [_]Pattern{
+        .{
+            .before_call_operand = "\x41\x54" ++ // push r12
+                "\x49\x89\xf4" ++ // mov r12,rsi
+                "\x55" ++ // push rbp
+                "\x53" ++ // push rbx
+                "\x48\x85\xf6" ++ // test rsi,rsi
+                "\x74\x08" ++ // je past overflow check
+                "\x48\x89\xf0" ++ // mov rax,rsi
+                "\x48\xf7\xe7" ++ // mul rdi
+                "\x70\x3f" ++ // jo allocation failure
+                "\x4c\x0f\xaf\xe7" ++ // imul r12,rdi
+                "\x4c\x89\xe7" ++ // mov rdi,r12
+                "\xe8", // call rel32; operand follows
+            .result_check = "\x48\x89\xc3" ++ // mov rbx,rax
+                "\x48\x85\xc0", // test rax,rax
+        },
+        // GCC's larger zeroing loop uses a near overflow branch and swaps the
+        // saved size/result registers (RBX/R12).
+        .{
+            .before_call_operand = "\x41\x54" ++ // push r12
+                "\x55" ++ // push rbp
+                "\x53" ++ // push rbx
+                "\x48\x89\xf3" ++ // mov rbx,rsi
+                "\x48\x85\xf6" ++ // test rsi,rsi
+                "\x74\x0c" ++ // je past overflow check
+                "\x48\x89\xf0" ++ // mov rax,rsi
+                "\x48\xf7\xe7" ++ // mul rdi
+                "\x0f\x80\xe5\x00\x00\x00" ++ // jo allocation failure
+                "\x48\x0f\xaf\xdf" ++ // imul rbx,rdi
+                "\x48\x89\xdf" ++ // mov rdi,rbx
+                "\xe8", // call rel32; operand follows
+            .result_check = "\x49\x89\xc4" ++ // mov r12,rax
+                "\x48\x85\xc0", // test rax,rax
+        },
+    };
+
+    for (patterns) |pattern| {
+        if (try code.findUnique(pattern.before_call_operand, 4, pattern.result_check) == 0) {
+            return .{
+                .call_operand_offset_bytes = pattern.before_call_operand.len,
+                .sequence_size_bytes = pattern.before_call_operand.len + 4 + pattern.result_check.len,
+            };
+        }
+    }
+
+    return error.UnrecognizedAllocatorTarget;
 }
 
 // Private global and pthread-layout inspection.
@@ -597,6 +642,13 @@ const MuslThreads = struct {
     threaded: bool, // First-worker stdio/signal/TSD transition completed.
 };
 
+fn skipEndbr64(entry: CodeView) !CodeView {
+    // CET adds an entry landing pad without changing the libc layout. Advance
+    // the view's ELF address too, so RIP-relative operands still resolve correctly.
+    const prefix_size: usize = if (std.mem.startsWith(u8, entry.bytes, "\xf3\x0f\x1e\xfa")) 4 else 0;
+    return entry.slice(prefix_size, entry.bytes.len - prefix_size);
+}
+
 /// `issetugid` returns `libc.secure`. Its complete short body reveals both the
 /// field's address and whether the global flags occupy ints or bytes. Subtract
 /// the known `secure` offset to recover `__libc`, then validate the candidate layout.
@@ -605,7 +657,7 @@ const MuslThreads = struct {
 /// Byte-flag layout in v1.2.5, lines 20-31:
 /// https://git.musl-libc.org/cgit/musl/tree/src/internal/libc.h?h=v1.2.5#n20
 fn detectMuslLayout(services: *const Services, dyn_object: *DynObject) !MuslLayout {
-    const code = try CodeView.fromSymbol(services.inspect(dyn_object), "issetugid");
+    const code = try skipEndbr64(try CodeView.fromSymbol(services.inspect(dyn_object), "issetugid"));
 
     const Pattern = struct {
         prefix: []const u8,
@@ -722,7 +774,14 @@ fn detectMuslThreads(allocator: std.mem.Allocator, services: *const Services, dy
     const segment = dyn_object.segments.values()[location.segment_index];
     const global_virtual_address = segment.mem_offset + (layout.mapped_address - segment.loaded_at);
 
-    var create_flow = try InstructionFlow.init(allocator, create_code);
+    var create_options: InstructionFlow.Options = .{};
+    if (try findLibcSymbol(services, dyn_object, "__stack_chk_fail")) |symbol| {
+        // Hardened builds place cold allocation paths after the stack-protector
+        // failure call. That call cannot fall through into those paths.
+        create_options.noreturn_targets[0] = symbol.value;
+    }
+
+    var create_flow = try InstructionFlow.initWithOptions(allocator, create_code, create_options);
     defer create_flow.deinit();
 
     capability = "tsd";
@@ -1198,7 +1257,6 @@ fn hasPointerResultUse(bytes: []const u8) bool {
 
         if (rex < 0x40 or rex > 0x4f) return false;
         if (opcode != 0x89 and opcode != 0x8b and opcode != 0x8d) return false;
-        if (opcode != 0x8d and rex & 8 == 0) return false;
 
         const mode: u2 = @intCast(modrm >> 6);
         const rm_index = modrm & 0b111;
@@ -1230,7 +1288,7 @@ fn hasPointerResultUse(bytes: []const u8) bool {
         if (remaining.len < instruction_size) return false;
 
         if (opcode == 0x89) {
-            if (register_operand == 0) return true;
+            if (register_operand == 0 and rex & 8 != 0) return true;
 
             const destination_extension = (rex & 0b0001) << 3;
             const destination_register = rm_index | destination_extension;
@@ -1286,7 +1344,9 @@ fn preparePatches(allocator: std.mem.Allocator, dyn_object: *DynObject, patches:
 
             const candidate_target = code.relativeTarget(offset + 1) catch continue;
             if (candidate_target != target_virtual_address) continue;
-            if (!hasPointerResultUse(code.bytes[offset + 5 ..])) return error.UnrecognizedCallSite;
+            if (!hasPointerResultUse(code.bytes[offset + 5 ..])) {
+                return error.UnrecognizedCallSite;
+            }
 
             // Candidate comparison above used ELF addresses. Replacement bytes
             // are computed from loaded addresses, including the extra page.
@@ -1650,6 +1710,58 @@ fn appendWritePlan(runtime: *common.Runtime, musl: MuslLayout) !void {
             .value = .tid,
         },
     });
+}
+
+test "CET issetugid preserves the secure field RIP target" {
+    // Debian musl's exported issetugid, including its entry landing pad.
+    const bytes =
+        "\xf3\x0f\x1e\xfa" ++ // endbr64
+        "\x0f\xbe\x05\x17\x5c\x05\x00" ++ // movsx eax,byte ptr [rip+0x55c17]
+        "\xc3"; // ret
+    const code = try skipEndbr64(CodeView.fromBytes(bytes, 0x62c60));
+
+    try std.testing.expectEqual(@as(usize, 0xb8882), try code.relativeTarget(3));
+    try std.testing.expectEqual(@as(usize, 8), code.bytes.len);
+}
+
+test "hardened calloc requires overflow guard and full pointer result" {
+    // Public calloc's observed entry at ELF 0x16740; call at 0x16763 targets malloc@plt.
+    const bytes =
+        "\xf3\x0f\x1e\xfa" ++ // endbr64
+        "\x41\x54\x55\x53" ++ // push r12; push rbp; push rbx
+        "\x48\x89\xf3" ++ // mov rbx,rsi
+        "\x48\x85\xf6\x74\x0c" ++ // test rsi,rsi; je past overflow check
+        "\x48\x89\xf0\x48\xf7\xe7" ++ // mov rax,rsi; mul rdi
+        "\x0f\x80\xe5\x00\x00\x00" ++ // jo allocation failure
+        "\x48\x0f\xaf\xdf\x48\x89\xdf" ++ // imul rbx,rdi; mov rdi,rbx
+        "\xe8\xa8\xd8\xff\xff" ++ // call malloc@plt
+        "\x49\x89\xc4\x48\x85\xc0"; // mov r12,rax; test rax,rax
+    const body = try skipEndbr64(CodeView.fromBytes(bytes, 0x16740));
+    const found = try matchGccCallocPrefix(body);
+    try std.testing.expectEqual(@as(usize, 0x14010), try body.relativeTarget(found.call_operand_offset_bytes));
+
+    const overflow_branch_opcode_offset = 23;
+    var no_overflow_guard = bytes.*;
+    no_overflow_guard[overflow_branch_opcode_offset] = 0x81; // jno instead of jo
+    const unguarded_body = try skipEndbr64(CodeView.fromBytes(&no_overflow_guard, 0x16740));
+    try std.testing.expectError(error.UnrecognizedAllocatorTarget, matchGccCallocPrefix(unguarded_body));
+
+    const result_copy_rex_offset = 40;
+    var truncated_result = bytes.*;
+    truncated_result[result_copy_rex_offset] = 0x41; // 32-bit result copy instead of 64-bit
+    const truncated_body = try skipEndbr64(CodeView.fromBytes(&truncated_result, 0x16740));
+    try std.testing.expectError(error.UnrecognizedAllocatorTarget, matchGccCallocPrefix(truncated_body));
+}
+
+test "allocator result validation tolerates unrelated 32-bit restores, not pointer truncation" {
+    // GCC restores R10 and R11D before testing the full malloc result.
+    try std.testing.expect(hasPointerResultUse("\x4c\x8b\x54\x24\x28\x44\x8b\x5c\x24\x30\x48\x85\xc0"));
+
+    // mov eax,r11d invalidates the result even if a pointer test follows.
+    try std.testing.expect(!hasPointerResultUse("\x44\x89\xd8\x48\x85\xc0"));
+
+    // Saving just EAX is not evidence of a pointer use.
+    try std.testing.expect(!hasPointerResultUse("\x41\x89\xc4\xc3"));
 }
 
 test "allocator call detection requires matching arguments and a result check" {

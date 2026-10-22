@@ -65,6 +65,8 @@ static void recordFailure(struct probe_result *result, unsigned line, const char
 } while (0)
 #define UNUSED_HOST() ((void)host)
 
+#include "runpath/probes.h"
+
 static void constructors(const struct probe_host_api *host, struct probe_result *result) {
     UNUSED_HOST();
     EXPECT(result, constructor_count, 1);
@@ -1699,6 +1701,28 @@ static const struct {
     {"loader.dependency_lookup", dependencyLookup},
     {"loader.runpath_chain", runpathChain},
     {"loader.runpath_scope", runpathScope},
+    {"loader.search.rpath", searchRpath},
+    {"loader.search.runpath", searchRunpath},
+    {"loader.search.env_rpath", searchEnvRpath},
+    {"loader.search.env_runpath", searchEnvRunpath},
+    {"loader.search.inherited", searchInherited},
+    {"loader.search.scoped", searchScoped},
+    {"loader.search.blocked", searchBlocked},
+    {"loader.search.owner_origin", searchOwner},
+    {"loader.search.both_tags", searchBoth},
+    {"loader.search.relative_request", searchRelativeRequest},
+    {"loader.search.env_relative", searchEnvRelative},
+    {"loader.search.env_component", searchEnvComponent},
+    {"loader.search.env_empty", searchEnvEmpty},
+    {"loader.search.relative_runpath", searchRelativeRunpath},
+    {"loader.search.empty_runpath", searchEmptyRunpath},
+    {"loader.search.runpath_component", searchRunpathComponent},
+    {"loader.search.alias_origin", searchAliasOrigin},
+    {"loader.search.dynamic_direct", searchDynamicDirect},
+    {"loader.search.dynamic_rpath", searchDynamicRpath},
+    {"loader.search.dynamic_runpath", searchDynamicRunpath},
+    {"loader.search.reload", searchReload},
+    {"loader.search.resident_name", searchResidentName},
     {"thread.key_cleanup_return", keyCleanupReturn},
     {"thread.key_cleanup_exit", keyCleanupExit},
     {"cpp.tls_destructor_return", cppCleanupReturn},

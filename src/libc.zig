@@ -536,7 +536,14 @@ pub fn findPltSlot(dyn_object: *const DynObject, target_address: usize, symbol_n
 
 /// Follows one recognized tail-jump wrapper in ELF coordinates.
 pub fn resolveEntryJump(dyn_object: *const DynObject, entry_address: usize) !usize {
-    const entry = try CodeView.fromDynObject(dyn_object, entry_address, 5);
+    // Skip CET's endbr64 landing pad before recognizing the tail-jump wrapper.
+    const landing = try CodeView.fromDynObject(dyn_object, entry_address, 4);
+    const body_address = if (std.mem.eql(u8, landing.bytes, "\xf3\x0f\x1e\xfa"))
+        try std.math.add(usize, entry_address, 4)
+    else
+        entry_address;
+
+    const entry = try CodeView.fromDynObject(dyn_object, body_address, 5);
     if (entry.bytes[0] == 0xe9) return entry.relativeTarget(1); // `jmp rel32`
 
     const frame_pointer_wrapper =
@@ -545,7 +552,7 @@ pub fn resolveEntryJump(dyn_object: *const DynObject, entry_address: usize) !usi
         "\x5d" ++ // `pop rbp`
         "\xe9"; // `jmp rel32`
 
-    const wrapper = try CodeView.fromDynObject(dyn_object, entry_address, frame_pointer_wrapper.len + 4);
+    const wrapper = try CodeView.fromDynObject(dyn_object, body_address, frame_pointer_wrapper.len + 4);
     if (std.mem.startsWith(u8, wrapper.bytes, frame_pointer_wrapper)) {
         return wrapper.relativeTarget(frame_pointer_wrapper.len);
     }

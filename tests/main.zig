@@ -28,6 +28,11 @@ const libc_sources = [_][]const u8{
     "tests/resources/libc/runpath/leaf.c",
     "tests/resources/libc/runpath/middle.c",
     "tests/resources/libc/runpath/top.c",
+    "tests/resources/libc/runpath/search.c",
+    "tests/resources/libc/runpath/search.sh",
+    "tests/resources/libc/runpath/tag_patch.c",
+    "tests/resources/libc/runpath/probes.h",
+    "tests/resources/libc/runpath/search_result.h",
 };
 
 const libc_filenames = [_][]const u8{
@@ -42,6 +47,32 @@ const libc_filenames = [_][]const u8{
     "runpath/scope/top.so",
     "runpath/scope/middle/libmatrix_middle.so",
     "runpath/scope/leaf/libmatrix_leaf.so",
+    "runpath/search/leaf/libsearch_leaf.so",
+    "runpath/search/override/libsearch_leaf.so",
+    "runpath/search/alias/leaf/libsearch_leaf.so",
+    "runpath/search/middle/libsearch_middle.so",
+    "runpath/search/blocked/libsearch_middle.so",
+    "runpath/search/owner/libsearch_middle.so",
+    "runpath/search/rpath.so",
+    "runpath/search/runpath.so",
+    "runpath/search/bare.so",
+    "runpath/search/relative.so",
+    "runpath/search/empty.so",
+    "runpath/search/empty-component.so",
+    "runpath/search/both.so",
+    "runpath/search/inherited.so",
+    "runpath/search/alternate.so",
+    "runpath/search/scoped.so",
+    "runpath/search/blocked.so",
+    "runpath/search/owner.so",
+    "runpath/search/dynamic-rpath.so",
+    "runpath/search/dynamic-runpath.so",
+    "runpath/search/dynamic-direct.so",
+    "runpath/search/reload.so",
+    "runpath/search/change-cwd.so",
+    "runpath/search/leaf/relative-root.so",
+    "runpath/search/override/relative-root.so",
+    "runpath/search/alias/runpath.so",
 };
 
 const growth_filenames = blk: {
@@ -66,6 +97,17 @@ const regression_filenames = [_][]const u8{
     "plt_only.so",
     "relr.so",
     "relative_addends.so",
+    "symbol_boundaries.so",
+    "scope_leaf.so",
+    "scope_sibling.so",
+    "scope_child.so",
+    "scope_nested_child.so",
+    "scope_nested.so",
+    "scope_root.so",
+    "scope_other.so",
+    "scope_unrelated.so",
+    "scope_driver.so",
+    "scope-native",
     "layout.so",
     "capabilities.json",
 } ++ growth_filenames;
@@ -225,6 +267,17 @@ fn trimOutput(text: []const u8) []const u8 {
 
 const WorkerKind = enum { assertion, reference, dyn_loader };
 
+/// Native loaders capture LD_LIBRARY_PATH at startup. Supply identical startup
+/// settings to both workers rather than changing environ from inside a probe.
+fn libcCaseSearchPath(case_name: ?[]const u8) []const u8 {
+    const name = case_name orelse return "/fixtures";
+    if (std.mem.eql(u8, name, "loader.search.env_rpath") or std.mem.eql(u8, name, "loader.search.env_runpath")) return "/fixtures:/fixtures/runpath/search/override";
+    if (std.mem.eql(u8, name, "loader.search.env_relative")) return "/fixtures:runpath/search/leaf";
+    if (std.mem.eql(u8, name, "loader.search.env_component")) return "/fixtures:";
+    if (std.mem.eql(u8, name, "loader.search.env_empty")) return "";
+    return "/fixtures";
+}
+
 const Runtime = struct {
     // `image` is the pinned execution image (or a built image ID). Informational
     // manifest fields such as `discovery_tag` remain in `metadata` for provenance;
@@ -296,6 +349,7 @@ const Matrix = struct {
         fixtures_dir: []const u8,
         worker: WorkerKind,
         case_id: ?u32 = null,
+        case_name: ?[]const u8 = null,
         timeout_ms: u64 = 30_000,
         log_prefix: []const u8,
     };
@@ -804,6 +858,61 @@ const Matrix = struct {
                 "plt_only.so",
             },
             &.{ "-nostdlib", "/src/regression/relative_addends.c", "-Wl,-z,defs", "-Wl,-soname,relative_addends.so", "-o", "relative_addends.so" },
+            &.{ "-nostdlib", "/src/regression/symbol_boundaries.c", "-Wl,-z,defs", "-Wl,-soname,symbol_boundaries.so", "-o", "symbol_boundaries.so" },
+            &.{ "/src/regression/scope.c", "-DSCOPE_LEAF", "-Wl,-soname,scope_leaf.so", "-o", "scope_leaf.so" },
+            &.{ "/src/regression/scope.c", "-DSCOPE_SIBLING", "-Wl,-soname,scope_sibling.so", "-o", "scope_sibling.so" },
+            &.{
+                "/src/regression/scope.c",
+                "-DSCOPE_CHILD",
+                "-L.",
+                "-l:scope_leaf.so",
+                "-Wl,-rpath,$ORIGIN",
+                "-Wl,-soname,scope_child.so",
+                "-o",
+                "scope_child.so",
+            },
+            &.{ "/src/regression/scope.c", "-DSCOPE_NESTED_CHILD", "-Wl,-soname,scope_nested_child.so", "-o", "scope_nested_child.so" },
+            &.{
+                "/src/regression/scope.c",
+                "-DSCOPE_NESTED",
+                "-L.",
+                "-l:scope_nested_child.so",
+                "-Wl,-rpath,$ORIGIN",
+                "-Wl,-soname,scope_nested.so",
+                "-o",
+                "scope_nested.so",
+            },
+            // Keep child before sibling: breadth-first lookup must find the
+            // sibling's definition before the child's leaf dependency.
+            &.{
+                "/src/regression/scope.c",
+                "-DSCOPE_ROOT",
+                "-L.",
+                "-Wl,--no-as-needed",
+                "-l:scope_child.so",
+                "-l:scope_sibling.so",
+                "-ldl",
+                "-Wl,-rpath,$ORIGIN",
+                "-Wl,-soname,scope_root.so",
+                "-o",
+                "scope_root.so",
+            },
+            &.{
+                "/src/regression/scope.c",
+                "-DSCOPE_ROOT",
+                "-DPARENT_VALUE=21",
+                "-L.",
+                "-Wl,--no-as-needed",
+                "-l:scope_child.so",
+                "-l:scope_sibling.so",
+                "-ldl",
+                "-Wl,-rpath,$ORIGIN",
+                "-Wl,-soname,scope_other.so",
+                "-o",
+                "scope_other.so",
+            },
+            &.{ "/src/regression/scope.c", "-DSCOPE_UNRELATED", "-Wl,-soname,scope_unrelated.so", "-o", "scope_unrelated.so" },
+            &.{ "/src/regression/scope_driver.c", "-ldl", "-Wl,-soname,scope_driver.so", "-o", "scope_driver.so" },
             &.{ "-nostdlib", "/src/regression/relr.c", "-Wl,-z,defs", "-Wl,--fatal-warnings", "-Wl,-z,pack-relative-relocs", "-Wl,-soname,relr.so", "-o", "relr.so" },
         };
 
@@ -822,7 +931,31 @@ const Matrix = struct {
             try commands.array.append(recorded_command);
         }
 
+        const native_command = &.{
+            "cc",
+            "-std=c11",
+            "-O0",
+            "-g",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-DSCOPE_NATIVE_MAIN",
+            "/src/regression/scope_driver.c",
+            "-ldl",
+            "-o",
+            "scope-native",
+        };
+        const native_build_log = try std.fmt.allocPrint(context.allocator, "{s}/scope-native-build", .{runtime_dir});
+        try matrix.runSdkCommand(sdk_image, fixtures_dir, native_command, native_build_log);
+        try commands.array.append(try json.cloneViaSerialization(context.allocator, native_command));
+
         return commands;
+    }
+
+    /// Verifies scope behavior with the SDK's native loader before caching fixtures.
+    fn verifyScopeNativeReference(matrix: *Matrix, sdk_image: []const u8, fixtures_dir: []const u8, runtime_dir: []const u8) !void {
+        const log_prefix = try std.fmt.allocPrint(matrix.context.allocator, "{s}/scope-native-reference", .{runtime_dir});
+        try matrix.runSdkCommand(sdk_image, fixtures_dir, &.{ "./scope-native", "/fixtures" }, log_prefix);
     }
 
     /// Builds SDK-linked regression objects and derives the non-identity ELF
@@ -856,6 +989,9 @@ const Matrix = struct {
             "tests/resources/regression/plt_only.c",
             "tests/resources/regression/relr.c",
             "tests/resources/regression/relative_addends.c",
+            "tests/resources/regression/symbol_boundaries.c",
+            "tests/resources/regression/scope.c",
+            "tests/resources/regression/scope_driver.c",
         });
 
         const relr_probe = try matrix.queryImage(sdk_image, &.{
@@ -912,6 +1048,8 @@ const Matrix = struct {
             try context.makeDir(regression_dir);
 
             build_commands = try matrix.compileRegressionFixtures(sdk_image, regression_dir, runtime_dir, relr_supported);
+            try matrix.verifyScopeNativeReference(sdk_image, regression_dir, runtime_dir);
+
             const capabilities_path = try std.fs.path.join(allocator, &.{ regression_dir, "capabilities.json" });
             try context.saveJson(capabilities_path, try json.cloneViaSerialization(allocator, .{ .relr = relr_supported }));
 
@@ -1031,7 +1169,8 @@ const Matrix = struct {
         if (is_assertion) {
             try argv.appendSlice(allocator, &.{ "--env", "LD_LIBRARY_PATH=/fixtures/regression" });
         } else {
-            try argv.appendSlice(allocator, &.{ "--env", "LD_LIBRARY_PATH=/fixtures" });
+            const search_path = libcCaseSearchPath(options.case_name);
+            try argv.appendSlice(allocator, &.{ "--env", try std.fmt.allocPrint(allocator, "LD_LIBRARY_PATH={s}", .{search_path}) });
         }
 
         try argv.appendSlice(allocator, &.{
@@ -1284,6 +1423,7 @@ fn runRuntimeCases(
                     .fixtures_dir = fixtures_dir,
                     .worker = .reference,
                     .case_id = case.id,
+                    .case_name = case.name,
                     .timeout_ms = options.timeout_ms,
                     .log_prefix = reference_case_log,
                 });
@@ -1293,6 +1433,7 @@ fn runRuntimeCases(
                         .fixtures_dir = fixtures_dir,
                         .worker = .dyn_loader,
                         .case_id = case.id,
+                        .case_name = case.name,
                         .timeout_ms = options.timeout_ms,
                         .log_prefix = loader_case_log,
                     })

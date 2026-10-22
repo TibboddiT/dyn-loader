@@ -43,3 +43,5 @@ for variant in chain scope; do
         exit 1
     fi
 done
+
+sh /src/libc/runpath/search.sh

@@ -377,6 +377,8 @@ pub fn deinit() void {
         state.allocator.free(dyn_object.name);
         state.allocator.free(dyn_object.path);
         if (dyn_object.runpath) |runpath| state.allocator.free(runpath);
+        if (dyn_object.rpath) |rpath| state.allocator.free(rpath);
+        if (dyn_object.inherited_rpath) |rpath| state.allocator.free(rpath);
 
         if (dyn_object.file_handle != -1) {
             _ = std.os.linux.close(dyn_object.file_handle);
@@ -440,7 +442,7 @@ pub fn resolve(allocator: std.mem.Allocator, name: []const u8) !?[]const u8 {
     state.transaction_lock.lock(state.io);
     defer state.transaction_lock.unlock(state.io);
 
-    return resolvePath(allocator, name, true, null, null, null) catch |err| switch (err) {
+    return resolvePath(allocator, name, true, .{}) catch |err| switch (err) {
         error.LibraryNotFound => null,
         else => |e| return e,
     };
@@ -457,7 +459,7 @@ pub fn loadSystemLibC() !DynamicLibrary {
     for (libc.system_libc_names) |candidate| {
         logger.debug("libc: trying {s}", .{candidate});
 
-        const path = resolvePath(state.allocator, candidate, true, null, null, null) catch |err| switch (err) {
+        const path = resolvePath(state.allocator, candidate, true, .{}) catch |err| switch (err) {
             error.LibraryNotFound => continue,
             else => |e| return e,
         };
@@ -473,7 +475,7 @@ pub fn loadSystemLibC() !DynamicLibrary {
 /// On failure, attempts to release unreferenced objects. Callback side effects and
 /// process-wide runtime initialization are not undone.
 pub fn load(name_or_path: []const u8) !DynamicLibrary {
-    return loadWithRootResolveContext(name_or_path, null, null, .host);
+    return loadWithRootResolveContext(name_or_path, .{}, .host);
 }
 
 /// Resolves a name in the loader's global scope, including native IFUNC calls.
@@ -638,17 +640,25 @@ fn loadPreloads() void {
 // Log owner-process load errors after cleanup.
 const LoadOwner = enum { host, native };
 
-fn loadWithRootResolveContext(name_or_path: []const u8, root_runpath: ?[]const u8, root_origin_dir: ?[]const u8, owner: LoadOwner) !DynamicLibrary {
+/// `rpath` contains already-expanded entries; `runpath` retains its ELF tokens.
+const LibrarySearchContext = struct {
+    requester_name: ?[]const u8 = null,
+    runpath: ?[]const u8 = null,
+    origin_dir: ?[]const u8 = null,
+    rpath: ?[]const u8 = null,
+};
+
+fn loadWithRootResolveContext(name_or_path: []const u8, search: LibrarySearchContext, owner: LoadOwner) !DynamicLibrary {
     // Reject before even the error logger: its host locks are not fork-repaired.
     try requireOwnerProcess();
 
-    return loadWithRootResolveContextInner(name_or_path, root_runpath, root_origin_dir, owner) catch |err| {
+    return loadWithRootResolveContextInner(name_or_path, search, owner) catch |err| {
         logger.err("load: request={s} error={t}", .{ name_or_path, err });
         return err;
     };
 }
 
-fn loadWithRootResolveContextInner(name_or_path: []const u8, root_runpath: ?[]const u8, root_origin_dir: ?[]const u8, owner: LoadOwner) !DynamicLibrary {
+fn loadWithRootResolveContextInner(name_or_path: []const u8, search: LibrarySearchContext, owner: LoadOwner) !DynamicLibrary {
     try requireManaged(.active_only);
     state.transaction_lock.lock(state.io);
     defer state.transaction_lock.unlock(state.io);
@@ -682,7 +692,7 @@ fn loadWithRootResolveContextInner(name_or_path: []const u8, root_runpath: ?[]co
             break :blk .{ .index = cached_lib_idx };
         }
 
-        const loaded_lib = try loadDepTree(name_or_path, root_runpath, root_origin_dir);
+        const loaded_lib = try loadDepTree(name_or_path, search);
 
         const owned_cache_key = try state.allocator.dupe(u8, name_or_path);
         errdefer state.allocator.free(owned_cache_key);
@@ -713,13 +723,21 @@ fn loadWithRootResolveContextInner(name_or_path: []const u8, root_runpath: ?[]co
     const relocation_order = try state.allocator.dupe(usize, state.dyn_objects_sorted_indices.items);
     defer state.allocator.free(relocation_order);
 
+    // Relocation visibility belongs to the load group, not each member's DT_NEEDED subtree.
+    const relocation_scope = try state.allocator.dupe(usize, state.dyn_objects.values()[lib.index].deps_breadth_first.items);
+    defer state.allocator.free(relocation_scope);
+
     for (relocation_order) |idx| {
+        if (std.mem.findScalar(usize, relocation_scope, idx) == null) continue;
+
         const object = &state.dyn_objects.values()[idx];
         if (object.relocated or object.mapped_at == 0 or object.tls_module_id != null) continue;
         try reserveModuleTls(object);
     }
 
     for (relocation_order) |idx| {
+        if (std.mem.findScalar(usize, relocation_scope, idx) == null) continue;
+
         const dyn_obj = &state.dyn_objects.values()[idx];
 
         if (dyn_obj.relocated or dyn_obj.mapped_at == 0) continue;
@@ -745,11 +763,13 @@ fn loadWithRootResolveContextInner(name_or_path: []const u8, root_runpath: ?[]co
     }
 
     for (relocation_order) |idx| {
+        if (std.mem.findScalar(usize, relocation_scope, idx) == null) continue;
+
         const dyn_obj = &state.dyn_objects.values()[idx];
         if (dyn_obj.relocated or dyn_obj.mapped_at == 0) continue;
 
         phase = "relocations";
-        try processRelocations(dyn_obj);
+        try processRelocations(dyn_obj, relocation_scope);
         phase = "tls";
         try publishModuleTls(dyn_obj);
         _dl_debug_state();
@@ -849,10 +869,12 @@ fn loadWithRootResolveContextInner(name_or_path: []const u8, root_runpath: ?[]co
 }
 
 // TODO replace repeated registry scans with a work list of pending dependencies.
-fn loadDepTree(o_path: []const u8, root_runpath: ?[]const u8, root_origin_dir: ?[]const u8) !DynamicLibrary {
+fn loadDepTree(o_path: []const u8, root_search: LibrarySearchContext) !DynamicLibrary {
     logger.debug("dep tree: checking {s}", .{o_path});
 
-    const lib_idx = try loadDso(o_path, root_runpath, root_origin_dir);
+    // The caller's search context locates a dlopen root; it does not become that
+    // root's DT_NEEDED ancestry. Only dependency edges inherit RPATH.
+    const lib_idx = try loadDso(o_path, root_search, null);
     if (state.dyn_objects.values()[lib_idx].mapped_at != 0) {
         return .{
             .index = lib_idx,
@@ -885,8 +907,8 @@ fn loadDepTree(o_path: []const u8, root_runpath: ?[]const u8, root_origin_dir: ?
             const dyn_object_path = state.dyn_objects.values()[dyn_object_idx].path;
             const idx = try loadDso(
                 if (dyn_object_idx == lib_idx) o_path else dyn_object_path,
-                if (dyn_object_idx == lib_idx) root_runpath else null,
-                if (dyn_object_idx == lib_idx) root_origin_dir else null,
+                if (dyn_object_idx == lib_idx) root_search else .{},
+                if (dyn_object_idx == lib_idx) null else state.dyn_objects.values()[dyn_object_idx].inherited_rpath,
             );
 
             // TODO establish whether alias resolution and retired-slot reuse guarantee
@@ -917,35 +939,103 @@ fn loadDepTree(o_path: []const u8, root_runpath: ?[]const u8, root_origin_dir: ?
     };
 }
 
-// TODO implement current-directory semantics for empty/relative search entries
-// and define RPATH/RUNPATH inheritance and native search-path configuration.
+/// Returns an owned absolute pathname allocated with `allocator`.
+/// Preserves symlinks and `..` so kernel lookup and `$ORIGIN` keep their meaning.
+fn makeAbsoluteLibraryPath(allocator: std.mem.Allocator, path: []const u8) ![]const u8 {
+    if (std.fs.path.isAbsolute(path)) return allocator.dupe(u8, path);
+
+    const cwd = try std.process.currentPathAlloc(state.io, allocator);
+    defer allocator.free(cwd);
+
+    return std.fmt.allocPrint(allocator, "{s}/{s}", .{ cwd, path });
+}
+
+/// Returns joined RPATH entries owned by `state.allocator`, or null for no entries.
+/// Expands the owner's tokens; relative/empty entries stay relative until lookup.
+fn buildInheritedRpath(own_rpath: ?[]const u8, ancestor_rpath: ?[]const u8, origin_dir: []const u8) !?[]const u8 {
+    var entries: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (entries.items) |entry| state.allocator.free(entry);
+        entries.deinit(state.allocator);
+    }
+
+    if (own_rpath) |value| {
+        if (value.len != 0) {
+            var it = std.mem.splitScalar(u8, value, ':');
+            while (it.next()) |entry| try appendLdExpansions(&entries, entry, origin_dir);
+        }
+    }
+
+    if (ancestor_rpath) |value| {
+        const copy = try state.allocator.dupe(u8, value);
+        errdefer state.allocator.free(copy);
+
+        try entries.append(state.allocator, copy);
+    }
+
+    if (entries.items.len == 0) return null;
+    return try std.mem.join(state.allocator, ":", entries.items);
+}
+
+fn searchLibraryDirectories(allocator: std.mem.Allocator, name: []const u8, directories: []const u8, origin_dir: ?[]const u8, expand_tokens: bool) !?[]const u8 {
+    // An empty list is disabled; empty components of a nonempty list mean cwd.
+    if (directories.len == 0) return null;
+
+    var it = std.mem.splitScalar(u8, directories, ':');
+    while (it.next()) |directory| {
+        var entries: std.ArrayList([]const u8) = .empty;
+        defer {
+            for (entries.items) |entry| state.allocator.free(entry);
+            entries.deinit(state.allocator);
+        }
+
+        if (expand_tokens) {
+            try appendLdExpansions(&entries, directory, origin_dir);
+        } else {
+            const copy = try state.allocator.dupe(u8, directory);
+            errdefer state.allocator.free(copy);
+
+            try entries.append(state.allocator, copy);
+        }
+
+        for (entries.items) |entry| {
+            const joined_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ if (entry.len == 0) "." else entry, name });
+            defer allocator.free(joined_path);
+
+            const candidate = try makeAbsoluteLibraryPath(allocator, joined_path);
+            errdefer allocator.free(candidate);
+
+            logger.debug("path.candidate: source=search_path path={s}", .{candidate});
+            if (isSupportedElfPath(candidate)) return candidate;
+
+            allocator.free(candidate);
+        }
+    }
+    return null;
+}
+
 /// Returns an owned path allocated with `allocator`. `check_mode` only changes
 /// missing-library diagnostics; every candidate is checked for supported ELF format.
-fn resolvePath(allocator: std.mem.Allocator, requested_path: []const u8, check_mode: bool, requester_name: ?[]const u8, runpath: ?[]const u8, origin_dir: ?[]const u8) ![]const u8 {
+fn resolvePath(allocator: std.mem.Allocator, requested_path: []const u8, check_mode: bool, search: LibrarySearchContext) ![]const u8 {
+    const requester_name = search.requester_name;
+    const runpath = search.runpath;
+    const origin_dir = search.origin_dir;
+    const rpath = search.rpath;
+
     logger.debug("path.search: request={s} requester={?s} runpath={?s} origin={?s} probe={}", .{ requested_path, requester_name, runpath, origin_dir, check_mode });
     var buf: [std.fs.max_path_bytes]u8 = @splat(0);
 
-    if (state.environ.getPosix("LD_LIBRARY_PATH")) |dir_list| {
-        var dirs_it = std.mem.splitScalar(u8, dir_list, ':');
-        while (dirs_it.next()) |dir| {
-            if (dir.len == 0) continue;
+    if (std.mem.findScalar(u8, requested_path, '/') != null) return makeAbsoluteLibraryPath(allocator, requested_path);
 
-            const a_path = if (std.mem.startsWith(u8, dir, "/")) try std.fmt.bufPrint(&buf, "{s}/{s}", .{ dir, requested_path }) else try std.fmt.bufPrint(&buf, "/{s}/{s}", .{ dir, requested_path });
-
-            logger.debug("path.candidate: source=LD_LIBRARY_PATH path={s}", .{a_path});
-            std.Io.Dir.accessAbsolute(state.io, a_path, .{ .read = true }) catch |err| {
-                logger.debug("path.candidate: path={s} result=unreadable error={t}", .{ a_path, err });
-                continue;
-            };
-            if (!isSupportedElfPath(a_path)) {
-                logger.debug("skipping unsupported library candidate {s}", .{a_path});
-                continue;
-            }
-
-            const path = try std.fmt.allocPrint(allocator, "{s}", .{a_path});
-            logger.debug("found {s} via LD_LIBRARY_PATH: {s}", .{ requested_path, path });
-            return path;
+    // A requester's RUNPATH suppresses the RPATH chain for this lookup only.
+    if (runpath == null) {
+        if (rpath) |dirs| {
+            if (try searchLibraryDirectories(allocator, requested_path, dirs, origin_dir, false)) |path| return path;
         }
+    }
+
+    if (state.environ.getPosix("LD_LIBRARY_PATH")) |dir_list| {
+        if (try searchLibraryDirectories(allocator, requested_path, dir_list, null, true)) |path| return path;
     }
 
     if (requester_name) |name| {
@@ -968,35 +1058,7 @@ fn resolvePath(allocator: std.mem.Allocator, requested_path: []const u8, check_m
     }
 
     if (runpath) |dir_list| {
-        var dirs_it = std.mem.splitScalar(u8, dir_list, ':');
-        while (dirs_it.next()) |dir| {
-            if (dir.len == 0) continue;
-
-            var candidates: std.ArrayList([]const u8) = .empty;
-            defer {
-                for (candidates.items) |candidate| state.allocator.free(candidate);
-                candidates.deinit(state.allocator);
-            }
-
-            try appendLdExpansions(&candidates, dir, origin_dir);
-            for (candidates.items) |candidate| {
-                const a_path = if (std.mem.startsWith(u8, candidate, "/")) try std.fmt.bufPrint(&buf, "{s}/{s}", .{ candidate, requested_path }) else try std.fmt.bufPrint(&buf, "{s}/{s}", .{ candidate, requested_path });
-
-                logger.debug("path.candidate: source=RUNPATH path={s}", .{a_path});
-                std.Io.Dir.accessAbsolute(state.io, a_path, .{ .read = true }) catch |err| {
-                    logger.debug("path.candidate: path={s} result=unreadable error={t}", .{ a_path, err });
-                    continue;
-                };
-                if (!isSupportedElfPath(a_path)) {
-                    logger.debug("skipping unsupported library candidate {s}", .{a_path});
-                    continue;
-                }
-
-                const path = try std.fmt.allocPrint(allocator, "{s}", .{a_path});
-                logger.debug("found {s} via RUNPATH: {s}", .{ requested_path, path });
-                return path;
-            }
-        }
+        if (try searchLibraryDirectories(allocator, requested_path, dir_list, origin_dir, true)) |path| return path;
     }
 
     const lib_dirs = [_][]const u8{
@@ -1046,23 +1108,18 @@ fn resolvePath(allocator: std.mem.Allocator, requested_path: []const u8, check_m
     return path orelse error.LibraryNotFound;
 }
 
-fn resolveDynObjectInfosByNameOrPath(name_or_path: []const u8, requester_name: ?[]const u8, runpath: ?[]const u8, origin_dir: ?[]const u8) !ResolvedDynObjectInfos {
+fn resolveDynObjectInfosByNameOrPath(name_or_path: []const u8, search: LibrarySearchContext) !ResolvedDynObjectInfos {
     const path: []const u8 = if (std.mem.findScalar(u8, name_or_path, '/') != null)
-        try state.allocator.dupe(u8, name_or_path)
+        try makeAbsoluteLibraryPath(state.allocator, name_or_path)
     else
-        try resolvePath(state.allocator, name_or_path, false, requester_name, runpath, origin_dir);
+        try resolvePath(state.allocator, name_or_path, false, search);
     errdefer state.allocator.free(path);
 
     const f = try std.Io.Dir.openFileAbsolute(state.io, path, .{ .mode = .read_only });
     defer f.close(state.io);
 
     const stat = try f.stat(state.io);
-    const size = std.math.cast(usize, stat.size) orelse return error.FileTooBig;
-    if (size < @sizeOf(std.elf.Elf64_Ehdr)) return error.NotAnElfFile;
-
-    var eh: std.elf.Elf64_Ehdr = undefined;
-    const read = try f.readPositional(state.io, &.{std.mem.asBytes(&eh)}, 0);
-    if (read != @sizeOf(std.elf.Elf64_Ehdr)) return error.NotAnElfFile;
+    const eh = try readIdentifiedElfHeader(f);
     try validateSupportedElfHeader(path, &eh);
 
     return .{
@@ -1127,6 +1184,21 @@ const RelocationTable = struct {
         return std.mem.bytesAsSlice(T, try DynObject.virtualFileRange(bytes, phdrs, address, size));
     }
 };
+
+fn identifyElfHeader(bytes: []const u8) !void {
+    if (bytes.len < std.elf.MAGIC.len or !std.mem.eql(u8, bytes[0..std.elf.MAGIC.len], std.elf.MAGIC)) return error.NotAnElfFile;
+    if (bytes.len <= std.elf.EI_CLASS) return error.InvalidElfFileRange;
+    if (bytes[std.elf.EI_CLASS] != std.elf.ELFCLASS64) return error.UnsupportedElfClass;
+    if (bytes.len < @sizeOf(std.elf.Elf64_Ehdr)) return error.InvalidElfFileRange;
+}
+
+fn readIdentifiedElfHeader(file: std.Io.File) !std.elf.Elf64_Ehdr {
+    var header: std.elf.Elf64_Ehdr = undefined;
+    const bytes = std.mem.asBytes(&header);
+    const read = try file.readPositional(state.io, &.{bytes}, 0);
+    try identifyElfHeader(bytes[0..read]);
+    return header;
+}
 
 fn checkSupportedElfHeader(eh: *const std.elf.Elf64_Ehdr) error{
     NotAnElfFile,
@@ -1283,11 +1355,11 @@ fn appendRelrTarget(relocs: *RelocList, phdrs: []align(1) const std.elf.Elf64.Ph
 /// Parses and maps one object when its dependencies are ready.
 /// May return successfully with `mapped_at == 0` if mapping is deferred.
 /// `loadDepTree` repeats the pass until all requested dependencies are mapped.
-fn loadDso(o_path: []const u8, root_runpath: ?[]const u8, root_origin_dir: ?[]const u8) !usize {
+fn loadDso(o_path: []const u8, search: LibrarySearchContext, ancestor_rpath: ?[]const u8) !usize {
     const path: []const u8 = if (std.mem.findScalar(u8, o_path, '/') != null)
-        try state.allocator.dupe(u8, o_path)
+        try makeAbsoluteLibraryPath(state.allocator, o_path)
     else
-        try resolvePath(state.allocator, o_path, false, null, root_runpath, root_origin_dir);
+        try resolvePath(state.allocator, o_path, false, search);
     defer state.allocator.free(path);
 
     const dyn_object_name = try state.allocator.dupe(u8, std.fs.path.basename(path));
@@ -1320,7 +1392,8 @@ fn loadDso(o_path: []const u8, root_runpath: ?[]const u8, root_origin_dir: ?[]co
         }
     }
 
-    if (size < @sizeOf(std.elf.Elf64_Ehdr)) return error.InvalidElfFileRange;
+    const initial_header = try readIdentifiedElfHeader(f);
+    try validateSupportedElfHeader(path, &initial_header);
 
     logger.debug("loading: {s} [{s}]", .{ o_path, path });
 
@@ -1361,7 +1434,11 @@ fn loadDso(o_path: []const u8, root_runpath: ?[]const u8, root_origin_dir: ?[]co
         const owned_path = try state.allocator.dupe(u8, path);
         errdefer state.allocator.free(owned_path);
 
+        const owned_ancestor_rpath = if (ancestor_rpath) |value| try state.allocator.dupe(u8, value) else null;
+        errdefer if (owned_ancestor_rpath) |value| state.allocator.free(value);
+
         try state.dyn_objects.putNoClobber(state.allocator, dyn_object_key, .init(dyn_object_key, owned_name, owned_path));
+        state.dyn_objects.getPtr(dyn_object_key).?.inherited_rpath = owned_ancestor_rpath;
     }
 
     logger.debug("elf type: {s}", .{@tagName(eh.e_type)});
@@ -1512,6 +1589,7 @@ fn loadDso(o_path: []const u8, root_runpath: ?[]const u8, root_origin_dir: ?[]co
     };
 
     var dyn_runpath: ?[]const u8 = null;
+    var dyn_rpath: ?[]const u8 = null;
     var ph_addr: usize = file_addr + eh.e_phoff;
     var dyn_addr: usize = undefined;
     var found_dynamic = false;
@@ -1541,9 +1619,14 @@ fn loadDso(o_path: []const u8, root_runpath: ?[]const u8, root_origin_dir: ?[]co
                     const runpath_z: [*:0]const u8 = @ptrFromInt(dyn_strtab_addr + dyns[runpath_scan_idx].d_val);
                     dyn_runpath = std.mem.span(runpath_z);
                     logger.debug("dep tree: found RUNPATH: {s} => {s}", .{ dyn_object_name, dyn_runpath.? });
-                    break;
+                } else if (dyns[runpath_scan_idx].d_tag == std.elf.DT_RPATH) {
+                    const rpath_z: [*:0]const u8 = @ptrFromInt(dyn_strtab_addr + dyns[runpath_scan_idx].d_val);
+                    dyn_rpath = std.mem.span(rpath_z);
                 }
             }
+
+            const search_rpath = try buildInheritedRpath(if (dyn_runpath == null) dyn_rpath else null, ancestor_rpath, std.fs.path.dirname(path) orelse "/");
+            defer if (search_rpath) |value| state.allocator.free(value);
 
             var has_unloaded_deps = false;
             var j: usize = 0;
@@ -1571,7 +1654,12 @@ fn loadDso(o_path: []const u8, root_runpath: ?[]const u8, root_origin_dir: ?[]co
                     }
 
                     const origin_dir = std.fs.path.dirname(path) orelse "/";
-                    const resolved_dep = resolveDynObjectInfosByNameOrPath(dep_name, dyn_object_name, dyn_runpath, origin_dir) catch |err| {
+                    const resolved_dep = resolveDynObjectInfosByNameOrPath(dep_name, .{
+                        .requester_name = dyn_object_name,
+                        .runpath = dyn_runpath,
+                        .origin_dir = origin_dir,
+                        .rpath = search_rpath,
+                    }) catch |err| {
                         logger.err("unresolved {s} dependency: {s}: {}", .{ dyn_object_name, dependency_name_z, err });
                         return err;
                     };
@@ -1585,7 +1673,11 @@ fn loadDso(o_path: []const u8, root_runpath: ?[]const u8, root_origin_dir: ?[]co
                         const owned_dep_name = try state.allocator.dupe(u8, dep_name);
                         errdefer state.allocator.free(owned_dep_name);
 
+                        const owned_ancestor_rpath = if (search_rpath) |value| try state.allocator.dupe(u8, value) else null;
+                        errdefer if (owned_ancestor_rpath) |value| state.allocator.free(value);
+
                         try state.dyn_objects.putNoClobber(state.allocator, resolved_dep.key, .init(resolved_dep.key, owned_dep_name, resolved_dep.path));
+                        state.dyn_objects.getPtr(resolved_dep.key).?.inherited_rpath = owned_ancestor_rpath;
                         resolved_dep_path = null;
 
                         logger.debug("dep tree: {s} loading deferred", .{dyn_object_name});
@@ -1596,6 +1688,13 @@ fn loadDso(o_path: []const u8, root_runpath: ?[]const u8, root_origin_dir: ?[]co
 
                         const dep = maybe_dep.?;
                         if (dep.finalizing) return error.LibraryFinalizing;
+                        if (!dep.load_requested and dep.mapped_at == 0) {
+                            // A retired slot can be reused by a different root.
+                            // Its old parent's RPATH must not influence this load.
+                            const inherited = if (search_rpath) |value| try state.allocator.dupe(u8, value) else null;
+                            if (dep.inherited_rpath) |value| state.allocator.free(value);
+                            dep.inherited_rpath = inherited;
+                        }
                         dep.load_requested = true;
                         if (dep.mapped_at != 0) {
                             logger.debug("dep tree: registering dependency: {s} => {s}", .{ dyn_object_name, dependency_name_z });
@@ -1980,11 +2079,19 @@ fn loadDso(o_path: []const u8, root_runpath: ?[]const u8, root_origin_dir: ?[]co
         const owned_runpath = if (dyn_runpath) |runpath| try state.allocator.dupe(u8, runpath) else null;
         errdefer if (owned_runpath) |runpath| state.allocator.free(runpath);
 
+        const owned_rpath = if (dyn_rpath) |value| try state.allocator.dupe(u8, value) else null;
+        errdefer if (owned_rpath) |value| state.allocator.free(value);
+
+        const owned_ancestor_rpath = if (ancestor_rpath) |value| try state.allocator.dupe(u8, value) else null;
+        errdefer if (owned_ancestor_rpath) |value| state.allocator.free(value);
+
         do_entry.value_ptr.* = .{
             .key = dyn_object_key,
             .name = owned_name,
             .path = owned_path,
             .runpath = owned_runpath,
+            .rpath = owned_rpath,
+            .inherited_rpath = owned_ancestor_rpath,
             .file_handle = f.handle,
             .mapped_at = file_addr,
             .mapped_size = file_bytes.len,
@@ -2056,6 +2163,8 @@ fn loadDso(o_path: []const u8, root_runpath: ?[]const u8, root_origin_dir: ?[]co
         current_dyn_object.dependencies.deinit(state.allocator);
         current_dyn_object.deps_breadth_first.deinit(state.allocator);
         current_dyn_object.segments.deinit(state.allocator);
+        if (current_dyn_object.rpath) |value| state.allocator.free(value);
+        if (current_dyn_object.inherited_rpath) |value| state.allocator.free(value);
 
         if (previous_dyn_object) |previous| {
             state.allocator.free(current_name);
@@ -2097,6 +2206,8 @@ fn loadDso(o_path: []const u8, root_runpath: ?[]const u8, root_origin_dir: ?[]co
         state.allocator.free(previous_to_free.name);
         state.allocator.free(previous_to_free.path);
         if (previous_to_free.runpath) |runpath| state.allocator.free(runpath);
+        if (previous_to_free.rpath) |value| state.allocator.free(value);
+        if (previous_to_free.inherited_rpath) |value| state.allocator.free(value);
     }
 
     dyn_object_installed = false;
@@ -2114,7 +2225,7 @@ fn mapSegments(dyn_object: *DynObject, file_bytes: []const u8) !void {
 
     for (dyn_object.segments.values()) |*segment| {
         std.debug.assert(segment.mem_align >= std.heap.pageSize() and segment.mem_align % std.heap.pageSize() == 0);
-        const aligned_mem_end = std.mem.alignForward(usize, segment.mem_offset + segment.mem_size, segment.mem_align);
+        const aligned_mem_end = std.mem.alignForward(usize, segment.mem_offset + segment.mem_size, std.heap.pageSize());
         mem_end = @max(mem_end, aligned_mem_end);
         max_align = @max(max_align, segment.mem_align);
     }
@@ -2197,10 +2308,13 @@ fn mapSegments(dyn_object: *DynObject, file_bytes: []const u8) !void {
             .EXEC = segment.flags_first.exec,
         };
 
-        const aligned_ptr: [*]align(std.heap.pageSize()) u8 = @ptrFromInt(std.mem.alignBackward(usize, base_addr + segment.mem_offset, segment.mem_align));
-        const aligned_end: usize = std.mem.alignForward(usize, base_addr + segment.mem_offset + segment.mem_size, segment.mem_align);
+        // p_align constrains the load bias, not the size of a mapping. Rounding
+        // to it here can overlap adjacent PT_LOADs with smaller alignments.
+        // The base already satisfies max_align; mmap boundaries use OS pages.
+        const aligned_ptr: [*]align(std.heap.pageSize()) u8 = @ptrFromInt(std.mem.alignBackward(usize, base_addr + segment.mem_offset, std.heap.pageSize()));
+        const aligned_end: usize = std.mem.alignForward(usize, base_addr + segment.mem_offset + segment.mem_size, std.heap.pageSize());
         const aligned_size = aligned_end - @intFromPtr(aligned_ptr);
-        const aligned_file_offset = std.mem.alignBackward(usize, segment.file_offset, segment.mem_align);
+        const aligned_file_offset = std.mem.alignBackward(usize, segment.file_offset, std.heap.pageSize());
 
         segment.loaded_at = base_addr + segment.mem_offset;
         segment.mapped_from_file = true;
@@ -2689,7 +2803,7 @@ fn processRelativeRelocationsFast(dyn_object: *DynObject) void {
 /// Applies eager symbol bindings after relative relocation. ELF arithmetic uses
 /// wrapping pointer-width operations: signed addends are preserved as bit patterns.
 /// TLS relocations use symbol offsets, whereas ordinary relocations use host addresses.
-fn processRelocations(dyn_object: *DynObject) !void {
+fn processRelocations(dyn_object: *DynObject, scope: []const usize) !void {
     logger.debug("processing relocations for {s}", .{dyn_object.name});
 
     var reloc_count: usize = 0;
@@ -2707,7 +2821,7 @@ fn processRelocations(dyn_object: *DynObject) !void {
             .@"64" => {
                 reloc_count += 1;
                 // R_X86_64_64: S + A
-                const sym = try resolveSymbol(dyn_object, reloc.sym_idx);
+                const sym = try resolveSymbolInScope(dyn_object, reloc.sym_idx, scope);
                 const value = r64_blk: {
                     if (reloc.addend != 0) break :r64_blk (try sym.getStaticAddress()) +% @as(usize, @bitCast(reloc.addend));
                     break :r64_blk if (try getSubstituteAddress(sym, dyn_object, true)) |a| a else try sym.getStaticAddress();
@@ -2718,7 +2832,7 @@ fn processRelocations(dyn_object: *DynObject) !void {
             .GLOB_DAT => {
                 reloc_count += 1;
                 // R_X86_64_GLOB_DAT: S
-                const sym = try resolveSymbol(dyn_object, reloc.sym_idx);
+                const sym = try resolveSymbolInScope(dyn_object, reloc.sym_idx, scope);
                 const value = if (try getSubstituteAddress(sym, dyn_object, true)) |a| a else try sym.getStaticAddress();
                 logger.debug("  GLOB_DAT: 0x{x} (0x{x}): 0x{x} -> 0x{x} (0x{x}, {s}@{s} + 0x{x})", .{ reloc_addr, reloc.offset, ptr.*, value, sym.value, sym.name, sym.version, reloc.addend });
                 ptr.* = value;
@@ -2726,7 +2840,7 @@ fn processRelocations(dyn_object: *DynObject) !void {
             .JUMP_SLOT => {
                 reloc_count += 1;
                 // R_X86_64_JUMP_SLOT: S
-                const sym = try resolveSymbol(dyn_object, reloc.sym_idx);
+                const sym = try resolveSymbolInScope(dyn_object, reloc.sym_idx, scope);
                 const value = if (try getSubstituteAddress(sym, dyn_object, true)) |a| a else try sym.getStaticAddress();
                 logger.debug("  JUMP_SLOT: 0x{x} (0x{x}): 0x{x} -> 0x{x} (0x{x}, {s}@{s} + 0x{x})", .{ reloc_addr, reloc.offset, ptr.*, value, sym.value, sym.name, sym.version, reloc.addend });
                 ptr.* = value;
@@ -2734,7 +2848,7 @@ fn processRelocations(dyn_object: *DynObject) !void {
             .TPOFF64 => {
                 reloc_count += 1;
                 // R_X86_64_TPOFF64: S + A (TLS offset)
-                const sym = try resolveSymbol(dyn_object, reloc.sym_idx);
+                const sym = try resolveSymbolInScope(dyn_object, reloc.sym_idx, scope);
                 const tls_offset = state.dyn_objects.values()[sym.dyn_object_idx].tls_offset;
                 const value = sym.value +% @as(usize, @bitCast(reloc.addend)) -% tls_offset;
                 logger.debug("  TPOFF64: 0x{x} (0x{x}): 0x{x} -> 0x{x} (0x{x}, {s}@{s} - [MODULE_TLS_OFFSET]0x{x} + 0x{x})", .{
@@ -2753,7 +2867,7 @@ fn processRelocations(dyn_object: *DynObject) !void {
             .DTPOFF64 => {
                 reloc_count += 1;
                 // R_X86_64_DTPOFF64: S + A
-                const sym = try resolveSymbol(dyn_object, reloc.sym_idx);
+                const sym = try resolveSymbolInScope(dyn_object, reloc.sym_idx, scope);
                 const value = sym.value +% @as(usize, @bitCast(reloc.addend));
                 logger.debug("  DTPOFF64: 0x{x} (0x{x}): 0x{x} -> 0x{x} (0x{x}, {s}@{s} + 0x{x})", .{
                     reloc_addr,
@@ -2770,7 +2884,7 @@ fn processRelocations(dyn_object: *DynObject) !void {
             .DTPMOD64 => {
                 reloc_count += 1;
                 // R_X86_64_DTPMOD64: S (TLS module ID)
-                const sym = try resolveSymbol(dyn_object, reloc.sym_idx);
+                const sym = try resolveSymbolInScope(dyn_object, reloc.sym_idx, scope);
                 const tls_module_id = state.dyn_objects.values()[sym.dyn_object_idx].tls_module_id.?.value;
                 const value = @as(isize, @intCast(tls_module_id));
                 logger.debug("  DTPMOD64: 0x{x} (0x{x}): 0x{x} -> 0x{x} (0x{x}, {s}@{s} => [MODULE_TLS_ID]0x{x})", .{
@@ -2788,7 +2902,7 @@ fn processRelocations(dyn_object: *DynObject) !void {
             .TLSDESC => {
                 reloc_count += 1;
                 // R_X86_64_TLSDESC: S + A (TLS offset)
-                const sym = try resolveSymbol(dyn_object, reloc.sym_idx);
+                const sym = try resolveSymbolInScope(dyn_object, reloc.sym_idx, scope);
                 const tls_offset = state.dyn_objects.values()[sym.dyn_object_idx].tls_offset;
                 const value: TlsDesc = .{
                     .tls_desc_resolver_arg = @bitCast(sym.value +% @as(usize, @bitCast(reloc.addend)) -% tls_offset),
@@ -2844,7 +2958,7 @@ fn processRelocations(dyn_object: *DynObject) !void {
             for (dyn_object.relocs.items) |r| {
                 if (r.offset == target_address) {
                     const sym = dyn_object.syms_array.items[r.sym_idx];
-                    const r_sym = try resolveSymbol(dyn_object, r.sym_idx);
+                    const r_sym = try resolveSymbolInScope(dyn_object, r.sym_idx, scope);
 
                     const substitute_addr = try getSubstituteAddress(r_sym, dyn_object, true);
                     if (substitute_addr == null) break;
@@ -3005,9 +3119,7 @@ fn resolveLibcRuntimeSymbol(sym_name: []const u8) !ResolvedSymbol {
 
                     if (dep_sym.type == .TLS) return makeTlsDefinition(dep_object, dep_sym_idx);
 
-                    const dep_sym_address = dep_sym.value;
-
-                    var dep_addr = try dep_object.virtualToLoadedAddress(dep_sym_address, false);
+                    var dep_addr = try dep_object.symbolToLoadedAddress(dep_sym);
                     if (state.ifunc_resolved_addrs.get(dep_addr)) |res_addr| {
                         dep_addr = res_addr;
                     }
@@ -3064,7 +3176,7 @@ fn getResolvedSymbolByName(maybe_dyn_object: ?*DynObject, sym_name: []const u8, 
                         if (dep_sym.type == .TLS) return lookupTlsSymbol(dep_object, dep_sym_idx, allow_preload_override);
 
                         const dep_sym_address = dep_sym.value;
-                        var dep_addr = try dep_object.virtualToLoadedAddress(dep_sym_address, false);
+                        var dep_addr = try dep_object.symbolToLoadedAddress(dep_sym);
 
                         if (state.ifunc_resolved_addrs.get(dep_addr)) |res_addr| {
                             logger.debug("ifunc address substitution: {s}: 0x{x} => 0x{x}", .{ dep_sym.name, dep_addr, res_addr });
@@ -3126,7 +3238,7 @@ fn getResolvedSymbolByName(maybe_dyn_object: ?*DynObject, sym_name: []const u8, 
                         if (dep_sym.type == .TLS) return lookupTlsSymbol(dep_object, dep_sym_idx, allow_preload_override);
 
                         const dep_sym_address = dep_sym.value;
-                        var dep_addr = try dep_object.virtualToLoadedAddress(dep_sym_address, false);
+                        var dep_addr = try dep_object.symbolToLoadedAddress(dep_sym);
 
                         if (state.ifunc_resolved_addrs.get(dep_addr)) |res_addr| {
                             logger.debug("ifunc address substitution: {s}: 0x{x} => 0x{x}", .{ dep_sym.name, dep_addr, res_addr });
@@ -3189,7 +3301,7 @@ fn getResolvedSymbolByName(maybe_dyn_object: ?*DynObject, sym_name: []const u8, 
                         if (dep_sym.type == .TLS) return lookupTlsSymbol(dep_object, dep_sym_idx, allow_preload_override);
 
                         const dep_sym_address = dep_sym.value;
-                        var dep_addr = try dep_object.virtualToLoadedAddress(dep_sym_address, false);
+                        var dep_addr = try dep_object.symbolToLoadedAddress(dep_sym);
 
                         if (state.ifunc_resolved_addrs.get(dep_addr)) |res_addr| {
                             logger.debug("ifunc address substitution: {s}: 0x{x} => 0x{x}", .{ dep_sym.name, dep_addr, res_addr });
@@ -3266,7 +3378,7 @@ fn getResolvedSymbolByNameAndVersion(maybe_dyn_object: ?*DynObject, sym_name: []
                         if (dep_sym.type == .TLS) return lookupTlsSymbol(dep_object, dep_sym_idx, allow_preload_override);
 
                         const dep_sym_address = dep_sym.value;
-                        var dep_addr = try dep_object.virtualToLoadedAddress(dep_sym_address, false);
+                        var dep_addr = try dep_object.symbolToLoadedAddress(dep_sym);
 
                         if (state.ifunc_resolved_addrs.get(dep_addr)) |res_addr| {
                             logger.debug("ifunc address substitution: {s}: 0x{x} => 0x{x}", .{ dep_sym.name, dep_addr, res_addr });
@@ -3328,7 +3440,7 @@ fn getResolvedSymbolByNameAndVersion(maybe_dyn_object: ?*DynObject, sym_name: []
                         if (dep_sym.type == .TLS) return lookupTlsSymbol(dep_object, dep_sym_idx, allow_preload_override);
 
                         const dep_sym_address = dep_sym.value;
-                        var dep_addr = try dep_object.virtualToLoadedAddress(dep_sym_address, false);
+                        var dep_addr = try dep_object.symbolToLoadedAddress(dep_sym);
 
                         if (state.ifunc_resolved_addrs.get(dep_addr)) |res_addr| {
                             logger.debug("ifunc address substitution: {s}: 0x{x} => 0x{x}", .{ dep_sym.name, dep_addr, res_addr });
@@ -3391,7 +3503,7 @@ fn getResolvedSymbolByNameAndVersion(maybe_dyn_object: ?*DynObject, sym_name: []
                         if (dep_sym.type == .TLS) return lookupTlsSymbol(dep_object, dep_sym_idx, allow_preload_override);
 
                         const dep_sym_address = dep_sym.value;
-                        var dep_addr = try dep_object.virtualToLoadedAddress(dep_sym_address, false);
+                        var dep_addr = try dep_object.symbolToLoadedAddress(dep_sym);
 
                         if (state.ifunc_resolved_addrs.get(dep_addr)) |res_addr| {
                             logger.debug("ifunc address substitution: {s}: 0x{x} => 0x{x}", .{ dep_sym.name, dep_addr, res_addr });
@@ -3440,28 +3552,43 @@ fn getResolvedSymbolByNameAndVersion(maybe_dyn_object: ?*DynObject, sym_name: []
     return error.UnresolvedSymbol;
 }
 
-/// A relocation binding from this object or its declared dependencies.
+/// A relocation binding from this object or the load group's lookup scope.
 /// Records whether a resolver or cache redirected the result. A redirected
 /// address may require retaining an owner outside the declared dependencies.
 const ResolvedBinding = struct {
     symbol: ResolvedSymbol,
-    provenance: enum { declared_scope, redirected_address, unresolved_weak },
+    provenance: enum { definition, redirected_address, unresolved_weak },
 };
 
 // TODO test and complete scope/preemption, default-version selection, visibility,
 // binding, and absolute-symbol semantics across lookup and relocation paths.
-fn resolveSymbol(dyn_object: *DynObject, sym_idx: usize) !ResolvedSymbol {
-    const binding = try resolveSymbolInner(dyn_object, sym_idx);
+fn resolveSymbolInScope(dyn_object: *DynObject, sym_idx: usize, scope: []const usize) !ResolvedSymbol {
+    const binding = try resolveSymbolInner(dyn_object, sym_idx, scope);
     const sym = binding.symbol;
     logger.debug("symbol.bind: requester={s} symbol={s} version={s} provider_index={d} symbol_value=0x{x} location={any}", .{ dyn_object.name, sym.name, sym.version, sym.dyn_object_idx, sym.value, sym.location });
 
-    // Ordinary definitions come from self or the declared dependency closure,
-    // which unloading already follows. Only redirected addresses need an owner.
+    // A group member can bind to its parent or sibling. Keep the defining
+    // provider alive even for TLS or a zero-sized endpoint (neither is reliably
+    // identifiable by searching for a mapped host address).
     switch (binding.provenance) {
-        .declared_scope, .unresolved_weak => {},
-        .redirected_address => try recordBindingDependency(dyn_object, try sym.getStaticAddress(), sym.dyn_object_idx),
+        .definition => try recordSymbolProvider(dyn_object, sym.dyn_object_idx),
+        .redirected_address => {
+            try recordSymbolProvider(dyn_object, sym.dyn_object_idx);
+            // IFUNCs may additionally return an address owned by another object.
+            try recordBindingDependency(dyn_object, try sym.getStaticAddress(), sym.dyn_object_idx);
+        },
+        .unresolved_weak => {},
     }
+
     return sym;
+}
+
+fn recordSymbolProvider(dyn_object: *DynObject, provider_index: usize) !void {
+    if (std.mem.findScalar(usize, dyn_object.deps_breadth_first.items, provider_index) == null and
+        std.mem.findScalar(usize, dyn_object.binding_dependencies.items, provider_index) == null)
+    {
+        try dyn_object.binding_dependencies.append(state.allocator, provider_index);
+    }
 }
 
 /// Adds a lifetime edge only when the address owner is outside the requester's
@@ -3489,7 +3616,7 @@ fn recordBindingDependency(dyn_object: *DynObject, address: usize, provider_hint
     }
 }
 
-fn resolveSymbolInner(dyn_object: *DynObject, sym_idx: usize) !ResolvedBinding {
+fn resolveSymbolInner(dyn_object: *DynObject, sym_idx: usize, scope: []const usize) !ResolvedBinding {
     if (sym_idx >= dyn_object.syms_array.items.len) return error.InvalidSymbolIndex;
 
     const sym = dyn_object.syms_array.items[sym_idx];
@@ -3505,12 +3632,12 @@ fn resolveSymbolInner(dyn_object: *DynObject, sym_idx: usize) !ResolvedBinding {
 
         if (sym.type == .TLS) return .{
             .symbol = makeTlsDefinition(dyn_object, sym_idx),
-            .provenance = .declared_scope,
+            .provenance = .definition,
         };
 
         const sym_address = sym.value;
 
-        var addr = try dyn_object.virtualToLoadedAddress(sym_address, false);
+        var addr = try dyn_object.symbolToLoadedAddress(sym);
         var address_redirected = false;
 
         if (state.ifunc_resolved_addrs.get(addr)) |res_addr| {
@@ -3541,11 +3668,11 @@ fn resolveSymbolInner(dyn_object: *DynObject, sym_idx: usize) !ResolvedBinding {
                 .dyn_object_idx = state.dyn_objects.getIndex(dyn_object.key).?,
                 .sym_idx = sym_idx,
             },
-            .provenance = if (address_redirected) .redirected_address else .declared_scope,
+            .provenance = if (address_redirected) .redirected_address else .definition,
         };
     }
 
-    for (dyn_object.deps_breadth_first.items) |dep_idx| {
+    for (scope) |dep_idx| {
         const dep_object = &state.dyn_objects.values()[dep_idx];
 
         if (std.mem.eql(u8, dep_object.name, dyn_object.name)) {
@@ -3570,12 +3697,12 @@ fn resolveSymbolInner(dyn_object: *DynObject, sym_idx: usize) !ResolvedBinding {
 
                     if (dep_sym.type == .TLS) return .{
                         .symbol = makeTlsDefinition(dep_object, dep_sym_idx),
-                        .provenance = .declared_scope,
+                        .provenance = .definition,
                     };
 
                     const dep_sym_address = dep_sym.value;
 
-                    var dep_addr = try dep_object.virtualToLoadedAddress(dep_sym_address, false);
+                    var dep_addr = try dep_object.symbolToLoadedAddress(dep_sym);
                     var address_redirected = false;
 
                     if (state.ifunc_resolved_addrs.get(dep_addr)) |res_addr| {
@@ -3606,7 +3733,7 @@ fn resolveSymbolInner(dyn_object: *DynObject, sym_idx: usize) !ResolvedBinding {
                             .dyn_object_idx = dep_idx,
                             .sym_idx = dep_sym_idx,
                         },
-                        .provenance = if (address_redirected) .redirected_address else .declared_scope,
+                        .provenance = if (address_redirected) .redirected_address else .definition,
                     };
                 }
 
@@ -3640,7 +3767,7 @@ fn resolveSymbolInner(dyn_object: *DynObject, sym_idx: usize) !ResolvedBinding {
     logger.err("symbol.bind: requester={s} symbol={s} version={s} result=unresolved", .{ dyn_object.name, sym.name, sym.version });
     if (logger.level != .none) {
         logger.err("searched:", .{});
-        for (dyn_object.deps_breadth_first.items) |dep_idx| {
+        for (scope) |dep_idx| {
             const dep_object = &state.dyn_objects.values()[dep_idx];
             logger.err("  - {s}", .{dep_object.name});
         }
@@ -3650,7 +3777,7 @@ fn resolveSymbolInner(dyn_object: *DynObject, sym_idx: usize) !ResolvedBinding {
 
 fn findDynObjectIndexByName(name: []const u8) ?usize {
     for (state.dyn_objects.values(), 0..) |dyn_object, dyn_object_idx| {
-        if (std.mem.eql(u8, name, dyn_object.name)) return dyn_object_idx;
+        if ((dyn_object.mapped_at != 0 or dyn_object.load_requested) and std.mem.eql(u8, name, dyn_object.name)) return dyn_object_idx;
     }
 
     return null;
@@ -4622,10 +4749,17 @@ fn dlopenSubstitute(path: ?[*:0]const u8, flags: c_int) callconv(.c) ?*anyopaque
 
     var caller_runpath: ?[]const u8 = null;
     var caller_origin_dir: ?[]const u8 = null;
+    var caller_rpath: ?[]const u8 = null;
+    defer if (caller_rpath) |value| state.allocator.free(value);
     if (findDynObjectForLoadedAddr(caller_addr)) |caller_result| {
         const caller = &state.dyn_objects.values()[caller_result.dyn_object_index];
         caller_runpath = caller.runpath;
         caller_origin_dir = std.fs.path.dirname(caller.path) orelse "/";
+        caller_rpath = buildInheritedRpath(if (caller.runpath == null) caller.rpath else null, caller.inherited_rpath, caller_origin_dir.?) catch |err| {
+            last_dl_error = formatDlError("unable to prepare library search: {}", .{err});
+            dlerror_cleared = false;
+            return null;
+        };
         logger.debug("dlopen caller: {s} at 0x{x}", .{ caller.name, caller_addr });
     } else {
         logger.debug("dlopen caller at 0x{x} is not a dynamically loaded object", .{caller_addr});
@@ -4634,7 +4768,11 @@ fn dlopenSubstitute(path: ?[*:0]const u8, flags: c_int) callconv(.c) ?*anyopaque
     const loaded = if ((flags & rtld_flags.noload) != 0)
         acquireResidentLibrary(requested_path)
     else
-        loadWithRootResolveContext(requested_path, caller_runpath, caller_origin_dir, .native);
+        loadWithRootResolveContext(requested_path, .{
+            .runpath = caller_runpath,
+            .origin_dir = caller_origin_dir,
+            .rpath = caller_rpath,
+        }, .native);
     const lib = loaded catch |err| {
         if ((flags & rtld_flags.noload) == 0) {
             last_dl_error = formatDlError("unable to load library {s}: {}", .{ requested_path, err });
@@ -4989,7 +5127,7 @@ fn dladdrSubstitute(addr: *anyopaque, dl_info: *DlInfo) callconv(.c) c_int {
 
     if (infos.sym_index) |sidx| {
         const sym = infos.dyn_object.syms_array.items[sidx];
-        const sym_addr = infos.dyn_object.virtualToLoadedAddress(sym.value, false) catch unreachable;
+        const sym_addr = infos.dyn_object.symbolToLoadedAddress(sym) catch unreachable;
 
         const owned_sym_name = retainDiagnosticString(sym.name) catch {
             last_dl_error = formatDlError("dladdr: out of memory", .{});
@@ -5057,7 +5195,7 @@ fn dladdr1Substitute(addr: *anyopaque, dl_info: *DlInfo, extra_infos: *anyopaque
 
     if (infos.sym_index) |sidx| {
         const sym = infos.dyn_object.syms_array.items[sidx];
-        const sym_addr = infos.dyn_object.virtualToLoadedAddress(sym.value, false) catch unreachable;
+        const sym_addr = infos.dyn_object.symbolToLoadedAddress(sym) catch unreachable;
 
         const owned_sym_name = retainDiagnosticString(sym.name) catch {
             last_dl_error = formatDlError("dladdr1: out of memory", .{});
@@ -6234,6 +6372,11 @@ const ReallocationTestAllocator = struct {
         self.lengths[index] = 0;
     }
 };
+
+// Resolver unit tests use the requester's own dependency closure as their scope.
+fn resolveSymbol(dyn_object: *DynObject, sym_idx: usize) !ResolvedSymbol {
+    return resolveSymbolInScope(dyn_object, sym_idx, dyn_object.deps_breadth_first.items);
+}
 
 test {
     _ = @import("CustomSelfInfo.zig");

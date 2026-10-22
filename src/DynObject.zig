@@ -193,6 +193,8 @@ key: DynObjectId,
 name: []const u8,
 path: []const u8,
 runpath: ?[]const u8,
+rpath: ?[]const u8,
+inherited_rpath: ?[]const u8,
 file_handle: i32,
 mapped_at: usize,
 mapped_size: usize,
@@ -267,6 +269,8 @@ pub fn init(key: DynObjectId, name: []const u8, path: []const u8) DynObject {
         .name = name,
         .path = path,
         .runpath = null,
+        .rpath = null,
+        .inherited_rpath = null,
         .file_handle = -1,
         .mapped_at = 0,
         .mapped_size = 0,
@@ -344,6 +348,23 @@ pub fn virtualToLoadedAddress(self: *const DynObject, virtual_address: usize, al
 
     logger.debug("address.translate: object={s} address_elf=0x{x} action=allow_outside_mapped_segments base_host=0x{x}", .{ self.name, virtual_address, self.loaded_at.? });
     return self.loaded_at.? + virtual_address;
+}
+
+/// Resolves a section-relative, non-TLS symbol without dereferencing it.
+/// Zero-sized data/NOTYPE markers (such as `_end`) may denote the exclusive
+/// segment end. Memory accesses still use the strict address/range helpers.
+pub fn symbolToLoadedAddress(self: *const DynObject, symbol: DynSym) !usize {
+    if (symbol.size == 0 and (symbol.type == .NOTYPE or symbol.type == .OBJECT) and
+        symbol.shidx != std.elf.SHN_UNDEF and symbol.shidx < std.elf.SHN_LORESERVE)
+    {
+        for (self.segments.values()) |segment| {
+            if (symbol.value >= segment.mem_offset and symbol.value - segment.mem_offset == segment.mem_size) {
+                return std.math.add(usize, segment.loaded_at, segment.mem_size);
+            }
+        }
+    }
+
+    return self.virtualToLoadedAddress(symbol.value, false);
 }
 
 /// Returns a host address in the original file mapping, not the loaded image.
@@ -500,4 +521,42 @@ pub fn virtualFileRange(bytes: []const u8, headers: []align(1) const std.elf.Elf
     }
 
     return error.AddressNotInFileSegments;
+}
+
+test "zero-sized symbol endpoints do not permit out-of-segment memory accesses" {
+    const previous_log_level = logger.level;
+    logger.level = .none;
+    defer logger.level = previous_log_level;
+
+    var object = DynObject.init(.{ .ino = 1 }, "boundary", "boundary");
+    defer object.segments.deinit(std.testing.allocator);
+
+    var segment = std.mem.zeroes(LoadSegment);
+    segment.mem_offset = 0x100;
+    segment.mem_size = 0x20;
+    segment.loaded_at = 0x2100;
+    segment.flags_first.read = true;
+    try object.segments.put(std.testing.allocator, segment.mem_offset, segment);
+
+    var symbol = std.mem.zeroes(DynSym);
+    symbol.type = .NOTYPE;
+    symbol.shidx = 1;
+    symbol.value = 0x120;
+    try std.testing.expectEqual(@as(usize, 0x2120), try object.symbolToLoadedAddress(symbol));
+
+    symbol.type = .OBJECT;
+    try std.testing.expectEqual(@as(usize, 0x2120), try object.symbolToLoadedAddress(symbol));
+    try std.testing.expectError(error.AddressNotInMappedSegments, object.virtualToLoadedAddress(symbol.value, false));
+    try std.testing.expectError(error.InvalidDataAddress, object.mappedDataAddress(symbol.value, 1));
+
+    symbol.size = 1;
+    try std.testing.expectError(error.AddressNotInMappedSegments, object.symbolToLoadedAddress(symbol));
+
+    symbol.size = 0;
+    symbol.value += 1;
+    try std.testing.expectError(error.AddressNotInMappedSegments, object.symbolToLoadedAddress(symbol));
+
+    symbol.value -= 1;
+    symbol.type = .GNU_IFUNC;
+    try std.testing.expectError(error.AddressNotInMappedSegments, object.symbolToLoadedAddress(symbol));
 }

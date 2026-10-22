@@ -16,6 +16,7 @@ const fork_scope = @import("specifics/fork_scope.zig");
 const control = @import("control.zig");
 const resolver_context = @import("specifics/resolver_context.zig");
 const nodelete = @import("specifics/nodelete.zig");
+const relocation_scope = @import("specifics/relocation_scope.zig");
 
 pub const runThreadContractChild = contract_failures.runChild;
 pub fn onLoaderEvent(event: anytype) error{InjectedFailure}!void {
@@ -67,6 +68,13 @@ const mutated_state: LibraryState = .{
 };
 
 pub const cases: []const runner.Case = &.{
+    .{
+        .name = "relocation-load-group",
+        .bridge = "bridge.so",
+        .bridge_symbols = bridge_symbols,
+        .library = "scope_driver.so",
+        .behavior = .{ .specific = .{ .run = &relocation_scope.run } },
+    },
     .{
         .name = "nodelete-elf",
         .bridge = "bridge.so",

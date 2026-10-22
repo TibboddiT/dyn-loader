@@ -1,3 +1,4 @@
 .zig-cache
 zig-out
 .tests-matrix/
+.local-tests/

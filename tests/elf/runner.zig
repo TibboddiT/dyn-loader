@@ -8,23 +8,28 @@ const elf = std.elf;
 const dyn_loader = @import("dyn_loader");
 
 pub const Library = enum {
+    identity,
     non_identity,
     relr,
     plt_only,
     relative_addends,
+    symbol_boundaries,
 
     fn fileName(library: Library) []const u8 {
         return switch (library) {
+            .identity => "target.so",
             .non_identity => "layout.so",
             .relr => "relr.so",
             .plt_only => "plt_only.so",
             .relative_addends => "relative_addends.so",
+            .symbol_boundaries => "symbol_boundaries.so",
         };
     }
 };
 
 pub const Mutation = union(enum) {
     none,
+    first_load_alignment: u64,
     tag_value: struct {
         tag: u64,
         value: u64,
@@ -48,6 +53,8 @@ pub const Mutation = union(enum) {
 
 pub const Case = struct {
     name: []const u8,
+    /// Complete input for identification tests that cannot form a valid ElfImage.
+    contents: ?[]const u8 = null,
     library: Library = .non_identity,
     mutation: Mutation = .none,
     expect: Expectation,
@@ -142,6 +149,7 @@ pub fn unavailableReason(init: std.process.Init, case: Case, resources_dir: []co
 
 pub fn validate(init: std.process.Init, cases: []const Case, resources_dir: []const u8) !void {
     for (cases) |case| {
+        if (case.contents != null) continue;
         if (try unavailableReason(init, case, resources_dir) != null) continue;
 
         const path = try std.fs.path.join(init.gpa, &.{ resources_dir, case.library.fileName() });
@@ -172,13 +180,17 @@ pub fn runCase(init: std.process.Init, cases: []const Case, name: []const u8, re
     const path = try std.fs.path.join(init.gpa, &.{ resources_dir, case.library.fileName() });
     defer init.gpa.free(path);
 
-    const bytes = try std.Io.Dir.cwd().readFileAlloc(init.io, path, init.gpa, .limited(4 * 1024 * 1024));
+    const bytes = if (case.contents) |contents|
+        try init.gpa.dupe(u8, contents)
+    else
+        try std.Io.Dir.cwd().readFileAlloc(init.io, path, init.gpa, .limited(4 * 1024 * 1024));
     defer init.gpa.free(bytes);
 
-    const image = try ElfImage.init(bytes);
-
-    try image.checkLayout(case.library);
-    try image.mutate(case.mutation);
+    if (case.contents == null) {
+        const image = try ElfImage.init(bytes);
+        try image.checkLayout(case.library);
+        try image.mutate(case.mutation);
+    }
 
     const mutated_path = try std.fmt.allocPrint(init.gpa, "{s}/{s}.so", .{ temporary_dir, case.name });
     defer init.gpa.free(mutated_path);
@@ -323,6 +335,17 @@ const ElfImage = struct {
 
     fn checkLayout(image: ElfImage, library: Library) !void {
         switch (library) {
+            .symbol_boundaries => {
+                const end = try image.symbolValue("_end");
+
+                var memory_end: u64 = 0;
+                for (try image.programHeaders()) |header| {
+                    if (header.type == .LOAD) memory_end = @max(memory_end, header.vaddr + header.memsz);
+                }
+
+                try std.testing.expectEqual(memory_end, end);
+            },
+            .identity => {},
             .non_identity => {
                 const address = (try image.tag(elf.DT_RELA)).d_val;
                 try std.testing.expect((try image.fileOffsetForAddress(address)) > address);
@@ -363,6 +386,18 @@ const ElfImage = struct {
     fn mutate(image: ElfImage, mutation: Mutation) !void {
         switch (mutation) {
             .none => {},
+            .first_load_alignment => |alignment| {
+                for (try image.programHeaders()) |*header| {
+                    if (header.type != .LOAD) continue;
+
+                    // Increasing p_align must preserve the ELF congruence rule.
+                    try std.testing.expectEqual(header.offset % alignment, header.vaddr % alignment);
+
+                    header.@"align" = alignment;
+                    return;
+                }
+                return error.MissingReferenceLoadSegment;
+            },
             .tag_value => |value| (try image.tag(value.tag)).d_val = value.value,
             // Use a harmless ignored tag, not `DT_NULL`, which would hide all
             // following entries and test a different failure condition.
