@@ -38,6 +38,7 @@ const caller_saved_registers = [_]u4{ Register.rax, Register.rcx, Register.rdx, 
 /// - `address`: ELF address `a`; `global`: `load(a)`.
 /// - `global_address`: `load(a) + b`; `global_field`: `load(load(a) + b)`.
 /// - `indirect_address`: `load(load(a) + b) + c`.
+/// - `indirect_field`: `load(load(load(a) + b) + c)`.
 /// - `sum`: fields at offsets `b` and `c` from `load(a)`, added with `bias`.
 /// - `thread`: current thread pointer; `thread_address`: that pointer plus `b`;
 ///   `thread_field`: contents at that offset.
@@ -56,6 +57,7 @@ pub const Value = struct {
         global_address,
         global_field,
         indirect_address,
+        indirect_field,
         sum,
         thread,
         stack,
@@ -280,6 +282,9 @@ pub const Options = struct {
     /// volatile argument facts as well, to avoid attributing stale arguments to
     /// a subsequent call when no callee argument contract is available.
     preserve_syscall_arguments: bool = false,
+    /// Treats indirect jumps with the entry stack restored as tail exits.
+    /// The caller must validate their targets from the resulting node states.
+    allow_indirect_tail_exits: bool = false,
     log_errors: bool = true,
 };
 
@@ -339,7 +344,10 @@ pub fn initWithOptions(allocator: std.mem.Allocator, code: CodeView, options: Op
         // Calls are not followed into their callees. Branches add successors;
         // an external conditional edge needs the backend's explicit proof.
         if (instruction.op == .branch or instruction.op == .jump) {
-            const target = instruction.target orelse return error.UnsupportedIndirectBranch;
+            const target = instruction.target orelse {
+                if (instruction.op == .jump and options.allow_indirect_tail_exits) continue;
+                return error.UnsupportedIndirectBranch;
+            };
             if (target >= code.address and target < code.address + code.bytes.len) {
                 try pending.append(allocator, target - code.address);
             } else if (instruction.op == .branch and std.mem.indexOfScalar(?usize, &self.options.external_exits, target) == null) {
@@ -390,7 +398,10 @@ pub fn initWithOptions(allocator: std.mem.Allocator, code: CodeView, options: Op
 
             const instruction = node.instruction;
             if (instruction.op == .branch or instruction.op == .jump) {
-                const target = instruction.target orelse return error.UnsupportedIndirectBranch;
+                const target = instruction.target orelse {
+                    if (instruction.op == .jump and options.allow_indirect_tail_exits) continue;
+                    return error.UnsupportedIndirectBranch;
+                };
                 if (target >= code.address and target < code.address + code.bytes.len) {
                     const destination_index = self.indexAt(target - code.address) orelse return error.InvalidInstructionBranch;
                     changed = self.propagate(destination_index, &state) or changed;
@@ -401,6 +412,13 @@ pub fn initWithOptions(allocator: std.mem.Allocator, code: CodeView, options: Op
             if (instruction.op != .ret and instruction.op != .jump and !self.noReturn(instruction) and index + 1 < self.nodes.items.len) {
                 changed = self.propagate(index + 1, &state) or changed;
             }
+        }
+    }
+
+    if (options.allow_indirect_tail_exits) {
+        for (self.nodes.items) |node| {
+            if (node.instruction.op != .jump or node.instruction.target != null) continue;
+            if (!node.state.registers[Register.rsp].is(.stack, 0)) return error.UnsupportedIndirectBranch;
         }
     }
 
@@ -518,7 +536,7 @@ fn address(self: Self, state: *const State, instruction: Instruction, memory: Me
             .address, .stack => v.a = std.math.add(i64, v.a, displacement) catch return .{},
             .thread_address, .call_address, .global_address => v.b = std.math.add(i64, v.b, displacement) catch return .{},
             .sum => v.bias = std.math.add(i64, v.bias, displacement) catch return .{},
-            .unknown, .constant, .range, .indirect_address, .thread_field, .call_field => return .{},
+            .unknown, .constant, .range, .indirect_address, .indirect_field, .thread_field, .call_field => return .{},
         }
         return v;
     }
@@ -546,8 +564,9 @@ fn read(self: Self, state: *const State, instruction: Instruction, operand: Oper
                 .stack => if (instruction.width == 64) state.stackValue(location.a) else .{},
                 .thread_address => .{ .kind = .thread_field, .b = location.b, .bits = if (instruction.width == 64) 0 else instruction.width },
                 .global_address => .{ .kind = .global_field, .a = location.a, .b = location.b, .bits = if (instruction.width == 64) 0 else instruction.width },
+                .indirect_address => .{ .kind = .indirect_field, .a = location.a, .b = location.b, .c = location.c, .bits = if (instruction.width == 64) 0 else instruction.width },
                 .call_address => .{ .kind = .call_field, .a = location.a, .b = location.b },
-                .unknown, .constant, .range, .global, .global_field, .indirect_address, .sum, .thread, .call, .thread_field, .call_field => .{},
+                .unknown, .constant, .range, .global, .global_field, .indirect_field, .sum, .thread, .call, .thread_field, .call_field => .{},
             };
         },
     };

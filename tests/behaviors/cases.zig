@@ -17,6 +17,8 @@ const control = @import("control.zig");
 const resolver_context = @import("specifics/resolver_context.zig");
 const nodelete = @import("specifics/nodelete.zig");
 const relocation_scope = @import("specifics/relocation_scope.zig");
+const iconv = @import("specifics/iconv.zig");
+const constructor_nested = @import("specifics/constructor_nested.zig");
 
 pub const runThreadContractChild = contract_failures.runChild;
 pub fn onLoaderEvent(event: anytype) error{InjectedFailure}!void {
@@ -68,6 +70,27 @@ const mutated_state: LibraryState = .{
 };
 
 pub const cases: []const runner.Case = &.{
+    .{
+        .name = "iconv-conversion",
+        .bridge = "bridge.so",
+        .bridge_symbols = bridge_symbols,
+        .library = "bridge.so",
+        .behavior = .{ .specific = .{ .run = &iconv.run } },
+    },
+    .{
+        .name = "constructor-iconv",
+        .bridge = "bridge.so",
+        .bridge_symbols = bridge_symbols,
+        .library = "constructor_iconv.so",
+        .behavior = .{ .specific = .{ .run = &iconv.runConstructor } },
+    },
+    .{
+        .name = "constructor-nested-loading",
+        .bridge = "bridge.so",
+        .bridge_symbols = bridge_symbols,
+        .library = "constructor_nested.so",
+        .behavior = .{ .specific = .{ .run = &constructor_nested.run } },
+    },
     .{
         .name = "relocation-load-group",
         .bridge = "bridge.so",

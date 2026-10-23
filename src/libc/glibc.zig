@@ -19,6 +19,32 @@ const resolveEntryJump = common.resolveEntryJump;
 
 pub const system_libc_names = [_][]const u8{"libc.so.6"};
 
+/// glibc's static-dlopen bridge. Handles belong to the outer loader.
+/// https://github.com/bminor/glibc/blob/glibc-2.34/include/dlfcn.h
+const DlfcnHooks = extern struct {
+    dlopen: *const fn (path: ?[*:0]const u8, flags: c_int, caller: usize) callconv(.c) ?*anyopaque,
+    dlclose: *const fn (handle: *anyopaque) callconv(.c) c_int,
+    dlsym: *const fn (handle: ?*anyopaque, name: [*:0]const u8, caller: usize) callconv(.c) ?*anyopaque,
+    dlvsym: *const fn (handle: ?*anyopaque, name: [*:0]const u8, version: [*:0]const u8, caller: usize) callconv(.c) ?*anyopaque,
+    dlerror: *const fn () callconv(.c) ?[*:0]const u8,
+    dladdr: *const fn (address: *anyopaque, info: *anyopaque) callconv(.c) c_int,
+    dladdr1: *const fn (address: *anyopaque, info: *anyopaque, extra: *anyopaque, flags: c_int) callconv(.c) c_int,
+    dlinfo: *const fn (handle: *anyopaque, request: c_int, info: *anyopaque) callconv(.c) c_int,
+    dlmopen: *const fn (namespace: c_long, path: ?[*:0]u8, flags: c_int, caller: usize) callconv(.c) ?*anyopaque,
+    libc_dlopen_mode: *const fn (path: ?[*:0]const u8, flags: c_int) callconv(.c) ?*anyopaque,
+    libc_dlsym: *const fn (handle: ?*anyopaque, name: [*:0]const u8) callconv(.c) ?*anyopaque,
+    libc_dlvsym: *const fn (handle: ?*anyopaque, name: [*:0]const u8, version: [*:0]const u8) callconv(.c) ?*anyopaque,
+    libc_dlclose: *const fn (handle: *anyopaque) callconv(.c) c_int,
+};
+
+// Before glibc 2.34, libc's private entry points use a separate table.
+const LegacyDlHooks = extern struct {
+    dlopen_mode: @FieldType(DlfcnHooks, "libc_dlopen_mode"),
+    dlsym: @FieldType(DlfcnHooks, "libc_dlsym"),
+    dlclose: @FieldType(DlfcnHooks, "libc_dlclose"),
+    dlvsym: @FieldType(DlfcnHooks, "libc_dlvsym"),
+};
+
 // Runtime discovery and lifecycle callbacks.
 // ------------------------------------------
 
@@ -36,6 +62,8 @@ const State = struct {
     threads: ?GlibcThreadLayout,
     earlyInit: ?*const fn (initial: bool) callconv(.c) void,
     initCtype: ?*const fn () callconv(.c) void,
+    dl_hooks: LegacyDlHooks,
+    dlfcn_hooks: DlfcnHooks,
 };
 
 const vtable: common.VTable = .{
@@ -116,6 +144,27 @@ pub fn create(services: *const Services, allocator: std.mem.Allocator, object: *
         .threads = threads,
         .earlyInit = if (early_init) |symbol| @ptrFromInt(try symbol.getStaticAddress()) else null,
         .initCtype = if (ctype_init) |symbol| @ptrFromInt(try symbol.getStaticAddress()) else null,
+        .dl_hooks = .{
+            .dlopen_mode = services.dynamic_loading.openInternal,
+            .dlsym = services.dynamic_loading.lookupInternal,
+            .dlclose = services.dynamic_loading.closeInternal,
+            .dlvsym = services.dynamic_loading.lookupVersionInternal,
+        },
+        .dlfcn_hooks = .{
+            .dlopen = services.dynamic_loading.open,
+            .dlclose = services.dynamic_loading.close,
+            .dlsym = services.dynamic_loading.lookup,
+            .dlvsym = services.dynamic_loading.lookupVersion,
+            .dlerror = services.dynamic_loading.getError,
+            .dladdr = services.dynamic_loading.address,
+            .dladdr1 = services.dynamic_loading.addressExtra,
+            .dlinfo = services.dynamic_loading.info,
+            .dlmopen = services.dynamic_loading.openNamespace,
+            .libc_dlopen_mode = services.dynamic_loading.openInternal,
+            .libc_dlsym = services.dynamic_loading.lookupInternal,
+            .libc_dlvsym = services.dynamic_loading.lookupVersionInternal,
+            .libc_dlclose = services.dynamic_loading.closeInternal,
+        },
     };
 
     var runtime = common.Runtime.init(allocator, .{
@@ -126,7 +175,78 @@ pub fn create(services: *const Services, allocator: std.mem.Allocator, object: *
     });
     errdefer runtime.write_ops.deinit(allocator);
     try appendWritePlan(&runtime, layout);
+    capability = "dynamic_loading_hooks";
+    try appendDlHookWrites(&runtime, object, layout.rtld_mapped_address);
     return runtime;
+}
+
+/// Installs the bridge used by libc's hidden dl entry points, including gconv.
+/// No native link_map is exposed: all four private operations use our handles.
+fn appendDlHookWrites(runtime: *common.Runtime, object: *DynObject, rtld_address: usize) !void {
+    const services = runtime.services;
+    if (try findLibcSymbol(services, object, "_dl_open_hook")) |hook| {
+        const owner = services.definingObject(hook);
+        const table_address = @intFromPtr(&getState(runtime).dl_hooks);
+        try runtime.write_ops.append(runtime.allocator, .{
+            .addr = try owner.symbolToLoadedAddress(owner.syms_array.items[hook.sym_idx]),
+            .relative_to = .zero,
+            .value = .{ .addr = table_address },
+        });
+
+        if (try findLibcSymbol(services, object, "_dl_open_hook2")) |hook2| {
+            const owner2 = services.definingObject(hook2);
+            try runtime.write_ops.append(runtime.allocator, .{
+                .addr = try owner2.symbolToLoadedAddress(owner2.syms_array.items[hook2.sym_idx]),
+                .relative_to = .zero,
+                .value = .{ .addr = table_address },
+            });
+        }
+
+        return;
+    }
+
+    // The modern table lives in _rtld_global_ro. Require two independent
+    // wrappers to agree on its offset; never assume a release-specific layout.
+    const slot = try globalSlot(object, "_rtld_global_ro");
+    var offset: ?usize = null;
+    inline for (.{ "dlclose", "dladdr" }) |name| {
+        const code = try CodeView.fromSymbol(services.inspect(object), name);
+        var options: InstructionFlow.Options = .{ .allow_indirect_tail_exits = true };
+        try setGlibcNoReturnTargets(object, code, &options, false);
+        var flow = try InstructionFlow.initWithOptions(runtime.allocator, code, options);
+        defer flow.deinit();
+
+        const candidate = try dlHookOffset(flow, slot, @offsetOf(DlfcnHooks, name));
+        if (offset) |previous| {
+            if (previous != candidate) return error.InconsistentGlibcDlHooks;
+        }
+
+        offset = candidate;
+    }
+
+    try runtime.write_ops.append(runtime.allocator, .{
+        .addr = try std.math.add(usize, rtld_address, offset.?),
+        .relative_to = .zero,
+        .value = .{ .addr = @intFromPtr(&getState(runtime).dlfcn_hooks) },
+    });
+}
+
+fn dlHookOffset(flow: InstructionFlow, slot: usize, member_offset: usize) !usize {
+    var result: ?usize = null;
+    for (flow.nodes.items) |node| {
+        const instruction = node.instruction;
+        if (instruction.op != .jump or instruction.target != null) continue;
+
+        const table = flow.value(node, instruction.src);
+        if (!table.is(.indirect_field, @intCast(slot)) or table.bits != 0 or table.b < 0 or table.c != member_offset) return error.InvalidGlibcDlHooks;
+
+        const offset: usize = @intCast(table.b);
+        if (offset % @alignOf(usize) != 0) return error.InvalidGlibcDlHooks;
+        if (result != null and result.? != offset) return error.AmbiguousGlibcDlHooks;
+        result = offset;
+    }
+
+    return result orelse error.GlibcDlHooksNotFound;
 }
 
 fn getState(runtime: *const common.Runtime) *State {
@@ -1000,7 +1120,7 @@ fn shifted(address: Value, offset: i64) Value {
         .address => result.a = std.math.add(i64, result.a, offset) catch return .{},
         .thread_address, .call_address, .global_address => result.b = std.math.add(i64, result.b, offset) catch return .{},
         .indirect_address => result.c = std.math.add(i64, result.c, offset) catch return .{},
-        .unknown, .constant, .range, .global, .global_field, .sum, .thread, .stack, .call, .thread_field, .call_field => return .{},
+        .unknown, .constant, .range, .global, .global_field, .indirect_field, .sum, .thread, .stack, .call, .thread_field, .call_field => return .{},
     }
     return result;
 }
@@ -1223,6 +1343,42 @@ fn appendWritePlan(runtime: *common.Runtime, glibc: Layout) !void {
 const scalar_tls_fixture = "\x48\x8b\x05\xf9\x0f\x00\x00" ++
     "\x4c\x8b\x88\xa8\x02\x00\x00\x48\x8b\x98\xa0\x02\x00\x00" ++
     "\x4c\x01\xcb\x48\x83\xeb\x01\x48\x89\xd8\x31\xd2\x49\xf7\xf1\xc3";
+
+test "dl hook discovery follows the rtld field and validates the table member" {
+    // mov rdx, [rip+0xff9]; mov rax, [rdx+0x388]; jmp [rax+8]
+    const bytes = "\x48\x8b\x15\xf9\x0f\x00\x00\x48\x8b\x82\x88\x03\x00\x00\xff\x60\x08";
+    const code = CodeView.fromBytes(bytes, 0x1000);
+    try std.testing.expectError(error.UnsupportedIndirectBranch, InstructionFlow.init(std.testing.allocator, code));
+
+    var flow = try InstructionFlow.initWithOptions(std.testing.allocator, code, .{ .allow_indirect_tail_exits = true });
+    defer flow.deinit();
+    try std.testing.expectEqual(@as(usize, 0x388), try dlHookOffset(flow, 0x2000, 8));
+    try std.testing.expectError(error.InvalidGlibcDlHooks, dlHookOffset(flow, 0x3000, 8));
+    try std.testing.expectError(error.InvalidGlibcDlHooks, dlHookOffset(flow, 0x2000, 40));
+}
+
+test "dl hook discovery rejects a tail exit with an unrestored stack" {
+    const bytes = "\x50\xff\x60\x08"; // push rax; jmp [rax+8]
+    try std.testing.expectError(error.UnsupportedIndirectBranch, InstructionFlow.initWithOptions(
+        std.testing.allocator,
+        CodeView.fromBytes(bytes, 0x1000),
+        .{ .allow_indirect_tail_exits = true },
+    ));
+}
+
+test "dl hook discovery follows a register tail call and rejects narrowed pointers" {
+    // mov rdx, [rip+0xff9]; mov rax, [rdx+0x388]; mov rax, [rax+8]; jmp rax
+    const bytes = "\x48\x8b\x15\xf9\x0f\x00\x00\x48\x8b\x82\x88\x03\x00\x00\x48\x8b\x40\x08\xff\xe0";
+    var flow = try InstructionFlow.initWithOptions(std.testing.allocator, CodeView.fromBytes(bytes, 0x1000), .{ .allow_indirect_tail_exits = true });
+    defer flow.deinit();
+    try std.testing.expectEqual(@as(usize, 0x388), try dlHookOffset(flow, 0x2000, 8));
+
+    var narrowed = bytes.*;
+    narrowed[14] = 0x40; // mov eax, [rax+8] loses the pointer's high bits.
+    var narrow_flow = try InstructionFlow.initWithOptions(std.testing.allocator, CodeView.fromBytes(&narrowed, 0x1000), .{ .allow_indirect_tail_exits = true });
+    defer narrow_flow.deinit();
+    try std.testing.expectError(error.InvalidGlibcDlHooks, dlHookOffset(narrow_flow, 0x2000, 8));
+}
 
 test "TLS rounding identifies field roles through renamed registers" {
     // glibc's rounding expression identifies which global fields are size and

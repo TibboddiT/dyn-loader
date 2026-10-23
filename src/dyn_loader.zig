@@ -4034,8 +4034,10 @@ fn unloadObjects(mode: enum { release, deinit }) !void {
     state.thread_mutex.lockUncancelable(state.io);
     for (state.thread_infos.values()) |worker| {
         const owner = worker.entry_object orelse continue;
-        if (worker.authorized and std.mem.findScalar(usize, retiring.items, owner) != null)
+        if (worker.authorized and std.mem.findScalar(usize, retiring.items, owner) != null) {
+            logger.err("unload.worker: object={s} worker_index={d} tid={d} action=refuse_retirement", .{ state.dyn_objects.values()[owner].name, worker.idx, worker.tid });
             @panic("library finalizer left a worker executing retiring code");
+        }
     }
     state.thread_mutex.unlock(state.io);
 
@@ -4190,6 +4192,21 @@ const libc_services: libc.Services = .{
         @ptrCast(&TimerCreateSubstitute(1).call),
         @ptrCast(&TimerCreateSubstitute(2).call),
         @ptrCast(&TimerCreateSubstitute(3).call),
+    },
+    .dynamic_loading = .{
+        .open = &openDlLibrary,
+        .close = &dlcloseSubstitute,
+        .lookup = &dlsymWithCaller,
+        .lookupVersion = &dlvsymWithCaller,
+        .getError = &dlerrorSubstitute,
+        .address = @ptrCast(&dladdrSubstitute),
+        .addressExtra = @ptrCast(&dladdr1Substitute),
+        .info = &dlinfoSubstitute,
+        .openNamespace = &dlmopenWithCaller,
+        .openInternal = &openInternalLibrary,
+        .lookupInternal = &lookupInternalSymbol,
+        .lookupVersionInternal = &lookupInternalSymbolVersion,
+        .closeInternal = &closeInternalLibrary,
     },
 };
 
@@ -4689,6 +4706,29 @@ threadlocal var last_dl_error: ?[:0]const u8 = null;
 threadlocal var dl_error_buffer: [2048]u8 = undefined;
 threadlocal var dlerror_cleared: bool = true;
 
+const DlErrorSnapshot = struct {
+    message: ?[:0]const u8,
+    cleared: bool,
+    buffer: [2048]u8,
+
+    fn capture() DlErrorSnapshot {
+        var snapshot: DlErrorSnapshot = .{
+            .message = last_dl_error,
+            .cleared = dlerror_cleared,
+            .buffer = undefined,
+        };
+
+        if (last_dl_error) |message| @memcpy(snapshot.buffer[0 .. message.len + 1], message[0 .. message.len + 1]);
+        return snapshot;
+    }
+
+    fn restore(snapshot: *const DlErrorSnapshot) void {
+        if (snapshot.message) |message| @memcpy(dl_error_buffer[0 .. message.len + 1], snapshot.buffer[0 .. message.len + 1]);
+        last_dl_error = snapshot.message;
+        dlerror_cleared = snapshot.cleared;
+    }
+};
+
 fn dlerrorSubstitute() callconv(.c) ?[*:0]const u8 {
     // Reading a rejection diagnostic needs only executable TLS, even in a child.
     const can_log = isOwnerProcess();
@@ -4730,6 +4770,10 @@ fn acquireResidentLibrary(path: []const u8) !DynamicLibrary {
 }
 
 fn dlopenSubstitute(path: ?[*:0]const u8, flags: c_int) callconv(.c) ?*anyopaque {
+    return openDlLibrary(path, flags, @returnAddress());
+}
+
+fn openDlLibrary(path: ?[*:0]const u8, flags: c_int, caller_addr: usize) callconv(.c) ?*anyopaque {
     requireManaged(.active_only) catch |err| {
         last_dl_error = formatDlError("dlopen: {}", .{err});
         return null;
@@ -4737,7 +4781,6 @@ fn dlopenSubstitute(path: ?[*:0]const u8, flags: c_int) callconv(.c) ?*anyopaque
     state.transaction_lock.lock(state.io);
     defer state.transaction_lock.unlock(state.io);
 
-    const caller_addr = @returnAddress();
     logger.debug("intercepted call: dlopen(\"{?s}\", 0x{x})", .{ path, flags });
 
     if (path == null) {
@@ -4927,6 +4970,48 @@ fn dlsymSubstitute(lib_handle: ?*anyopaque, sym_name: [*:0]const u8) callconv(.c
 
 fn dlvsymSubstitute(lib_handle: ?*anyopaque, sym_name: [*:0]const u8, version: [*:0]const u8) callconv(.c) ?*anyopaque {
     return lookupDlSymbol(lib_handle, std.mem.span(sym_name), std.mem.span(version), @returnAddress());
+}
+
+fn dlsymWithCaller(handle: ?*anyopaque, name: [*:0]const u8, caller: usize) callconv(.c) ?*anyopaque {
+    return lookupDlSymbol(handle, std.mem.span(name), null, caller);
+}
+
+fn dlvsymWithCaller(handle: ?*anyopaque, name: [*:0]const u8, version: [*:0]const u8, caller: usize) callconv(.c) ?*anyopaque {
+    return lookupDlSymbol(handle, std.mem.span(name), std.mem.span(version), caller);
+}
+
+fn dlmopenWithCaller(namespace: c_long, path: ?[*:0]u8, flags: c_int, _: usize) callconv(.c) ?*anyopaque {
+    return dlmopenSubstitute(namespace, path, flags);
+}
+
+// Private libc lookups report failure through their return value, leaving the
+// application's pending dlerror intact.
+fn openInternalLibrary(path: ?[*:0]const u8, flags: c_int) callconv(.c) ?*anyopaque {
+    const saved_error = DlErrorSnapshot.capture();
+    defer saved_error.restore();
+
+    return openDlLibrary(path, flags, @returnAddress());
+}
+
+fn lookupInternalSymbol(handle: ?*anyopaque, name: [*:0]const u8) callconv(.c) ?*anyopaque {
+    const saved_error = DlErrorSnapshot.capture();
+    defer saved_error.restore();
+
+    return lookupDlSymbol(handle, std.mem.span(name), null, @returnAddress());
+}
+
+fn lookupInternalSymbolVersion(handle: ?*anyopaque, name: [*:0]const u8, version: [*:0]const u8) callconv(.c) ?*anyopaque {
+    const saved_error = DlErrorSnapshot.capture();
+    defer saved_error.restore();
+
+    return lookupDlSymbol(handle, std.mem.span(name), std.mem.span(version), @returnAddress());
+}
+
+fn closeInternalLibrary(handle: *anyopaque) callconv(.c) c_int {
+    const saved_error = DlErrorSnapshot.capture();
+    defer saved_error.restore();
+
+    return dlcloseSubstitute(handle);
 }
 
 // Capture the caller address in the C entry points: RTLD_NEXT and preload policy
@@ -6650,6 +6735,8 @@ test "dl symbol lookup respects versions, caller scopes, and handle validity" {
 
     try std.testing.expectEqual(@as(usize, 0x1020), @intFromPtr(dlsymSubstitute(handle_ptr, "lookup-test")));
     try std.testing.expectEqual(@as(usize, 0x1030), @intFromPtr(dlvsymSubstitute(handle_ptr, "lookup-test", "V2")));
+    try std.testing.expectEqual(@as(usize, 0x1020), @intFromPtr(lookupInternalSymbol(handle_ptr, "lookup-test")));
+    try std.testing.expectEqual(@as(usize, 0x1030), @intFromPtr(lookupInternalSymbolVersion(handle_ptr, "lookup-test", "V2")));
     try std.testing.expectEqual(@as(usize, 0x1020), @intFromPtr(dlsymSubstitute(null, "lookup-test")));
     try std.testing.expect(dlvsymSubstitute(handle_ptr, "lookup-test", "") == null);
     try std.testing.expect(std.mem.indexOf(u8, last_dl_error.?, "lookup-test@ for library") != null);
@@ -6682,6 +6769,37 @@ test "dl symbol lookup respects versions, caller scopes, and handle validity" {
         try std.testing.expectEqual(@as(usize, 0x3020), @intFromPtr(lookupDlSymbol(handle_ptr, "lookup-test", version, 0x1010)));
         try std.testing.expectEqual(@as(usize, 0x1020), @intFromPtr(lookupDlSymbol(handle_ptr, "lookup-test", version, 0x3010)));
         try std.testing.expectEqual(@as(usize, 0x2020), @intFromPtr(lookupDlSymbol(next, "lookup-test", version, 0x1010)));
+    }
+}
+
+test "private libc loader failures preserve pending and cleared dlerror" {
+    const previous_log_level = logger.level;
+    logger.level = .none;
+    defer logger.level = previous_log_level;
+
+    state = .{
+        .allocator = std.testing.allocator,
+        .io = std.testing.io,
+        .main_thread_pointer = libc.currentThreadPointer(),
+    };
+    const previous_lifecycle = lifecycle.swap(.active, .acq_rel);
+    defer lifecycle.store(previous_lifecycle, .release);
+    defer {
+        state = .{};
+        last_dl_error = null;
+        dlerror_cleared = true;
+    }
+
+    for ([_]bool{ false, true }) |cleared| {
+        last_dl_error = formatDlError("pending application error", .{});
+        dlerror_cleared = cleared;
+
+        try std.testing.expect(openInternalLibrary("missing-private-library", rtld_flags.noload) == null);
+        try std.testing.expect(lookupInternalSymbol(@ptrFromInt(1), "missing") == null);
+        try std.testing.expect(lookupInternalSymbolVersion(@ptrFromInt(1), "missing", "V1") == null);
+        try std.testing.expect(closeInternalLibrary(@ptrFromInt(1)) != 0);
+        try std.testing.expectEqualStrings("pending application error", last_dl_error.?);
+        try std.testing.expectEqual(cleared, dlerror_cleared);
     }
 }
 

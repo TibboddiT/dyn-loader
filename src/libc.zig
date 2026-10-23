@@ -16,6 +16,24 @@ const ResolvedSymbol = DynObject.ResolvedSymbol;
 /// The loader owns registries; Zig owns thread stacks and kernel thread-exit
 /// notification.
 pub const Services = struct {
+    /// Native loading operations supplied by DynLoader. Handles belong to the loader.
+    /// Internal operations preserve the application's pending dynamic-loader error.
+    pub const DynamicLoading = struct {
+        open: *const fn (path: ?[*:0]const u8, flags: c_int, caller: usize) callconv(.c) ?*anyopaque,
+        close: *const fn (handle: *anyopaque) callconv(.c) c_int,
+        lookup: *const fn (handle: ?*anyopaque, name: [*:0]const u8, caller: usize) callconv(.c) ?*anyopaque,
+        lookupVersion: *const fn (handle: ?*anyopaque, name: [*:0]const u8, version: [*:0]const u8, caller: usize) callconv(.c) ?*anyopaque,
+        getError: *const fn () callconv(.c) ?[*:0]const u8,
+        address: *const fn (address: *anyopaque, info: *anyopaque) callconv(.c) c_int,
+        addressExtra: *const fn (address: *anyopaque, info: *anyopaque, extra: *anyopaque, flags: c_int) callconv(.c) c_int,
+        info: *const fn (handle: *anyopaque, request: c_int, info: *anyopaque) callconv(.c) c_int,
+        openNamespace: *const fn (namespace: c_long, path: ?[*:0]u8, flags: c_int, caller: usize) callconv(.c) ?*anyopaque,
+        openInternal: *const fn (path: ?[*:0]const u8, flags: c_int) callconv(.c) ?*anyopaque,
+        lookupInternal: *const fn (handle: ?*anyopaque, name: [*:0]const u8) callconv(.c) ?*anyopaque,
+        lookupVersionInternal: *const fn (handle: ?*anyopaque, name: [*:0]const u8, version: [*:0]const u8) callconv(.c) ?*anyopaque,
+        closeInternal: *const fn (handle: *anyopaque) callconv(.c) c_int,
+    };
+
     /// Bytes reserved by the loader at and above the thread pointer.
     native_metadata_capacity: usize,
     lookupSymbol: *const fn (object: *DynObject, name: []const u8, allow_preload_override: bool) anyerror!ResolvedSymbol,
@@ -28,6 +46,7 @@ pub const Services = struct {
     calloc_substitute: *const anyopaque,
     mq_notify_substitute: *const anyopaque,
     timer_substitutes: [4]*const anyopaque,
+    dynamic_loading: DynamicLoading,
 
     pub fn inspect(self: *const Services, object: *DynObject) DynObject.Inspection {
         return .{ .object = object, .lookup = self.inspectSymbol };
