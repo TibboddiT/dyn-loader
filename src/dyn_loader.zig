@@ -157,6 +157,7 @@ const State = struct {
     load_request_cache: std.StringArrayHashMapUnmanaged(usize) = .empty,
     ifunc_resolved_addrs: std.AutoArrayHashMapUnmanaged(usize, usize) = .empty,
     irel_resolved_targets: std.AutoArrayHashMapUnmanaged(usize, usize) = .empty,
+    unique_symbols: std.StringArrayHashMapUnmanaged(ResolvedSymbol) = .empty,
 
     // Owns native backend state; worker handles borrow this runtime.
     libc_runtime: ?libc.Runtime = null,
@@ -396,6 +397,7 @@ pub fn deinit() void {
 
     state.ifunc_resolved_addrs.clearAndFree(state.allocator);
     state.irel_resolved_targets.clearAndFree(state.allocator);
+    state.unique_symbols.deinit(state.allocator);
 
     state.allocator.free(state.tls_template);
     state.tls_template = &.{};
@@ -1841,7 +1843,7 @@ fn loadDso(o_path: []const u8, search: LibrarySearchContext, ancestor_rpath: ?[]
             }
         }
 
-        const hidden = sym.other.visibility != .DEFAULT;
+        const hidden = sym.other.visibility == .HIDDEN or sym.other.visibility == .INTERNAL;
         if (logger.level == .debug) {
             logger.debug("{s}  - {d}:", .{ dyn_object_name, j });
             logger.debug("{s}    name: {s}", .{ dyn_object_name, name });
@@ -1867,6 +1869,7 @@ fn loadDso(o_path: []const u8, search: LibrarySearchContext, ancestor_rpath: ?[]
             .name = name,
             .version = version,
             .hidden = hidden,
+            .protected = sym.other.visibility == .PROTECTED,
             .default_version = if (ver_sym) |vs| !vs.HIDDEN else true,
             .offset = j * @sizeOf(std.elf.Sym),
             .type = sym.info.type,
@@ -3151,6 +3154,10 @@ fn resolveLibcRuntimeSymbol(sym_name: []const u8) !ResolvedSymbol {
 /// modes are mutually exclusive where asserted below. `find_next` skips the first
 /// object in the supplied dependency scope; it is the current RTLD_NEXT policy.
 fn getResolvedSymbolByName(maybe_dyn_object: ?*DynObject, sym_name: []const u8, find_next: bool, only_preload: bool, allow_preload_override: bool) !ResolvedSymbol {
+    return canonicalizeUniqueSymbol(try getResolvedSymbolByNameInner(maybe_dyn_object, sym_name, find_next, only_preload, allow_preload_override));
+}
+
+fn getResolvedSymbolByNameInner(maybe_dyn_object: ?*DynObject, sym_name: []const u8, find_next: bool, only_preload: bool, allow_preload_override: bool) anyerror!ResolvedSymbol {
     logger.debug("symbol.lookup: requester={s} symbol={s} next={} preload_only={} preload_override={}", .{ if (maybe_dyn_object) |object| object.name else "<global>", sym_name, find_next, only_preload, allow_preload_override });
     errdefer logger.debug("symbol.lookup: symbol={s} action=failed", .{sym_name});
     std.debug.assert(!(find_next and only_preload));
@@ -3353,6 +3360,10 @@ fn getResolvedSymbolByName(maybe_dyn_object: ?*DynObject, sym_name: []const u8, 
 /// Uses the same scope modes as name lookup but requires an exact version string.
 /// Relocation lookup has separate default-version rules in `resolveSymbolInner`.
 fn getResolvedSymbolByNameAndVersion(maybe_dyn_object: ?*DynObject, sym_name: []const u8, version: []const u8, find_next: bool, only_preload: bool, allow_preload_override: bool) !ResolvedSymbol {
+    return canonicalizeUniqueSymbol(try getResolvedSymbolByNameAndVersionInner(maybe_dyn_object, sym_name, version, find_next, only_preload, allow_preload_override));
+}
+
+fn getResolvedSymbolByNameAndVersionInner(maybe_dyn_object: ?*DynObject, sym_name: []const u8, version: []const u8, find_next: bool, only_preload: bool, allow_preload_override: bool) anyerror!ResolvedSymbol {
     logger.debug("symbol.lookup: requester={s} symbol={s} version={s} next={} preload_only={} preload_override={}", .{ if (maybe_dyn_object) |object| object.name else "<global>", sym_name, version, find_next, only_preload, allow_preload_override });
     errdefer logger.debug("symbol.lookup: symbol={s} version={s} action=failed", .{ sym_name, version });
     std.debug.assert(!(find_next and only_preload));
@@ -3560,11 +3571,30 @@ const ResolvedBinding = struct {
     provenance: enum { definition, redirected_address, unresolved_weak },
 };
 
-// TODO test and complete scope/preemption, default-version selection, visibility,
-// binding, and absolute-symbol semantics across lookup and relocation paths.
+/// GNU unique identity belongs to the loader namespace, including local groups.
+/// A provider selected before initialization remains removable on load failure.
+fn canonicalizeUniqueSymbol(symbol: ResolvedSymbol) !ResolvedSymbol {
+    if (symbol.dyn_object_idx == std.math.maxInt(usize)) return symbol;
+    const object = &state.dyn_objects.values()[symbol.dyn_object_idx];
+    if (object.syms_array.items[symbol.sym_idx].bind != std.elf.STB.GNU_UNIQUE) return symbol;
+
+    if (state.unique_symbols.get(symbol.name)) |canonical| return canonical;
+    try state.unique_symbols.putNoClobber(state.allocator, symbol.name, symbol);
+
+    if (object.init_called) {
+        object.nodelete = true;
+    } else {
+        object.nodelete_requested = true;
+    }
+
+    return symbol;
+}
+
+// TODO complete global scope, default-version selection, and absolute-symbol
+// semantics across lookup and relocation paths.
 fn resolveSymbolInScope(dyn_object: *DynObject, sym_idx: usize, scope: []const usize) !ResolvedSymbol {
     const binding = try resolveSymbolInner(dyn_object, sym_idx, scope);
-    const sym = binding.symbol;
+    const sym = try canonicalizeUniqueSymbol(binding.symbol);
     logger.debug("symbol.bind: requester={s} symbol={s} version={s} provider_index={d} symbol_value=0x{x} location={any}", .{ dyn_object.name, sym.name, sym.version, sym.dyn_object_idx, sym.value, sym.location });
 
     // A group member can bind to its parent or sibling. Keep the defining
@@ -3616,68 +3646,59 @@ fn recordBindingDependency(dyn_object: *DynObject, address: usize, provider_hint
     }
 }
 
+/// Resolves a selected definition (or ELF's zero symbol) without scope lookup.
+fn resolveSymbolDefinition(dyn_object: *DynObject, sym_idx: usize) !ResolvedBinding {
+    const sym = dyn_object.syms_array.items[sym_idx];
+    std.debug.assert(sym_idx == 0 or sym.shidx != std.elf.SHN_UNDEF);
+    if (sym.type == .TLS) return .{
+        .symbol = makeTlsDefinition(dyn_object, sym_idx),
+        .provenance = .definition,
+    };
+
+    var addr = try dyn_object.symbolToLoadedAddress(sym);
+    var address_redirected = false;
+    if (state.ifunc_resolved_addrs.get(addr)) |res_addr| {
+        logger.debug("ifunc address substitution: {s}: 0x{x} => 0x{x}", .{ sym.name, addr, res_addr });
+        addr = res_addr;
+        address_redirected = true;
+    } else if (sym.type == std.elf.STT.GNU_IFUNC) {
+        const resolver_addr = addr;
+        const resolver: *const fn () callconv(.c) usize = @ptrFromInt(resolver_addr);
+        logger.debug("  IFUNC: calling resolver for {s} at 0x{x} (0x{x})", .{ sym.name, resolver_addr, sym.value });
+        const value = invokeResolver(resolver);
+        logger.debug("  IFUNC: {s}: 0x{x} (0x{x}): 0x{x}", .{ sym.name, resolver_addr, sym.value, value });
+        if (state.ifunc_resolved_addrs.get(resolver_addr)) |res_val| {
+            std.debug.assert(res_val == value);
+        }
+        try state.ifunc_resolved_addrs.put(state.allocator, resolver_addr, value);
+        try state.irel_resolved_targets.putNoClobber(state.allocator, resolver_addr, value);
+        addr = value;
+        address_redirected = true;
+    }
+
+    return .{
+        .symbol = .{
+            .value = sym.value,
+            .location = .{ .address = addr },
+            .name = sym.name,
+            .version = sym.version,
+            .dyn_object_idx = state.dyn_objects.getIndex(dyn_object.key).?,
+            .sym_idx = sym_idx,
+        },
+        .provenance = if (address_redirected) .redirected_address else .definition,
+    };
+}
+
 fn resolveSymbolInner(dyn_object: *DynObject, sym_idx: usize, scope: []const usize) !ResolvedBinding {
     if (sym_idx >= dyn_object.syms_array.items.len) return error.InvalidSymbolIndex;
-
     const sym = dyn_object.syms_array.items[sym_idx];
 
-    if (sym_idx == 0 or sym.shidx != std.elf.SHN_UNDEF) {
-        if (sym.bind == .WEAK) {
-            logger.debug("WARNING: WEAK SYMBOL: {s}", .{if (sym_idx == 0) "ZERO" else sym.name});
-        }
-
-        if (sym.shidx == std.elf.SHN_ABS) {
-            logger.debug("WARNING: ABSOLUTE SYMBOL: {s}", .{if (sym_idx == 0) "ZERO" else sym.name});
-        }
-
-        if (sym.type == .TLS) return .{
-            .symbol = makeTlsDefinition(dyn_object, sym_idx),
-            .provenance = .definition,
-        };
-
-        const sym_address = sym.value;
-
-        var addr = try dyn_object.symbolToLoadedAddress(sym);
-        var address_redirected = false;
-
-        if (state.ifunc_resolved_addrs.get(addr)) |res_addr| {
-            logger.debug("ifunc address substitution: {s}: 0x{x} => 0x{x}", .{ sym.name, addr, res_addr });
-            addr = res_addr;
-            address_redirected = true;
-        } else if (sym.type == std.elf.STT.GNU_IFUNC) {
-            const resolver_addr = addr;
-            const resolver: *const fn () callconv(.c) usize = @ptrFromInt(resolver_addr);
-            logger.debug("  IFUNC: calling resolver for {s} at 0x{x} (0x{x})", .{ sym.name, resolver_addr, sym_address });
-            const value = invokeResolver(resolver);
-            logger.debug("  IFUNC: {s}: 0x{x} (0x{x}): 0x{x}", .{ sym.name, resolver_addr, sym_address, value });
-            if (state.ifunc_resolved_addrs.get(resolver_addr)) |res_val| {
-                std.debug.assert(res_val == value);
-            }
-            try state.ifunc_resolved_addrs.put(state.allocator, resolver_addr, value);
-            try state.irel_resolved_targets.putNoClobber(state.allocator, resolver_addr, value);
-            addr = value;
-            address_redirected = true;
-        }
-
-        return .{
-            .symbol = .{
-                .value = sym.value,
-                .location = .{ .address = addr },
-                .name = sym.name,
-                .version = sym.version,
-                .dyn_object_idx = state.dyn_objects.getIndex(dyn_object.key).?,
-                .sym_idx = sym_idx,
-            },
-            .provenance = if (address_redirected) .redirected_address else .definition,
-        };
+    if (sym_idx == 0 or (sym.shidx != std.elf.SHN_UNDEF and (sym.bind == .LOCAL or sym.hidden or sym.protected))) {
+        return resolveSymbolDefinition(dyn_object, sym_idx);
     }
 
     for (scope) |dep_idx| {
         const dep_object = &state.dyn_objects.values()[dep_idx];
-
-        if (std.mem.eql(u8, dep_object.name, dyn_object.name)) {
-            continue;
-        }
 
         if (dep_object.syms.get(sym.name)) |dep_sym_list| {
             for (dep_sym_list) |dep_sym_idx| {
@@ -3686,56 +3707,8 @@ fn resolveSymbolInner(dyn_object: *DynObject, sym_idx: usize, scope: []const usi
                     (sym.shidx == std.elf.SHN_UNDEF and sym.bind != .LOCAL and std.mem.eql(u8, sym.version, "LOCAL"));
                 const version_matches = dep_sym.version.len == 0 or std.mem.eql(u8, dep_sym.version, "GLOBAL") or
                     std.mem.eql(u8, dep_sym.version, sym.version) or (unversioned and dep_sym.default_version);
-                if (dep_sym.shidx != std.elf.SHN_UNDEF and version_matches and !dep_sym.hidden) {
-                    if (dep_sym.bind == .WEAK) {
-                        logger.debug("WARNING: WEAK SYMBOL from dep: {s}", .{if (sym_idx == 0) "ZERO" else dep_sym.name});
-                    }
 
-                    if (dep_sym.shidx == std.elf.SHN_ABS) {
-                        logger.debug("WARNING: ABSOLUTE SYMBOL from dep: {s}", .{if (sym_idx == 0) "ZERO" else dep_sym.name});
-                    }
-
-                    if (dep_sym.type == .TLS) return .{
-                        .symbol = makeTlsDefinition(dep_object, dep_sym_idx),
-                        .provenance = .definition,
-                    };
-
-                    const dep_sym_address = dep_sym.value;
-
-                    var dep_addr = try dep_object.symbolToLoadedAddress(dep_sym);
-                    var address_redirected = false;
-
-                    if (state.ifunc_resolved_addrs.get(dep_addr)) |res_addr| {
-                        logger.debug("ifunc address substitution: {s}: 0x{x} => 0x{x}", .{ dep_sym.name, dep_addr, res_addr });
-                        dep_addr = res_addr;
-                        address_redirected = true;
-                    } else if (dep_sym.type == std.elf.STT.GNU_IFUNC) {
-                        const resolver_addr = dep_addr;
-                        const resolver: *const fn () callconv(.c) usize = @ptrFromInt(resolver_addr);
-                        logger.debug("  IFUNC: calling resolver for {s} at 0x{x} (0x{x})", .{ dep_sym.name, resolver_addr, dep_sym_address });
-                        const value = invokeResolver(resolver);
-                        logger.debug("  IFUNC: {s}: 0x{x} (0x{x}): 0x{x}", .{ dep_sym.name, resolver_addr, dep_sym_address, value });
-                        if (state.ifunc_resolved_addrs.get(resolver_addr)) |res_val| {
-                            std.debug.assert(res_val == value);
-                        }
-                        try state.ifunc_resolved_addrs.put(state.allocator, resolver_addr, value);
-                        try state.irel_resolved_targets.putNoClobber(state.allocator, resolver_addr, value);
-                        dep_addr = value;
-                        address_redirected = true;
-                    }
-
-                    return .{
-                        .symbol = .{
-                            .value = dep_sym.value,
-                            .location = .{ .address = dep_addr },
-                            .name = dep_sym.name,
-                            .version = dep_sym.version,
-                            .dyn_object_idx = dep_idx,
-                            .sym_idx = dep_sym_idx,
-                        },
-                        .provenance = if (address_redirected) .redirected_address else .definition,
-                    };
-                }
+                if (dep_sym.shidx != std.elf.SHN_UNDEF and version_matches and !dep_sym.hidden and dep_sym.bind != .LOCAL) return resolveSymbolDefinition(dep_object, dep_sym_idx);
 
                 if (dep_sym.shidx == std.elf.SHN_UNDEF) logger.debug("WARNING: SKIPPING UNDEF SYMBOL from dep: {s} | {s}@{s}", .{ dep_object.name, dep_sym.name, dep_sym.version });
                 if (dep_sym.hidden) logger.debug("WARNING: SKIPPING HIDDEN SYMBOL from dep: {s} | {s}@{s}", .{ dep_object.name, dep_sym.name, dep_sym.version });
@@ -3743,6 +3716,9 @@ fn resolveSymbolInner(dyn_object: *DynObject, sym_idx: usize, scope: []const usi
             }
         }
     }
+
+    // Some internal callers supply only a dependency scope.
+    if (sym.shidx != std.elf.SHN_UNDEF) return resolveSymbolDefinition(dyn_object, sym_idx);
 
     if (sym.bind == .WEAK) {
         logger.debug("symbol.bind: requester={s} symbol={s} version={s} result=unresolved_weak value=0", .{ dyn_object.name, sym.name, sym.version });
@@ -3772,6 +3748,7 @@ fn resolveSymbolInner(dyn_object: *DynObject, sym_idx: usize, scope: []const usi
             logger.err("  - {s}", .{dep_object.name});
         }
     }
+
     return error.UnresolvedSymbol;
 }
 
@@ -4058,6 +4035,15 @@ fn unloadObjects(mode: enum { release, deinit }) !void {
 /// Keeps the address reservation and TLS capacity for reuse under a new epoch.
 fn retireObject(idx: usize) !void {
     const dyn_object = &state.dyn_objects.values()[idx];
+    var unique_index: usize = 0;
+    while (unique_index < state.unique_symbols.count()) {
+        if (state.unique_symbols.values()[unique_index].dyn_object_idx == idx) {
+            state.unique_symbols.swapRemoveAt(unique_index);
+        } else {
+            unique_index += 1;
+        }
+    }
+
     state.thread_mutex.lockUncancelable(state.io);
 
     for (state.object_lifetimes.items) |*entry| {
@@ -4340,7 +4326,9 @@ fn getSubstituteAddress(sym: ResolvedSymbol, for_obj: *DynObject, allow_preload_
         for_obj_is_preload_root = std.mem.findScalar(usize, state.preload_root_indices.items, for_obj_idx) != null;
     }
 
-    if (allow_preload_override and !for_obj_is_preload_root) {
+    const definition = dyn_object.syms_array.items[sym.sym_idx];
+    const local_binding = dyn_object == for_obj and (definition.bind == .LOCAL or definition.hidden or definition.protected);
+    if (allow_preload_override and !for_obj_is_preload_root and !local_binding) {
         const preload_sym = getResolvedSymbolByName(null, sym.name, false, true, false) catch |err| switch (err) {
             error.UnresolvedSymbol => null,
             else => return err,
@@ -6894,6 +6882,7 @@ test "binding retention follows resolution provenance and declared reachability"
     // Cached redirection must be recognized even for a non-IFUNC definition,
     // both in the requester and in a declared provider.
     requester.syms_array.items[1] = definition;
+    try requester.syms.build(state.allocator, requester.syms_array.items);
     try state.ifunc_resolved_addrs.put(state.allocator, 0x1020, 0x3020);
     try std.testing.expectEqual(@as(usize, 0x3020), try (try resolveSymbol(requester, 1)).getStaticAddress());
     try std.testing.expectEqualSlices(usize, &.{2}, requester.binding_dependencies.items);
@@ -6934,4 +6923,93 @@ test "binding retention follows resolution provenance and declared reachability"
     try std.testing.expectEqual(@as(usize, 0x3020), try (try resolveSymbol(requester, 1)).getStaticAddress());
     try recordBindingDependency(requester, 0x3020, null);
     try std.testing.expectEqual(@as(usize, 0), requester.binding_dependencies.items.len);
+}
+
+fn initSymbolTestObjects(allocator: std.mem.Allocator, bind: std.elf.STB) !void {
+    state = .{ .allocator = allocator };
+    for ([_][]const u8{ "first", "second" }, 0..) |name, index| {
+        const key: DynObjectId = .{ .ino = index + 1 };
+        try state.dyn_objects.put(allocator, key, DynObject.init(key, name, name));
+        const object = &state.dyn_objects.values()[index];
+        var segment = std.mem.zeroes(DynObject.LoadSegment);
+        segment.loaded_at = 0x1000 * (index + 1);
+        segment.mem_size = 4;
+        try object.segments.put(allocator, 0, segment);
+        const symbol: DynSym = .{
+            .name = "identity",
+            .version = "",
+            .hidden = false,
+            .default_version = true,
+            .offset = 0,
+            .type = .OBJECT,
+            .bind = bind,
+            .shidx = 1,
+            .value = 0,
+            .size = 4,
+        };
+        var zero = symbol;
+        zero.name = "";
+        zero.shidx = std.elf.SHN_UNDEF;
+        try object.syms_array.append(allocator, zero);
+        try object.syms_array.append(allocator, symbol);
+        try object.syms.build(allocator, object.syms_array.items);
+    }
+}
+
+fn deinitSymbolTestObjects() void {
+    for (state.dyn_objects.values()) |*object| {
+        object.segments.deinit(state.allocator);
+        object.syms_array.deinit(state.allocator);
+        object.syms.deinit(state.allocator);
+        object.binding_dependencies.deinit(state.allocator);
+    }
+    state.unique_symbols.deinit(state.allocator);
+    state.dyn_objects.deinit(state.allocator);
+    state = .{};
+}
+
+test "defined symbols follow scope except local hidden and protected definitions" {
+    defer deinitSymbolTestObjects();
+    try initSymbolTestObjects(std.testing.allocator, .WEAK);
+    const requester = &state.dyn_objects.values()[1];
+    for ([_]std.elf.STB{ .WEAK, .GLOBAL }) |bind| {
+        requester.syms_array.items[1].bind = bind;
+        const result = try resolveSymbolInScope(requester, 1, &.{ 0, 1 });
+        try std.testing.expectEqual(@as(usize, 0x1000), try result.getStaticAddress());
+        try std.testing.expectEqualSlices(usize, &.{0}, requester.binding_dependencies.items);
+    }
+    for (0..3) |mode| {
+        requester.syms_array.items[1].bind = if (mode == 0) .LOCAL else .GLOBAL;
+        requester.syms_array.items[1].hidden = mode == 1;
+        requester.syms_array.items[1].protected = mode == 2;
+        const result = try resolveSymbolInScope(requester, 1, &.{ 0, 1 });
+        try std.testing.expectEqual(@as(usize, 0x2000), try result.getStaticAddress());
+    }
+    // Protected definitions remain visible to other objects.
+    const result = try resolveSymbolInScope(&state.dyn_objects.values()[0], 1, &.{ 1, 0 });
+    try std.testing.expectEqual(@as(usize, 0x2000), try result.getStaticAddress());
+}
+
+fn checkUniqueRegistration(allocator: std.mem.Allocator) !void {
+    defer deinitSymbolTestObjects();
+    try initSymbolTestObjects(allocator, std.elf.STB.GNU_UNIQUE);
+    const first = &state.dyn_objects.values()[0];
+    const second = &state.dyn_objects.values()[1];
+    first.init_called = true;
+    const definition = (try resolveSymbolDefinition(first, 1)).symbol;
+    const canonical = canonicalizeUniqueSymbol(definition) catch |err| {
+        try std.testing.expect(!first.nodelete);
+        try std.testing.expectEqual(@as(usize, 0), state.unique_symbols.count());
+        return err;
+    };
+    try std.testing.expect(first.nodelete);
+    // Separate local scopes still return the first registered definition.
+    const other = try resolveSymbolInScope(second, 1, &.{1});
+    try std.testing.expectEqual(canonical.dyn_object_idx, other.dyn_object_idx);
+    try std.testing.expectEqualSlices(usize, &.{0}, second.binding_dependencies.items);
+    try std.testing.expect(!second.nodelete and !second.nodelete_requested);
+}
+
+test "unique registration preserves identity and commits retention after allocation" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkUniqueRegistration, .{});
 }

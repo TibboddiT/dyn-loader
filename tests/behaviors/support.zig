@@ -51,7 +51,7 @@ pub const Bridge = struct {
             std.debug.print("unable to resolve symbol '{s}'\n", .{name});
             return error.SymbolMissing;
         };
-        return @ptrCast(address);
+        return @ptrCast(@alignCast(address));
     }
 
     pub fn close(bridge: Bridge, handle: *anyopaque) !void {

@@ -19,6 +19,7 @@ const nodelete = @import("specifics/nodelete.zig");
 const relocation_scope = @import("specifics/relocation_scope.zig");
 const iconv = @import("specifics/iconv.zig");
 const constructor_nested = @import("specifics/constructor_nested.zig");
+const unique = @import("specifics/unique.zig");
 
 pub const runThreadContractChild = contract_failures.runChild;
 pub fn onLoaderEvent(event: anytype) error{InjectedFailure}!void {
@@ -70,6 +71,27 @@ const mutated_state: LibraryState = .{
 };
 
 pub const cases: []const runner.Case = &.{
+    .{
+        .name = "unique-identity",
+        .bridge = "bridge.so",
+        .bridge_symbols = bridge_symbols,
+        .library = "unique_a.so",
+        .behavior = .{ .specific = .{ .run = &unique.runIdentity } },
+    },
+    .{
+        .name = "unique-lookup",
+        .bridge = "bridge.so",
+        .bridge_symbols = bridge_symbols,
+        .library = "unique_lookup.so",
+        .behavior = .{ .specific = .{ .run = &unique.runLookup } },
+    },
+    .{
+        .name = "unique-binding-retention",
+        .bridge = "bridge.so",
+        .bridge_symbols = bridge_symbols,
+        .library = "retention_root.so",
+        .behavior = .{ .specific = .{ .run = &unique.runRetention } },
+    },
     .{
         .name = "iconv-conversion",
         .bridge = "bridge.so",

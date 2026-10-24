@@ -50,6 +50,7 @@ pub const DynSym = struct {
     name: []const u8,
     version: []const u8,
     hidden: bool,
+    protected: bool = false,
     default_version: bool,
     offset: usize,
     type: std.elf.STT,
