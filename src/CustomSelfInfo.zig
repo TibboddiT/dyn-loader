@@ -1,4 +1,4 @@
-// Based on lib/std/debug/SelfInfo/Elf.zig @ 79bb28aa57b3712116dc75288d60f2d29ba31cfb.
+// Based on lib/std/debug/SelfInfo/Elf.zig @ 64e4f9db8fa6fc47b0a2ef3143edacf472fb8c48.
 // https://codeberg.org/ziglang/zig/commits/branch/master/lib/std/debug/SelfInfo/Elf.zig
 
 // DynLoader extensions.
@@ -101,11 +101,11 @@ pub fn deinit(si: *SelfInfo, io: Io) void {
     const gpa = std.debug.getDebugInfoAllocator();
     for (si.modules.items) |*mod| {
         unwind: {
-            const u = &(mod.unwind orelse break :unwind catch break :unwind);
+            const u = &((mod.unwind orelse break :unwind) catch break :unwind);
             for (u.buf[0..u.len]) |*unwind| unwind.deinit(gpa);
         }
         loaded: {
-            const l = &(mod.loaded_elf orelse break :loaded catch break :loaded);
+            const l = &((mod.loaded_elf orelse break :loaded) catch break :loaded);
             l.file.deinit(gpa);
         }
     }
@@ -285,7 +285,6 @@ pub const can_unwind: bool = s: {
             .arm,
             .m88k,
             .mips64,
-            .mips64el,
             .riscv64,
             .x86,
             .x86_64,
@@ -532,11 +531,11 @@ fn findModule(si: *SelfInfo, gpa: Allocator, io: Io, address: usize, lock: enum 
         }
         for (si.modules.items) |*mod| {
             unwind: {
-                const u = &(mod.unwind orelse break :unwind catch break :unwind);
+                const u = &((mod.unwind orelse break :unwind) catch break :unwind);
                 for (u.buf[0..u.len]) |*unwind| unwind.deinit(gpa);
             }
             loaded: {
-                const l = &(mod.loaded_elf orelse break :loaded catch break :loaded);
+                const l = &((mod.loaded_elf orelse break :loaded) catch break :loaded);
                 l.file.deinit(gpa);
             }
         }
