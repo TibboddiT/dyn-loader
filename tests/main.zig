@@ -573,7 +573,7 @@ const Matrix = struct {
             &.{ "/src/libc/reference.c", "-ldl", "-pthread", "-o", "reference" },
         };
 
-        var commands = json.array(context.allocator);
+        var commands = json.array();
         for (recipes, 0..) |recipe, index| {
             var argv: std.ArrayList([]const u8) = .empty;
             try argv.append(context.allocator, "cc");
@@ -586,7 +586,7 @@ const Matrix = struct {
             try argv.appendSlice(context.allocator, recipe);
 
             const recorded_command = try json.cloneViaSerialization(context.allocator, argv.items);
-            try commands.array.append(recorded_command);
+            try commands.array.append(context.allocator, recorded_command);
 
             const log_prefix = try std.fmt.allocPrint(context.allocator, "{s}/build-{d}", .{ runtime_dir, index });
             try matrix.runSdkCommand(sdk_image, fixtures_dir, argv.items, log_prefix);
@@ -597,14 +597,14 @@ const Matrix = struct {
             &.{ "sh", "/src/libc/runpath/build.sh" },
         };
         for (additional_commands, recipes.len..) |command, index| {
-            try commands.array.append(try json.cloneViaSerialization(context.allocator, command));
+            try commands.array.append(context.allocator, try json.cloneViaSerialization(context.allocator, command));
             const log_prefix = try std.fmt.allocPrint(context.allocator, "{s}/build-{d}", .{ runtime_dir, index });
             try matrix.runSdkCommand(sdk_image, fixtures_dir, command, log_prefix);
         }
 
         for (runtime.cpp_libraries) |name| {
             const command = &[_][]const u8{ "sh", "-ec", "source=$(c++ -print-file-name=\"$1\"); test \"$source\" != \"$1\"; cp -L \"$source\" \"/fixtures/$1\"", "copy-cpp-library", name };
-            try commands.array.append(try json.cloneViaSerialization(context.allocator, command));
+            try commands.array.append(context.allocator, try json.cloneViaSerialization(context.allocator, command));
             const log_prefix = try std.fmt.allocPrint(context.allocator, "{s}/build-{s}", .{ runtime_dir, name });
             try matrix.runSdkCommand(sdk_image, fixtures_dir, command, log_prefix);
         }
@@ -932,7 +932,7 @@ const Matrix = struct {
             &.{ "-nostdlib", "/src/regression/relr.c", "-Wl,-z,defs", "-Wl,--fatal-warnings", "-Wl,-z,pack-relative-relocs", "-Wl,-soname,relr.so", "-o", "relr.so" },
         };
 
-        var commands = json.array(context.allocator);
+        var commands = json.array();
         for (recipes, 0..) |recipe, index| {
             if (!relr_supported and std.mem.eql(u8, recipe[recipe.len - 1], "relr.so")) continue;
 
@@ -944,7 +944,7 @@ const Matrix = struct {
             try matrix.runSdkCommand(sdk_image, fixtures_dir, argv.items, log_prefix);
 
             const recorded_command = try json.cloneViaSerialization(context.allocator, argv.items);
-            try commands.array.append(recorded_command);
+            try commands.array.append(context.allocator, recorded_command);
         }
 
         const native_command = &.{
@@ -963,7 +963,7 @@ const Matrix = struct {
         };
         const native_build_log = try std.fmt.allocPrint(context.allocator, "{s}/scope-native-build", .{runtime_dir});
         try matrix.runSdkCommand(sdk_image, fixtures_dir, native_command, native_build_log);
-        try commands.array.append(try json.cloneViaSerialization(context.allocator, native_command));
+        try commands.array.append(context.allocator, try json.cloneViaSerialization(context.allocator, native_command));
 
         return commands;
     }

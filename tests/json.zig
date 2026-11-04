@@ -57,8 +57,8 @@ pub fn object() Value {
     return .{ .object = .empty };
 }
 
-pub fn array(allocator: std.mem.Allocator) Value {
-    return .{ .array = std.array_list.Managed(Value).init(allocator) };
+pub fn array() Value {
+    return .{ .array = .empty };
 }
 
 pub fn putField(allocator: std.mem.Allocator, value: *Value, key: []const u8, item: Value) !void {
