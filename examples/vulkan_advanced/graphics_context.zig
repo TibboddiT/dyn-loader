@@ -32,6 +32,15 @@ const DeviceWrapper = vk.DeviceWrapper;
 const Instance = vk.InstanceProxy;
 const Device = vk.DeviceProxy;
 
+fn createWrapper(allocator: Allocator, comptime T: type) !*T {
+    const bytes = try allocator.alignedAlloc(u8, .of(T), @sizeOf(T));
+    return @ptrCast(bytes.ptr);
+}
+
+fn destroyWrapper(allocator: Allocator, ptr: anytype) void {
+    allocator.free(std.mem.asBytes(ptr));
+}
+
 pub const GraphicsContext = struct {
     pub const CommandBuffer = vk.CommandBufferProxy;
 
@@ -97,8 +106,8 @@ pub const GraphicsContext = struct {
             .flags = .{ .enumerate_portability_bit_khr = true },
         }, null);
 
-        const vki = try allocator.create(InstanceWrapper);
-        errdefer allocator.destroy(vki);
+        const vki = try createWrapper(allocator, InstanceWrapper);
+        errdefer destroyWrapper(allocator, vki);
         vki.* = InstanceWrapper.load(instance, self.vkb.dispatch.vkGetInstanceProcAddr.?);
         self.instance = Instance.init(instance, vki);
         errdefer self.instance.destroyInstance(null);
@@ -128,8 +137,8 @@ pub const GraphicsContext = struct {
 
         const dev = try initializeCandidate(self.instance, candidate);
 
-        const vkd = try allocator.create(DeviceWrapper);
-        errdefer allocator.destroy(vkd);
+        const vkd = try createWrapper(allocator, DeviceWrapper);
+        errdefer destroyWrapper(allocator, vkd);
         vkd.* = DeviceWrapper.load(dev, self.instance.wrapper.dispatch.vkGetDeviceProcAddr.?);
         self.dev = Device.init(dev, vkd);
         errdefer self.dev.destroyDevice(null);
@@ -149,8 +158,8 @@ pub const GraphicsContext = struct {
         self.instance.destroyInstance(null);
 
         // Don't forget to free the tables to prevent a memory leak.
-        self.allocator.destroy(self.dev.wrapper);
-        self.allocator.destroy(self.instance.wrapper);
+        destroyWrapper(self.allocator, self.dev.wrapper);
+        destroyWrapper(self.allocator, self.instance.wrapper);
     }
 
     pub fn deviceName(self: *const GraphicsContext) []const u8 {

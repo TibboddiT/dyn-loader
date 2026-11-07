@@ -1,4 +1,4 @@
-// Based on lib/std/debug/SelfInfo/Elf.zig @ 64e4f9db8fa6fc47b0a2ef3143edacf472fb8c48.
+// Based on lib/std/debug/SelfInfo/Elf.zig @ 117fd40fbf6ec8ff0574b30383b70d4d54f9b76b.
 // https://codeberg.org/ziglang/zig/commits/branch/master/lib/std/debug/SelfInfo/Elf.zig
 
 // DynLoader extensions.
@@ -220,7 +220,6 @@ pub const can_unwind: bool = s: {
             .x86_64,
         },
         .illumos => &.{
-            .x86,
             .x86_64,
         },
         // Not supported yet: hppa, hppa64, microblaze/microblazeel, sh/sheb
@@ -297,11 +296,6 @@ pub const can_unwind: bool = s: {
     }
     break :s false;
 };
-comptime {
-    if (can_unwind) {
-        std.debug.assert(Dwarf.supportsUnwinding(&builtin.target));
-    }
-}
 pub const UnwindContext = Dwarf.SelfUnwinder;
 pub fn unwindFrame(si: *SelfInfo, io: Io, context: *UnwindContext) Error!usize {
     publication_lock.lockSharedUncancelable(io);
