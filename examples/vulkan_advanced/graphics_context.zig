@@ -1,4 +1,5 @@
 const std = @import("std");
+
 const vk = @import("vk.zig");
 const Xlib = @import("xlib.zig").Xlib;
 const VulkanProcResolver = @import("vulkan_proc_resolver.zig").VulkanProcResolver;
@@ -10,21 +11,7 @@ const required_layer_names = [_][*:0]const u8{};
 
 const required_device_extensions = [_][*:0]const u8{vk.extensions.khr_swapchain.name};
 
-/// There are 3 levels of bindings in vulkan-zig:
-/// - The Dispatch types (vk.BaseDispatch, vk.InstanceDispatch, vk.DeviceDispatch)
-///   are "plain" structs which just contain the function pointers for a particular
-///   object.
-/// - The Wrapper types (vk.Basewrapper, vk.InstanceWrapper, vk.DeviceWrapper) contains
-///   the Dispatch type, as well as Ziggified Vulkan functions - these return Zig errors,
-///   etc.
-/// - The Proxy types (vk.InstanceProxy, vk.DeviceProxy, vk.CommandBufferProxy,
-///   vk.QueueProxy) contain a pointer to a Wrapper and also contain the object's handle.
-///   Calling Ziggified functions on these types automatically passes the handle as
-///   the first parameter of each function. Note that this type accepts a pointer to
-///   a wrapper struct as there is a problem with LLVM where embedding function pointers
-///   and object pointer in the same struct leads to missed optimizations. If the wrapper
-///   member is a pointer, LLVM will try to optimize it as any other vtable.
-/// The wrappers contain
+// Proxies borrow heap-stable dispatch wrappers for the native object's lifetime.
 const BaseWrapper = vk.BaseWrapper;
 const InstanceWrapper = vk.InstanceWrapper;
 const DeviceWrapper = vk.DeviceWrapper;
@@ -71,11 +58,9 @@ pub const GraphicsContext = struct {
     present_queue: Queue,
 
     pub fn init(allocator: Allocator, app_name: [*:0]const u8, surface_source: SurfaceSource) !GraphicsContext {
-        var self: GraphicsContext = undefined;
-        self.allocator = allocator;
-        self.vkb = BaseWrapper.load(&VulkanProcResolver.resolver);
+        const vkb = BaseWrapper.load(&VulkanProcResolver.resolver);
 
-        if (try checkLayerSupport(&self.vkb, self.allocator) == false) return error.MissingLayer;
+        if (!try checkLayerSupport(&vkb, allocator)) return error.MissingLayer;
 
         var extension_names: std.ArrayList([*:0]const u8) = .empty;
         defer extension_names.deinit(allocator);
@@ -89,7 +74,10 @@ pub const GraphicsContext = struct {
         try extension_names.append(allocator, vk.extensions.khr_portability_enumeration.name);
         try extension_names.append(allocator, vk.extensions.khr_get_physical_device_properties_2.name);
 
-        const instance = try self.vkb.createInstance(&.{
+        const vki = try createWrapper(allocator, InstanceWrapper);
+        errdefer destroyWrapper(allocator, vki);
+
+        const instance_handle = try vkb.createInstance(&.{
             .p_application_info = &.{
                 .p_application_name = app_name,
                 .application_version = @bitCast(vk.makeApiVersion(0, 0, 0, 0)),
@@ -106,13 +94,11 @@ pub const GraphicsContext = struct {
             .flags = .{ .enumerate_portability_bit_khr = true },
         }, null);
 
-        const vki = try createWrapper(allocator, InstanceWrapper);
-        errdefer destroyWrapper(allocator, vki);
-        vki.* = InstanceWrapper.load(instance, self.vkb.dispatch.vkGetInstanceProcAddr.?);
-        self.instance = Instance.init(instance, vki);
-        errdefer self.instance.destroyInstance(null);
+        vki.* = InstanceWrapper.load(instance_handle, vkb.dispatch.vkGetInstanceProcAddr.?);
+        const instance = Instance.init(instance_handle, vki);
+        errdefer instance.destroyInstance(null);
 
-        self.debug_messenger = try self.instance.createDebugUtilsMessengerEXT(&.{
+        const debug_messenger = try instance.createDebugUtilsMessengerEXT(&.{
             .message_severity = .{
                 //.verbose_bit_ext = true,
                 //.info_bit_ext = true,
@@ -127,28 +113,34 @@ pub const GraphicsContext = struct {
             .pfn_user_callback = &debugUtilsMessengerCallback,
             .p_user_data = null,
         }, null);
+        errdefer instance.destroyDebugUtilsMessengerEXT(debug_messenger, null);
 
-        self.surface = try createSurface(self.instance, surface_source);
-        errdefer self.instance.destroySurfaceKHR(self.surface, null);
+        const surface = try createSurface(instance, surface_source);
+        errdefer instance.destroySurfaceKHR(surface, null);
 
-        const candidate = try pickPhysicalDevice(self.instance, allocator, self.surface);
-        self.pdev = candidate.pdev;
-        self.props = candidate.props;
-
-        const dev = try initializeCandidate(self.instance, candidate);
+        const candidate = try pickPhysicalDevice(instance, allocator, surface);
 
         const vkd = try createWrapper(allocator, DeviceWrapper);
         errdefer destroyWrapper(allocator, vkd);
-        vkd.* = DeviceWrapper.load(dev, self.instance.wrapper.dispatch.vkGetDeviceProcAddr.?);
-        self.dev = Device.init(dev, vkd);
-        errdefer self.dev.destroyDevice(null);
 
-        self.graphics_queue = Queue.init(self.dev, candidate.queues.graphics_family);
-        self.present_queue = Queue.init(self.dev, candidate.queues.present_family);
+        const device_handle = try initializeCandidate(instance, candidate);
+        vkd.* = DeviceWrapper.load(device_handle, instance.wrapper.dispatch.vkGetDeviceProcAddr.?);
+        const dev = Device.init(device_handle, vkd);
+        errdefer dev.destroyDevice(null);
 
-        self.mem_props = self.instance.getPhysicalDeviceMemoryProperties(self.pdev);
-
-        return self;
+        return .{
+            .allocator = allocator,
+            .vkb = vkb,
+            .instance = instance,
+            .debug_messenger = debug_messenger,
+            .surface = surface,
+            .pdev = candidate.pdev,
+            .props = candidate.props,
+            .mem_props = instance.getPhysicalDeviceMemoryProperties(candidate.pdev),
+            .dev = dev,
+            .graphics_queue = Queue.init(dev, candidate.queues.graphics_family),
+            .present_queue = Queue.init(dev, candidate.queues.present_family),
+        };
     }
 
     pub fn deinit(self: GraphicsContext) void {
@@ -157,7 +149,6 @@ pub const GraphicsContext = struct {
         self.instance.destroyDebugUtilsMessengerEXT(self.debug_messenger, null);
         self.instance.destroyInstance(null);
 
-        // Don't forget to free the tables to prevent a memory leak.
         destroyWrapper(self.allocator, self.dev.wrapper);
         destroyWrapper(self.allocator, self.instance.wrapper);
     }

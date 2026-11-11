@@ -13,7 +13,7 @@ const ResolvedSymbol = DynObject.ResolvedSymbol;
 /// Loader operations used during native-runtime inspection and preparation.
 /// Returned object pointers are borrowed until the next registry mutation.
 /// Backends retain mapped addresses, never registry-entry pointers.
-/// The loader owns registries; Zig owns thread stacks and kernel thread-exit
+/// The loader owns registries. Zig owns thread stacks and kernel thread-exit
 /// notification.
 pub const Services = struct {
     /// Native loading operations supplied by DynLoader. Handles belong to the loader.
@@ -36,11 +36,11 @@ pub const Services = struct {
 
     /// Bytes reserved by the loader at and above the thread pointer.
     native_metadata_capacity: usize,
-    lookupSymbol: *const fn (object: *DynObject, name: []const u8, allow_preload_override: bool) anyerror!ResolvedSymbol,
-    lookupRuntimeSymbol: *const fn (name: []const u8) anyerror!ResolvedSymbol,
+    lookupSymbol: *const fn (object: *DynObject, name: []const u8, allow_preload_override: bool) DynObject.SymbolLookupError!ResolvedSymbol,
+    lookupRuntimeSymbol: *const fn (name: []const u8) DynObject.SymbolLookupError!ResolvedSymbol,
     definingObject: *const fn (symbol: ResolvedSymbol) *DynObject,
-    inspectSymbol: *const fn (object: *DynObject, name: []const u8) anyerror!DynObject.Definition,
-    findSegment: *const fn (address: usize) anyerror!DynObject.DynObjectSegmentResult,
+    inspectSymbol: *const fn (object: *DynObject, name: []const u8) DynObject.SymbolLookupError!DynObject.Definition,
+    findSegment: *const fn (address: usize) error{ AddressNotInMappedSegments, LoadedAddressNotMapped }!DynObject.DynObjectSegmentResult,
     runtimeValues: *const fn () RuntimeValues,
     malloc_substitute: *const anyopaque,
     calloc_substitute: *const anyopaque,
@@ -68,7 +68,7 @@ pub const RuntimeValues = struct {
 
 /// Deferred native-field assignment. Values are computed when applied.
 /// `addr` is a loaded address for `.zero` or an unsigned TP offset for `.tp`.
-/// `.tid` writes a `c_int`; other values write a pointer-sized word.
+/// `.tid` writes a `c_int`. Other values write a pointer-sized word.
 pub const WriteOp = struct {
     addr: usize,
     relative_to: enum { zero, tp },
@@ -84,30 +84,36 @@ pub const WriteOp = struct {
     },
 };
 
+pub const InitialThreadError = error{ GlibcThreadListsAlreadyInitialized, GlibcThreadAlreadyRegistered };
+/// Inspection details are logged by the backend. Allocation failures stay distinct.
+pub const ObjectPreparationError = error{ OutOfMemory, UnrecognizedGlibcThreadLayout, NativeMetadataCapacityExceeded, Overflow };
+/// Preparation failure leaves code unchanged. Permission failures attempt rollback.
+pub const AllocatorPatchError = error{ OutOfMemory, LibcPatchPreparationFailed, ProtectSegmentFailed };
+
 /// Every slot has an explicit implementation, including intentional no-ops.
 /// Worker resource preparation and native registration run without the thread-registry lock.
 /// Backends synchronize native lists independently of loader metadata.
 pub const VTable = struct {
     destroyState: *const fn (runtime: *Runtime) void,
-    initInitialThread: *const fn (runtime: *Runtime) anyerror!void,
-    prepareThreads: *const fn (runtime: *Runtime) anyerror!void,
+    initInitialThread: *const fn (runtime: *Runtime) InitialThreadError!void,
+    prepareThreads: *const fn (runtime: *Runtime) InitialThreadError!void,
     supportsWorkers: *const fn (runtime: *const Runtime) bool,
-    prepareObject: *const fn (runtime: *Runtime, object: *DynObject) anyerror!void,
+    prepareObject: *const fn (runtime: *Runtime, object: *DynObject) ObjectPreparationError!void,
     threadStorageSize: *const fn (runtime: *const Runtime) usize,
-    patchAllocatorCalls: *const fn (runtime: *Runtime, object: *DynObject) anyerror!void,
+    patchAllocatorCalls: *const fn (runtime: *Runtime, object: *DynObject) AllocatorPatchError!void,
     initWorker: *const fn (runtime: *Runtime) WorkerHandle,
-    prepareWorker: *const fn (worker: *WorkerHandle) anyerror!void,
+    prepareWorker: *const fn (worker: *WorkerHandle) std.mem.Allocator.Error!void,
     beginSpawn: *const fn (worker: *WorkerHandle) void,
     spawnFailed: *const fn (worker: *WorkerHandle) void,
-    registerWorker: *const fn (worker: *const WorkerHandle, tp: usize) anyerror!void,
+    registerWorker: *const fn (worker: *const WorkerHandle, tp: usize) error{}!void,
     enterUserCode: *const fn (worker: *const WorkerHandle) void,
     finishStartup: *const fn (worker: *const WorkerHandle) void,
     unregisterWorker: *const fn (worker: *const WorkerHandle, tp: usize) void,
     releaseAfterJoin: *const fn (worker: *const WorkerHandle) void,
 };
 
-/// Owns heap-allocated backend state and its write plan. Copies alias that storage;
-/// only one owner may deinitialize it.
+/// Owns heap-allocated backend state and its write plan. Copies alias that storage.
+/// Only one owner may deinitialize it.
 /// Keep this handle and its services stable until all workers join and release
 /// their backend storage.
 pub const Runtime = struct {
@@ -135,11 +141,11 @@ pub const Runtime = struct {
     getErrnoLocation: *const fn () callconv(.c) *c_int,
     native_mq_notify: std.atomic.Value(usize),
     native_timer_create: [4]std.atomic.Value(usize),
-    readiness: std.atomic.Value(Readiness) = .init(.unavailable),
-    initial_fields_written: bool = false,
-    initial_thread_initialized: bool = false,
+    readiness: std.atomic.Value(Readiness),
+    initial_fields_written: bool,
+    initial_thread_initialized: bool,
 
-    /// Takes ownership of backend state; services and native code remain borrowed.
+    /// Takes ownership of backend state. Services and native code remain borrowed.
     pub fn init(allocator: std.mem.Allocator, options: InitOptions) Runtime {
         return .{
             .allocator = allocator,
@@ -150,6 +156,9 @@ pub const Runtime = struct {
             .getErrnoLocation = options.getErrnoLocation,
             .native_mq_notify = .init(0),
             .native_timer_create = @splat(.init(0)),
+            .readiness = .init(.unavailable),
+            .initial_fields_written = false,
+            .initial_thread_initialized = false,
         };
     }
 
@@ -172,7 +181,7 @@ pub const Runtime = struct {
     }
 
     /// Requires transaction ownership. Prerequisite discovery happens before
-    /// this boundary; failures during permanent native preparation panic.
+    /// this boundary. Failures during permanent native preparation panic.
     pub fn beforeConstructors(self: *Runtime, name: []const u8) void {
         switch (self.readiness.load(.acquire)) {
             .ready, .preparing => return,
@@ -382,7 +391,7 @@ pub const WorkerHandle = struct {
         logger.debug("worker.enter: tp_host=0x{x} action=complete", .{tp});
     }
 
-    /// Runs in the creator without the registry lock; releases startup ownership.
+    /// Releases startup ownership in the creator without the registry lock.
     pub fn finishStartup(self: *const WorkerHandle) void {
         logger.debug("worker.startup: parent_tp_host=0x{x} backend_state_host=0x{x} action=finish_begin", .{ self.parent_tp, @intFromPtr(self.state) });
         self.runtime.vtable.finishStartup(self);
@@ -407,7 +416,7 @@ pub const ObjectRole = enum { ordinary, libc, loader, thread_support };
 
 /// System libc names in search order, with established names before
 /// architecture-qualified fallbacks.
-/// `libc.so` is a shared alias; each backend supplies its other names.
+/// `libc.so` is a shared alias. Each backend supplies its other names.
 pub const system_libc_names = glibc.system_libc_names ++ [_][]const u8{"libc.so"} ++ musl.system_libc_names;
 
 pub fn objectRole(name: []const u8) ObjectRole {

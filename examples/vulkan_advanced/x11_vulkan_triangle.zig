@@ -1,5 +1,7 @@
 const std = @import("std");
+
 const dyn_loader = @import("dyn_loader");
+
 const vk = @import("vk.zig");
 const Xlib = @import("xlib.zig").Xlib;
 const VulkanProcResolver = @import("vulkan_proc_resolver.zig").VulkanProcResolver;
@@ -178,6 +180,12 @@ pub fn main(init: std.process.Init) !void {
     _ = xChangeWindowAttributes(x11_display, x11_window, Xlib.CWBackPixmap, &attrs);
 
     var state: Swapchain.PresentState = .optimal;
+    // Stop GPU access before deferred destruction, including on presentation errors.
+    defer gc.dev.deviceWaitIdle() catch |err| switch (err) {
+        error.DeviceLost => {},
+        else => @panic("unable to quiesce Vulkan device"),
+    };
+
     main_loop: while (true) {
         var attr: Xlib.XWindowAttributes = undefined;
         _ = xGetWindowAttributes(x11_display, x11_window, &attr);
@@ -211,6 +219,13 @@ pub fn main(init: std.process.Init) !void {
         if (state == .suboptimal or extent.width != @as(u32, @intCast(w)) or extent.height != @as(u32, @intCast(h))) {
             extent.width = @intCast(w);
             extent.height = @intCast(h);
+
+            try gc.dev.deviceWaitIdle();
+            destroyCommandBuffers(&gc, pool, allocator, cmdbufs);
+            cmdbufs = &.{};
+            destroyFramebuffers(&gc, allocator, framebuffers);
+            framebuffers = &.{};
+
             var do_recycle: bool = true;
             while (true) {
                 swapchain.recreate(extent, do_recycle) catch |err| switch (err) {
@@ -226,10 +241,8 @@ pub fn main(init: std.process.Init) !void {
                 break;
             }
 
-            destroyFramebuffers(&gc, allocator, framebuffers);
             framebuffers = try createFramebuffers(&gc, allocator, render_pass, swapchain);
 
-            destroyCommandBuffers(&gc, pool, allocator, cmdbufs);
             cmdbufs = try createCommandBuffers(
                 &gc,
                 pool,
@@ -399,6 +412,8 @@ fn createCommandBuffers(
 }
 
 fn destroyCommandBuffers(gc: *const GraphicsContext, pool: vk.CommandPool, allocator: Allocator, cmdbufs: []vk.CommandBuffer) void {
+    if (cmdbufs.len == 0) return;
+
     gc.dev.freeCommandBuffers(pool, @truncate(cmdbufs.len), cmdbufs.ptr);
     allocator.free(cmdbufs);
 }

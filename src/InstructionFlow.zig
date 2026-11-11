@@ -13,7 +13,7 @@ const Self = @This();
 // ------------------------------------------------
 
 /// Register indices use the x86 encoding order, including the REX extension bit.
-/// Native calls use the System V AMD64 ABI; syscalls use the Linux convention.
+/// Native calls use the System V AMD64 ABI. Syscalls use the Linux convention.
 /// Pointers are 64 bits.
 pub const Register = struct {
     pub const rax: u4 = 0;
@@ -34,17 +34,23 @@ const caller_saved_registers = [_]u4{ Register.rax, Register.rcx, Register.rdx, 
 /// related pointers. `thread` originates at a configured `FS` self-pointer offset.
 ///
 /// Payload convention (`load` below denotes a symbolic read, not a host read):
-/// - `unknown`: no usable value; `constant`: integer `a`; `range`: inclusive `[a,b]`.
-/// - `address`: ELF address `a`; `global`: `load(a)`.
-/// - `global_address`: `load(a) + b`; `global_field`: `load(load(a) + b)`.
+/// - `unknown`: no usable value.
+/// - `constant`: integer `a`.
+/// - `range`: inclusive `[a,b]`.
+/// - `address`: ELF address `a`.
+/// - `global`: `load(a)`.
+/// - `global_address`: `load(a) + b`.
+/// - `global_field`: `load(load(a) + b)`.
 /// - `indirect_address`: `load(load(a) + b) + c`.
 /// - `indirect_field`: `load(load(load(a) + b) + c)`.
 /// - `sum`: fields at offsets `b` and `c` from `load(a)`, added with `bias`.
-/// - `thread`: current thread pointer; `thread_address`: that pointer plus `b`;
-///   `thread_field`: contents at that offset.
+/// - `thread`: current thread pointer.
+/// - `thread_address`: thread pointer plus `b`.
+/// - `thread_field`: contents at that thread offset.
 /// - `stack`: entry stack pointer plus signed byte offset `a`.
-/// - `call`: return from call-site byte offset `a`, with ELF target in `b`;
-///   `call_address`: that return value plus `b`; `call_field`: contents there.
+/// - `call`: return from call-site byte offset `a`, with ELF target in `b`.
+/// - `call_address`: call return value plus `b`.
+/// - `call_field`: contents at that call-result offset.
 ///
 /// Unused payload fields stay zero because equality compares the whole value.
 pub const Value = struct {
@@ -100,7 +106,7 @@ pub const Value = struct {
 
 pub const Memory = struct {
     // Effective address: base + index * scale + signed displacement. `rip`
-    // uses the end of the instruction as the base; `fs` selects the thread base.
+    // uses the end of the instruction as the base. `fs` selects the thread base.
     base: ?u4 = null,
     index: ?u4 = null,
     scale: u4 = 1,
@@ -253,21 +259,16 @@ pub const Node = struct {
     reached: bool = false,
 };
 
-allocator: std.mem.Allocator,
-code: CodeView,
-nodes: std.ArrayList(Node),
-options: Options,
-
 pub const Options = struct {
     /// Native TCB self-pointer positions, relative to `FS`. glibc additionally
-    /// exposes `tcbhead_t.self` at offset 16; musl inspection uses only offset 0.
+    /// exposes `tcbhead_t.self` at offset 16. Musl inspection uses only offset 0.
     thread_self_offsets: []const i64 = &.{0},
     /// ELF call targets known not to return. Unused entries are `null`.
     noreturn_targets: [8]?usize = @splat(null),
     /// External conditional edges are rejected unless explicitly authorized.
     /// The validator is called only for reachable edges during construction.
     external_exits: [16]?usize = @splat(null),
-    /// Borrowed context shared by the callbacks; required when any is used.
+    /// Borrowed context shared by the callbacks. Required when any is used.
     external_exit_context: ?*anyopaque = null,
     validateExternalExit: ?*const fn (context: *anyopaque, address: usize) anyerror!bool = null,
     /// Known entry values. Unknown entries leave defaults intact, including `RSP`.
@@ -288,12 +289,17 @@ pub const Options = struct {
     log_errors: bool = true,
 };
 
+allocator: std.mem.Allocator,
+code: CodeView,
+nodes: std.ArrayList(Node),
+options: Options,
+
 // Reachable decoding and fixed-point propagation.
 // -----------------------------------------------
 
 /// Owns decoded instructions and their incoming states. The input bytes remain
-/// borrowed. Direct branches must land on decoded boundaries inside the view;
-/// a direct tail jump outside the function terminates that path.
+/// borrowed. Direct branches must land on decoded boundaries inside the view.
+/// A direct tail jump outside the function terminates that path.
 pub fn init(allocator: std.mem.Allocator, code: CodeView) !Self {
     return initWithOptions(allocator, code, .{});
 }
@@ -301,7 +307,7 @@ pub fn init(allocator: std.mem.Allocator, code: CodeView) !Self {
 /// Builds a complete analysis, freeing partial allocations on failure.
 /// Exceeding inspection limits returns an error, never a partial result.
 /// The result owns its node array and borrows `code` bytes and option context.
-/// Copies share the allocation; only its owner may call `deinit`.
+/// Copies share the allocation. Only its owner may call `deinit`.
 pub fn initWithOptions(allocator: std.mem.Allocator, code: CodeView, options: Options) !Self {
     logger.debug("instruction.analysis: code_elf=0x{x} size={d} action=begin log_errors={}", .{ code.address, code.bytes.len, options.log_errors });
     errdefer logger.debug("instruction.analysis: code_elf=0x{x} size={d} action=rejected", .{ code.address, code.bytes.len });
@@ -341,8 +347,8 @@ pub fn initWithOptions(allocator: std.mem.Allocator, code: CodeView, options: Op
         occupied[offset] = 1;
         try self.nodes.append(allocator, .{ .instruction = instruction });
 
-        // Calls are not followed into their callees. Branches add successors;
-        // an external conditional edge needs the backend's explicit proof.
+        // Calls are not followed into their callees. Branches add successors.
+        // An external conditional edge needs the backend's explicit proof.
         if (instruction.op == .branch or instruction.op == .jump) {
             const target = instruction.target orelse {
                 if (instruction.op == .jump and options.allow_indirect_tail_exits) continue;
@@ -357,7 +363,7 @@ pub fn initWithOptions(allocator: std.mem.Allocator, code: CodeView, options: Op
                 self.options.external_exits[slot] = target;
             }
         }
-        if (instruction.op != .ret and instruction.op != .jump and !self.noReturn(instruction) and instruction.end < code.bytes.len) {
+        if (self.fallsThrough(instruction) and instruction.end < code.bytes.len) {
             try pending.append(allocator, instruction.end);
         }
     }
@@ -409,7 +415,7 @@ pub fn initWithOptions(allocator: std.mem.Allocator, code: CodeView, options: Op
                     return error.InvalidInstructionBranch;
                 }
             }
-            if (instruction.op != .ret and instruction.op != .jump and !self.noReturn(instruction) and index + 1 < self.nodes.items.len) {
+            if (self.fallsThrough(instruction) and index + 1 < self.nodes.items.len) {
                 changed = self.propagate(index + 1, &state) or changed;
             }
         }
@@ -430,6 +436,42 @@ pub fn initWithOptions(allocator: std.mem.Allocator, code: CodeView, options: Op
         }
     }
     return self;
+}
+
+/// Determines whether execution can reach the instruction immediately following.
+fn fallsThrough(self: Self, instruction: Instruction) bool {
+    return switch (instruction.op) {
+        .ret, .jump => false,
+        .call => !self.noReturn(instruction),
+        .mov,
+        .lea,
+        .add,
+        .sub,
+        .sbb,
+        .bit_and,
+        .bit_xor,
+        .compare,
+        .branch,
+        .push,
+        .pop,
+        .leave,
+        .cmov,
+        .setcc,
+        .clobber,
+        .exchange,
+        .string_store,
+        .divide,
+        .multiply,
+        .vector_move,
+        .vector_unpack,
+        .vector_high,
+        .vector_shift,
+        .vector_add,
+        .vector_xor,
+        .nop,
+        .syscall,
+        => true,
+    };
 }
 
 fn noReturn(self: Self, instruction: Instruction) bool {
@@ -487,7 +529,7 @@ pub fn value(self: Self, node: Node, operand: Operand) Value {
 }
 
 /// Returns a memory destination's address, not its contents. Other destinations
-/// return `unknown`; callers inspect the operand for register destinations.
+/// return `unknown`. Callers inspect the operand for register destinations.
 pub fn destination(self: Self, node: Node) Value {
     return switch (node.instruction.dst) {
         .memory => |memory| self.address(&node.state, node.instruction, memory),
@@ -692,7 +734,7 @@ fn execute(self: Self, state: *State, instruction: Instruction) anyerror!void {
         },
         .syscall => {
             // Model selected kernel output buffers before discarding register
-            // facts. `rt_sigprocmask` writes its third argument; basic futex
+            // facts. `rt_sigprocmask` writes its third argument. Basic futex
             // wait/wake and `sched_setscheduler` do not write frame buffers.
             // Other syscalls discard all spills because their writes are unknown.
             const number = state.registers[Register.rax];
@@ -705,7 +747,7 @@ fn execute(self: Self, state: *State, instruction: Instruction) anyerror!void {
                 }
             } else if (number.is(.constant, @backingInt(std.os.linux.SYS.futex))) {
                 const operation = state.registers[Register.rsi];
-                // Low seven bits select the futex command; 0/1 are wait/wake.
+                // Low seven bits select the futex command. 0/1 are wait/wake.
                 if (operation.kind != .constant or (operation.a & 0x7f) > 1) {
                     state.slots = @splat(.{});
                 }
@@ -714,7 +756,7 @@ fn execute(self: Self, state: *State, instruction: Instruction) anyerror!void {
             }
 
             if (self.options.preserve_syscall_arguments) {
-                // Hardware overwrites `RCX`/`R11`; `RAX` holds the result.
+                // Hardware overwrites `RCX`/`R11`. `RAX` holds the result.
                 for ([_]u4{ Register.rax, Register.rcx, 11 }) |reg| {
                     state.registers[reg] = .{};
                 }
@@ -923,7 +965,7 @@ pub fn decode(code: CodeView, offset: usize) !Instruction {
     if (opcode == 0x0f) second = try r.byte();
 
     // Clang emits address-size-prefixed `ud1` traps. No address calculation is
-    // executed for that instruction; other address-size overrides are rejected.
+    // executed for that instruction. Other address-size overrides are rejected.
     if (address_override and second != 0xb9 and opcode != 0xe8 and opcode != 0xe9) return error.UnsupportedInstruction;
     var relative: ?i64 = null;
     const immediate_size: usize = if (short) 2 else 4;
@@ -991,7 +1033,7 @@ pub fn decode(code: CodeView, offset: usize) !Instruction {
         instruction.src = .{ .immediate = try r.integer(immediate_size) };
     } else {
         // ModR/M contains an addressing mode, a register/opcode-extension field,
-        // and a register-or-memory field. REX.R extends the register field;
+        // and a register-or-memory field. REX.R extends the register field.
         // REX.B extends the other register or memory base.
         const modrm = try r.byte();
         const mode = modrm >> 6;
@@ -1005,7 +1047,7 @@ pub fn decode(code: CodeView, offset: usize) !Instruction {
             var memory: Memory = .{ .fs = fs };
             if (low == 4) {
                 // SIB encodes scale/index/base. Index 4 means no index unless
-                // REX.X extends it; mode 0/base 5 means a displacement-only base.
+                // REX.X extends it. Mode 0/base 5 means a displacement-only base.
                 const sib = try r.byte();
                 memory.scale = @as(u4, 1) << @as(u2, @intCast(sib >> 6));
                 if ((sib >> 3) & 7 != 4 or rex & 2 != 0) memory.index = @intCast(((sib >> 3) & 7) | ((rex & 2) << 2));
@@ -1144,8 +1186,8 @@ pub fn decode(code: CodeView, offset: usize) !Instruction {
                 instruction.src = .{ .immediate = try r.integer(if (opcode == 0xc6) 1 else immediate_size) };
             },
             0x80, 0x81, 0x83 => {
-                // The ModR/M register field selects the arithmetic operation;
-                // it is not a source register for these immediate forms.
+                // The ModR/M register field selects the arithmetic operation.
+                // It is not a source register for these immediate forms.
                 instruction.op = switch (group) {
                     0 => .add,
                     3 => .sbb,
@@ -1232,7 +1274,7 @@ pub fn decode(code: CodeView, offset: usize) !Instruction {
 
     if (instruction.width == 8 and rex == 0) {
         // Legacy `AH`..`BH` do not name the low bytes of registers 4..7.
-        // Reads establish no layout fact; writes invalidate the actual parent.
+        // Reads establish no layout fact. Writes invalidate the actual parent.
         for ([_]*Operand{ &instruction.dst, &instruction.src }) |operand| {
             if (operand.* == .reg and operand.reg >= 4 and operand.reg <= 7) {
                 const high: u2 = @intCast(operand.reg - 4);
@@ -1608,7 +1650,7 @@ test "inspection options preserve glibc self pointers across syscalls" {
 
 test "non-returning calls exclude following bytes and unknown external edges fail" {
     // call 0x2000
-    // Trailing 0x62, 0x00 begins an unsupported EVEX encoding; it is unreachable
+    // Trailing 0x62, 0x00 begins an unsupported EVEX encoding. It is unreachable
     // only when the call target is known not to return.
     const bytes = "\xe8\xfb\x0f\x00\x00\x62\x00";
     var options: Options = .{ .log_errors = false };

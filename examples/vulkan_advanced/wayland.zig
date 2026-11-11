@@ -43,39 +43,39 @@ pub const Argument = extern union {
 };
 
 pub const RegistryListener = extern struct {
-    global: *const fn (?*anyopaque, *Registry, u32, [*:0]const u8, u32) callconv(.c) void,
-    global_remove: *const fn (?*anyopaque, *Registry, u32) callconv(.c) void,
+    global: *const fn (data: ?*anyopaque, registry: *Registry, name: u32, interface: [*:0]const u8, version: u32) callconv(.c) void,
+    global_remove: *const fn (data: ?*anyopaque, registry: *Registry, name: u32) callconv(.c) void,
 };
 
 pub const XdgWmBaseListener = extern struct {
-    ping: *const fn (?*anyopaque, *XdgWmBase, u32) callconv(.c) void,
+    ping: *const fn (data: ?*anyopaque, wm_base: *XdgWmBase, serial: u32) callconv(.c) void,
 };
 
 pub const XdgSurfaceListener = extern struct {
-    configure: *const fn (?*anyopaque, *XdgSurface, u32) callconv(.c) void,
+    configure: *const fn (data: ?*anyopaque, surface: *XdgSurface, serial: u32) callconv(.c) void,
 };
 
 pub const XdgToplevelListener = extern struct {
-    configure: *const fn (?*anyopaque, *XdgToplevel, i32, i32, *Array) callconv(.c) void,
-    close: *const fn (?*anyopaque, *XdgToplevel) callconv(.c) void,
+    configure: *const fn (data: ?*anyopaque, toplevel: *XdgToplevel, width: i32, height: i32, states: *Array) callconv(.c) void,
+    close: *const fn (data: ?*anyopaque, toplevel: *XdgToplevel) callconv(.c) void,
 };
 
 const marshal_flag_destroy: u32 = 1;
 
-const DisplayConnect = fn (?[*:0]const u8) callconv(.c) ?*Display;
-const DisplayDisconnect = fn (*Display) callconv(.c) void;
-const DisplayGetFd = fn (*Display) callconv(.c) c_int;
-const DisplayDispatchPending = fn (*Display) callconv(.c) c_int;
-const DisplayGetError = fn (*Display) callconv(.c) c_int;
-const DisplayFlush = fn (*Display) callconv(.c) c_int;
-const DisplayRoundtrip = fn (*Display) callconv(.c) c_int;
-const DisplayPrepareRead = fn (*Display) callconv(.c) c_int;
-const DisplayCancelRead = fn (*Display) callconv(.c) void;
-const DisplayReadEvents = fn (*Display) callconv(.c) c_int;
-const ProxyMarshalArrayFlags = fn (*Proxy, u32, ?*const Interface, u32, u32, [*c]Argument) callconv(.c) ?*Proxy;
-const ProxyAddListener = fn (*Proxy, *const anyopaque, ?*anyopaque) callconv(.c) c_int;
-const ProxyGetVersion = fn (*Proxy) callconv(.c) u32;
-const ProxyDestroy = fn (*Proxy) callconv(.c) void;
+const DisplayConnect = fn (name: ?[*:0]const u8) callconv(.c) ?*Display;
+const DisplayDisconnect = fn (display: *Display) callconv(.c) void;
+const DisplayGetFd = fn (display: *Display) callconv(.c) c_int;
+const DisplayDispatchPending = fn (display: *Display) callconv(.c) c_int;
+const DisplayGetError = fn (display: *Display) callconv(.c) c_int;
+const DisplayFlush = fn (display: *Display) callconv(.c) c_int;
+const DisplayRoundtrip = fn (display: *Display) callconv(.c) c_int;
+const DisplayPrepareRead = fn (display: *Display) callconv(.c) c_int;
+const DisplayCancelRead = fn (display: *Display) callconv(.c) void;
+const DisplayReadEvents = fn (display: *Display) callconv(.c) c_int;
+const ProxyMarshalArrayFlags = fn (proxy: *Proxy, opcode: u32, interface: ?*const Interface, version: u32, flags: u32, args: [*c]Argument) callconv(.c) ?*Proxy;
+const ProxyAddListener = fn (proxy: *Proxy, listener: *const anyopaque, data: ?*anyopaque) callconv(.c) c_int;
+const ProxyGetVersion = fn (proxy: *Proxy) callconv(.c) u32;
+const ProxyDestroy = fn (proxy: *Proxy) callconv(.c) void;
 
 pub const Api = struct {
     display_connect: *const DisplayConnect,

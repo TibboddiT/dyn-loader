@@ -29,7 +29,7 @@ pub const LoadSegmentFlags = struct {
 };
 
 pub const LoadSegment = struct {
-    // File coordinates name bytes in the original ELF; memory coordinates name
+    // File coordinates name bytes in the original ELF. Memory coordinates name
     // ELF virtual addresses. `loaded_at` is the host address after mapping.
     file_offset: usize,
     file_size: usize,
@@ -74,9 +74,12 @@ pub const DynSym = struct {
 };
 
 /// Names map to ranges in one owned index buffer, preserving ELF symbol order.
-/// Name keys borrow the symbol strings; returned ranges borrow the index buffer.
+/// Name keys borrow the symbol strings. Returned ranges borrow the index buffer.
 pub const DynSymList = struct {
-    const Range = struct { start: usize = 0, len: usize = 0 };
+    const Range = struct {
+        start: usize = 0,
+        len: usize = 0,
+    };
 
     names: std.StringArrayHashMapUnmanaged(Range) = .empty,
     indices: std.ArrayList(usize) = .empty,
@@ -102,6 +105,7 @@ pub const DynSymList = struct {
             start += range.len;
             range.len = 0;
         }
+
         self.indices.items.len = symbols.len;
         for (symbols, 0..) |symbol, index| {
             const range = self.names.getPtr(symbol.name).?;
@@ -133,7 +137,7 @@ pub const DynSymList = struct {
 
 pub const ResolvedSymbol = struct {
     // `value` preserves st_value: an ELF value or a module-relative TLS offset.
-    // Indices avoid registry-entry pointers; names and versions borrow the ELF file mapping.
+    // Indices avoid registry-entry pointers. Names and versions borrow the ELF file mapping.
     value: usize,
     location: union(enum) {
         address: usize,
@@ -181,14 +185,23 @@ pub const Definition = struct {
 };
 
 /// An object and lookup callback borrowed during inspection.
-/// Lookup may resolve a dependency; check the owner when local code is required.
+/// Lookup may resolve a dependency. Check the owner when local code is required.
 pub const Inspection = struct {
     object: *DynObject,
-    lookup: *const fn (object: *DynObject, name: []const u8) anyerror!Definition,
+    lookup: *const fn (object: *DynObject, name: []const u8) SymbolLookupError!Definition,
+};
+
+/// Failures shared by symbol lookup and native-runtime inspection callbacks.
+pub const SymbolLookupError = error{
+    OutOfMemory,
+    UnresolvedSymbol,
+    AddressNotInMappedSegments,
+    Overflow,
+    TlsSymbolHasNoStaticAddress,
 };
 
 // Strings and containers are owned by the loader through this entry. The file
-// mapping supplies borrowed header/symbol data; the separate reservation holds
+// mapping supplies borrowed header/symbol data. The separate reservation holds
 // loaded segments. Registry growth can move this struct without moving mappings.
 key: DynObjectId,
 name: []const u8,
@@ -202,7 +215,7 @@ mapped_size: usize,
 segments: LoadSegmentList,
 
 // Initializer coordinates come from PT_TLS. `tls_offset` is a positive distance
-// below TP; capacity/alignment survive retirement to permit compatible reuse.
+// below TP. Capacity/alignment survive retirement to permit compatible reuse.
 tls_init_file_offset: usize,
 tls_init_file_size: usize,
 tls_init_mem_offset: usize,
@@ -210,8 +223,8 @@ tls_init_mem_size: usize,
 tls_align: usize,
 tls_offset: usize,
 tls_mapped_at: usize,
-tls_module_id: ?TlsModuleId = null,
-tls_published: bool = false,
+tls_module_id: ?TlsModuleId,
+tls_published: bool,
 
 eh: *std.elf.Elf64_Ehdr,
 eh_init_file_offset: usize,
@@ -238,15 +251,15 @@ fini_array_size: usize,
 
 // These flags describe separate phases, not interchangeable "loaded" states.
 loaded: bool, // Final permissions and debug publication are complete.
-initializing: bool = false,
-initialization_failed: bool = false,
-execution_started: bool = false,
+initializing: bool,
+initialization_failed: bool,
+execution_started: bool,
 init_called: bool,
 current_epoch: u30,
 ref_count: usize,
-host_open_count: usize = 0,
-nodelete_requested: bool = false,
-nodelete: bool = false,
+host_open_count: usize,
+nodelete_requested: bool,
+nodelete: bool,
 loaded_at: ?usize,
 loaded_size: usize,
 reservation: ?[]align(std.heap.pageSize()) u8,
@@ -255,7 +268,7 @@ tls_slot_align: usize,
 load_requested: bool,
 finalizing: bool,
 pinned: bool,
-runtime_pinned: bool = false,
+runtime_pinned: bool,
 tls_destructors: usize,
 binding_dependencies: std.ArrayList(usize),
 phdr_info: ?*std.posix.dl_phdr_info,
@@ -283,6 +296,8 @@ pub fn init(key: DynObjectId, name: []const u8, path: []const u8) DynObject {
         .tls_align = 0,
         .tls_offset = 0,
         .tls_mapped_at = 0,
+        .tls_module_id = null,
+        .tls_published = false,
         .eh = undefined,
         .eh_init_file_offset = 0,
         .eh_init_file_size = 0,
@@ -304,9 +319,15 @@ pub fn init(key: DynObjectId, name: []const u8, path: []const u8) DynObject {
         .fini_array_addr = 0,
         .fini_array_size = 0,
         .loaded = false,
+        .initializing = false,
+        .initialization_failed = false,
+        .execution_started = false,
         .init_called = false,
         .current_epoch = 0,
         .ref_count = 0,
+        .host_open_count = 0,
+        .nodelete_requested = false,
+        .nodelete = false,
         .loaded_at = null,
         .loaded_size = 0,
         .reservation = null,
@@ -315,6 +336,7 @@ pub fn init(key: DynObjectId, name: []const u8, path: []const u8) DynObject {
         .load_requested = true,
         .finalizing = false,
         .pinned = false,
+        .runtime_pinned = false,
         .tls_destructors = 0,
         .binding_dependencies = .empty,
         .phdr_info = null,
@@ -522,6 +544,50 @@ pub fn virtualFileRange(bytes: []const u8, headers: []align(1) const std.elf.Elf
     }
 
     return error.AddressNotInFileSegments;
+}
+
+fn exerciseSymbolIndex(allocator: std.mem.Allocator) !void {
+    var index: DynSymList = .empty;
+    defer index.deinit(allocator);
+
+    var symbols: [96]DynSym = @splat(std.mem.zeroes(DynSym));
+    for (&symbols, 0..) |*symbol, i| {
+        symbol.name = if (i % 2 == 0) "versioned" else "other";
+    }
+    symbols[3].name = "removed";
+
+    try index.build(allocator, symbols[0..5]);
+
+    try std.testing.expectEqualSlices(usize, &.{ 0, 2, 4 }, index.get("versioned").?);
+    try std.testing.expectEqualSlices(usize, &.{1}, index.get("other").?);
+    try std.testing.expectEqualSlices(usize, &.{3}, index.get("removed").?);
+    try std.testing.expect(index.get("absent") == null);
+
+    symbols[3].name = "other";
+    index.build(allocator, &symbols) catch |err| {
+        try std.testing.expectEqual(@as(usize, 0), index.count());
+        try std.testing.expect(index.get("versioned") == null);
+        return err;
+    };
+
+    try std.testing.expect(index.get("removed") == null);
+    try std.testing.expectEqual(@as(usize, 48), index.get("versioned").?.len);
+    try std.testing.expectEqual(@as(usize, 48), index.get("other").?.len);
+    for (index.get("versioned").?, 0..) |value, i| try std.testing.expectEqual(i * 2, value);
+    for (index.get("other").?, 0..) |value, i| try std.testing.expectEqual(i * 2 + 1, value);
+
+    try index.build(allocator, &.{});
+
+    try std.testing.expectEqual(@as(usize, 0), index.count());
+    try std.testing.expect(index.get("other") == null);
+}
+
+test "shared symbol indices preserve order and rebuild without stale names" {
+    try exerciseSymbolIndex(std.testing.allocator);
+}
+
+test "shared symbol index allocation failures clean up" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, exerciseSymbolIndex, .{});
 }
 
 test "zero-sized symbol endpoints do not permit out-of-segment memory accesses" {

@@ -69,6 +69,7 @@ pub fn main(init: std.process.Init) !void {
                     .stage = "fixture",
                     .message = @errorName(err),
                 });
+
                 std.process.exit(1);
             };
         }

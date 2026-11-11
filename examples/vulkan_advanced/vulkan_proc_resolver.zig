@@ -1,7 +1,8 @@
 const std = @import("std");
 
-const vk = @import("vk.zig");
 const dyn_loader = @import("dyn_loader");
+
+const vk = @import("vk.zig");
 
 pub const VulkanProcResolver = struct {
     pub var lib_vulkan: dyn_loader.DynamicLibrary = undefined;

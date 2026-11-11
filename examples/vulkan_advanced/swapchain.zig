@@ -1,4 +1,5 @@
 const std = @import("std");
+
 const vk = @import("vk.zig");
 const GraphicsContext = @import("graphics_context.zig").GraphicsContext;
 const Allocator = std.mem.Allocator;
@@ -25,6 +26,7 @@ pub const Swapchain = struct {
         return try initRecycle(gc, allocator, extent, .null_handle);
     }
 
+    /// Borrows `old_handle`. The caller destroys it after this call, on either outcome.
     pub fn initRecycle(gc: *const GraphicsContext, allocator: Allocator, extent: vk.Extent2D, old_handle: vk.SwapchainKHR) !Swapchain {
         const caps = try gc.instance.getPhysicalDeviceSurfaceCapabilitiesKHR(gc.pdev, gc.surface);
         const actual_extent = findActualExtent(caps, extent);
@@ -44,7 +46,7 @@ pub const Swapchain = struct {
         else
             .exclusive;
 
-        const handle = gc.dev.createSwapchainKHR(&.{
+        const handle = try gc.dev.createSwapchainKHR(&.{
             .surface = gc.surface,
             .min_image_count = image_count,
             .image_format = surface_format.format,
@@ -60,15 +62,8 @@ pub const Swapchain = struct {
             .present_mode = present_mode,
             .clipped = .true,
             .old_swapchain = old_handle,
-        }, null) catch {
-            return error.SwapchainCreationFailed;
-        };
+        }, null);
         errdefer gc.dev.destroySwapchainKHR(handle, null);
-
-        if (old_handle != .null_handle) {
-            // Apparently, the old swapchain handle still needs to be destroyed after recreating.
-            gc.dev.destroySwapchainKHR(old_handle, null);
-        }
 
         const swap_images = try initSwapchainImages(gc, handle, surface_format.format, allocator);
         errdefer {
@@ -80,10 +75,7 @@ pub const Swapchain = struct {
         errdefer gc.dev.destroySemaphore(next_image_acquired, null);
 
         const result = try gc.dev.acquireNextImageKHR(handle, std.math.maxInt(u64), next_image_acquired, .null_handle);
-        // event with a .suboptimal_khr we can still go on to present
-        // if we error even for .suboptimal_khr the example will crash and segfault
-        // on resize, since even the recreated swapchain can be suboptimal during a
-        // resize.
+        // A recreated swapchain can already be suboptimal during a resize.
         if (result.result == .not_ready or result.result == .timeout) return error.ImageAcquireFailed;
 
         std.mem.swap(vk.Semaphore, &swap_images[result.image_index].image_acquired, &next_image_acquired);
@@ -107,16 +99,18 @@ pub const Swapchain = struct {
     }
 
     pub fn waitForAllFences(self: Swapchain) !void {
-        for (self.swap_images) |si| si.waitForFence(self.gc) catch {};
+        for (self.swap_images) |si| try si.waitForFence(self.gc);
     }
 
+    /// Requires idle GPU work, or a lost device. Also accepts failed recreation.
     pub fn deinit(self: Swapchain) void {
-        // if we have no swapchain none of these should exist and we can just return
         if (self.handle == .null_handle) return;
         self.deinitExceptSwapchain();
         self.gc.dev.destroySwapchainKHR(self.handle, null);
     }
 
+    /// Idle-wait failure preserves the old state. Later failure leaves no resources.
+    /// After failure, only `recreate` or `deinit` may be called.
     pub fn recreate(self: *Swapchain, new_extent: vk.Extent2D, recycle: bool) !void {
         const gc = self.gc;
         const allocator = self.allocator;
@@ -128,23 +122,21 @@ pub const Swapchain = struct {
 
         if (!recycle) {
             self.deinit();
+            self.handle = .null_handle;
+            self.swap_images = &.{};
+            self.next_image_acquired = .null_handle;
             self.* = try init(gc, allocator, new_extent);
             return;
         }
 
-        self.deinitExceptSwapchain();
-        // set current handle to NULL_HANDLE to signal that the current swapchain does no longer need to be
-        // de-initialized if we fail to recreate it.
+        if (old_handle != .null_handle) self.deinitExceptSwapchain();
+        defer if (old_handle != .null_handle) gc.dev.destroySwapchainKHR(old_handle, null);
+
         self.handle = .null_handle;
-        self.* = initRecycle(gc, allocator, new_extent, old_handle) catch |err| switch (err) {
-            error.SwapchainCreationFailed => {
-                // we failed while recreating so our current handle still exists,
-                // but we won't destroy it in the deferred deinit of this object.
-                gc.dev.destroySwapchainKHR(old_handle, null);
-                return err;
-            },
-            else => return err,
-        };
+        self.swap_images = &.{};
+        self.next_image_acquired = .null_handle;
+
+        self.* = try initRecycle(gc, allocator, new_extent, old_handle);
     }
 
     pub fn currentImage(self: Swapchain) vk.Image {
@@ -156,29 +148,12 @@ pub const Swapchain = struct {
     }
 
     pub fn present(self: *Swapchain, cmdbuf: vk.CommandBuffer) !PresentState {
-        // Simple method:
-        // 1) Acquire next image
-        // 2) Wait for and reset fence of the acquired image
-        // 3) Submit command buffer with fence of acquired image,
-        //    dependendent on the semaphore signalled by the first step.
-        // 4) Present current frame, dependent on semaphore signalled by previous step
-        // Problem: This way we can't reference the current image while rendering.
-        // Better method: Shuffle the steps around such that acquire next image is the last step,
-        // leaving the swapchain in a state with the current image.
-        // 1) Wait for and reset fence of current image
-        // 2) Submit command buffer, signalling fence of current image and dependent on
-        //    the semaphore signalled by step 4.
-        // 3) Present current frame, dependent on semaphore signalled by the submit
-        // 4) Acquire next image, signalling its semaphore
-        // One problem that arises is that we can't know beforehand which semaphore to signal,
-        // so we keep an extra auxilery semaphore that is swapped around
-
-        // Step 1: Make sure the current frame has finished rendering
+        // Acquire last so callers can record commands for the current image.
+        // An extra semaphore covers acquisition before the next image is known.
         const current = self.currentSwapImage();
         try current.waitForFence(self.gc);
         try self.gc.dev.resetFences(1, @ptrCast(&current.frame_fence));
 
-        // Step 2: Submit the command buffer
         const wait_stage = [_]vk.PipelineStageFlags{.{ .top_of_pipe_bit = true }};
         try self.gc.dev.queueSubmit(self.gc.graphics_queue.handle, 1, &[_]vk.SubmitInfo{.{
             .wait_semaphore_count = 1,
@@ -190,7 +165,6 @@ pub const Swapchain = struct {
             .p_signal_semaphores = @ptrCast(&current.render_finished),
         }}, current.frame_fence);
 
-        // Step 3: Present the current frame
         _ = try self.gc.dev.queuePresentKHR(self.gc.present_queue.handle, &.{
             .wait_semaphore_count = 1,
             .p_wait_semaphores = @ptrCast(&current.render_finished),
@@ -199,7 +173,6 @@ pub const Swapchain = struct {
             .p_image_indices = @ptrCast(&self.image_index),
         });
 
-        // Step 4: Acquire next frame
         const result = try self.gc.dev.acquireNextImageKHR(
             self.handle,
             std.math.maxInt(u64),
@@ -207,14 +180,16 @@ pub const Swapchain = struct {
             .null_handle,
         );
 
+        const present_state: PresentState = switch (result.result) {
+            .success => .optimal,
+            .suboptimal_khr => .suboptimal,
+            else => return error.ImageAcquireFailed,
+        };
+
         std.mem.swap(vk.Semaphore, &self.swap_images[result.image_index].image_acquired, &self.next_image_acquired);
         self.image_index = result.image_index;
 
-        return switch (result.result) {
-            .success => .optimal,
-            .suboptimal_khr => .suboptimal,
-            else => unreachable,
-        };
+        return present_state;
     }
 };
 
@@ -260,7 +235,6 @@ const SwapImage = struct {
     }
 
     fn deinit(self: SwapImage, gc: *const GraphicsContext) void {
-        self.waitForFence(gc) catch return;
         gc.dev.destroyImageView(self.view, null);
         gc.dev.destroySemaphore(self.image_acquired, null);
         gc.dev.destroySemaphore(self.render_finished, null);
@@ -268,7 +242,8 @@ const SwapImage = struct {
     }
 
     fn waitForFence(self: SwapImage, gc: *const GraphicsContext) !void {
-        _ = try gc.dev.waitForFences(1, @ptrCast(&self.frame_fence), .true, std.math.maxInt(u64));
+        const result = try gc.dev.waitForFences(1, @ptrCast(&self.frame_fence), .true, std.math.maxInt(u64));
+        if (result != .success) return error.FenceWaitFailed;
     }
 };
 

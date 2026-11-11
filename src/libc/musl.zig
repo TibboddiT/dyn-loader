@@ -131,7 +131,18 @@ fn threadStorageSize(_: *const common.Runtime) usize {
 /// Redirects internal allocations that bypass normal symbol substitution.
 /// Builds both patch sets before modifying code. `common.applyCodePatches`
 /// handles permission changes and rollback. Temporary patch records borrow mappings.
-fn patchAllocatorCalls(runtime: *common.Runtime, object: *DynObject) !void {
+fn patchAllocatorCalls(runtime: *common.Runtime, object: *DynObject) common.AllocatorPatchError!void {
+    patchAllocatorCallsInner(runtime, object) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.ProtectSegmentFailed => return error.ProtectSegmentFailed,
+        else => {
+            logger.err("musl.allocator: object={s} action=patch_failed error={t}", .{ object.name, err });
+            return error.LibcPatchPreparationFailed;
+        },
+    };
+}
+
+fn patchAllocatorCallsInner(runtime: *common.Runtime, object: *DynObject) !void {
     var patches: std.ArrayList(common.CodePatch) = .empty;
     defer patches.deinit(runtime.allocator);
 
@@ -175,7 +186,7 @@ fn beginSpawn(worker: *common.WorkerHandle) void {
 }
 
 fn spawnFailed(worker: *common.WorkerHandle) void {
-    // Unpublished state has no other owners; destroy it directly.
+    // Unpublished state has no other owners. Destroy it directly.
     getWorker(worker).destroy();
     worker.state = null;
 }
@@ -301,7 +312,7 @@ fn hasPointerResultCheck(bytes: []const u8) bool {
 /// Follows a small allowed set of instructions from known argument loads to a
 /// call and pointer-result check. Tracks overwrites of argument registers and
 /// stops at unknown instructions.
-/// Multiple anchors may describe the same call; different matching calls fail.
+/// Multiple anchors may describe the same call. Different matching calls fail.
 fn findCheckedCallOperand(code: CodeView, probe: CallProbe) !usize {
     const instruction_limit = 16;
     const search_span_bytes = 64;
@@ -409,7 +420,7 @@ fn findCheckedCallOperand(code: CodeView, probe: CallProbe) !usize {
 
 /// Uses allocation sites with distinctive constant sizes to identify the hidden
 /// allocator binding. On x86-64 an atfork record contains five pointers (40
-/// bytes); an atexit block contains a link and two arrays of 32 pointers (520
+/// bytes). An atexit block contains a link and two arrays of 32 pointers (520
 /// bytes). Both callers check allocation failure. These constants describe the
 /// supported source layouts, not an allocator ABI.
 /// atfork record layout, lines 11-16:
@@ -557,14 +568,14 @@ fn matchGccCallocPrefix(code: CodeView) !CallocPrefixMatch {
 // ---------------------------------------------
 
 /// Candidate x86-64 layouts selected by the width of `__libc.secure`.
-/// Global fields are relative to `mapped_address` (`__libc`); descriptor fields
+/// Global fields are relative to `mapped_address` (`__libc`). Descriptor fields
 /// from `tid_offset` onward are relative to the thread pointer. Detection below
 /// cross-checks selected fields rather than deriving the entire C structure.
 const MuslLayout = struct {
     const Flags = enum { int_flags, byte_flags };
 
     // Known x86-64 descriptor positions. Worker inspection checks selected
-    // accesses; the embedded link position remains a layout assumption.
+    // accesses. The embedded link position remains a layout assumption.
     const links_offset = 16;
     const sysinfo_offset = 32;
     const canary_offset = 40;
@@ -1095,7 +1106,7 @@ fn detectMuslStdio(dyn_object: *DynObject, flow: InstructionFlow, setup_end_offs
     }
     const end = unlock_index orelse return error.MuslStdioListUnlockNotFound;
 
-    // Retain nullable stream slots; their values are final only after relocation.
+    // Retain nullable stream slots. Their values are final only after relocation.
     var standard_files: [3]*const usize = undefined;
     var file_count: usize = 0;
     for (flow.nodes.items[end + 1 ..], end + 1..) |node, index| {
@@ -1206,8 +1217,8 @@ fn validateMuslWorkerFields(dyn_object: *DynObject, flow: InstructionFlow, layou
         }
 
         // Native creation selects joinable or detached according to attributes.
-        // The merged two-value range is acceptable evidence for this field;
-        // our worker initialization always installs the joinable alternative.
+        // The merged two-value range is acceptable evidence for this field.
+        // Our worker initialization always installs the joinable alternative.
         if (node.instruction.width == 32 and destination.b == layout.detach_state_offset and
             (source.is(.constant, layout.joinable_state) or
                 (source.is(.range, layout.joinable_state) and source.b == layout.joinable_state + 1)))
@@ -1338,7 +1349,7 @@ fn preparePatches(allocator: std.mem.Allocator, dyn_object: *DynObject, patches:
         for (0..code.bytes.len - 4) |offset| {
             // Scan for `E8` plus an exact target, then require a recognized use
             // of the returned pointer. This scan does not establish instruction
-            // boundaries; reject an unrecognized candidate instead of skipping
+            // boundaries. Reject an unrecognized candidate instead of skipping
             // a potentially real allocator call and producing a partial patch.
             if (code.bytes[offset] != 0xe8) continue;
 
@@ -1371,7 +1382,7 @@ fn preparePatches(allocator: std.mem.Allocator, dyn_object: *DynObject, patches:
 // ----------------------------------------------------------
 
 /// Establishes the initial descriptor before libc constructors run. A null TSD
-/// pointer preserves musl's lazy main-array setup in `pthread_key_create`; the
+/// pointer preserves musl's lazy main-array setup in `pthread_key_create`. The
 /// first-worker transition also installs that array if no key was created yet.
 fn initMuslInitialThread(initial_thread: *MuslThreads) void {
     if (initial_thread.initialized) return;
@@ -1418,7 +1429,7 @@ const MuslWorker = struct {
     references: u32,
 
     /// Returns an unpublished worker owning a zeroed key array. Failed spawn
-    /// destroys it directly; successful spawn uses the two-reference protocol.
+    /// destroys it directly. Successful spawn uses the two-reference protocol.
     fn create(allocator: std.mem.Allocator, slots: usize) !*MuslWorker {
         const worker = try allocator.create(MuslWorker);
         errdefer allocator.destroy(worker);
@@ -1442,20 +1453,20 @@ const MuslWorker = struct {
         allocator.destroy(worker);
     }
 
-    /// Consumes one creator/registry reference; the last release frees storage.
+    /// Consumes one creator/registry reference. The last release frees storage.
     fn release(worker: *MuslWorker) void {
         if (@atomicRmw(u32, &worker.references, .Sub, 1, .acq_rel) == 1) worker.destroy();
     }
 
     fn publishReady(worker: *MuslWorker) void {
         // Release/acquire publishes completed registration. The futex only
-        // avoids busy waiting; readiness is always decided by the atomic word.
+        // avoids busy waiting. Readiness is always decided by the atomic word.
         @atomicStore(u32, &worker.ready, 1, .release);
         _ = std.os.linux.futex_3arg(&worker.ready, .{ .cmd = .WAKE, .private = true }, 1);
     }
 
     fn waitUntilReady(worker: *MuslWorker) void {
-        // A futex wake does not guarantee readiness; recheck the atomic word.
+        // A futex wake does not guarantee readiness. Recheck the atomic word.
         while (@atomicLoad(u32, &worker.ready, .acquire) == 0) {
             _ = std.os.linux.futex_4arg(&worker.ready, .{ .cmd = .WAIT, .private = true }, 0, null);
         }
@@ -1485,7 +1496,7 @@ fn blockMuslAppSignals() std.os.linux.sigset_t {
 }
 
 /// Negative `FILE.lock` disables locking for single-threaded use. Zero enables
-/// the normal unlocked state; preserve a nonnegative value already in use.
+/// the normal unlocked state. Preserve a nonnegative value already in use.
 fn enableMuslFileLock(file: usize) void {
     if (file == 0) return;
 
@@ -1640,7 +1651,7 @@ fn unregisterMuslWorker(threads: *MuslThreads, tp: usize) void {
 }
 
 /// Supplies process/TLS values normally established by musl's executable startup.
-/// The plan borrows host `argv`/`environ` storage. Absolute writes update globals;
+/// The plan borrows host `argv`/`environ` storage. Absolute writes update globals.
 /// `self` and TID are TP-relative and are replayed for every worker. The common
 /// runtime resolves dynamic values and handles mapping permissions on application.
 fn appendWritePlan(runtime: *common.Runtime, musl: MuslLayout) !void {
@@ -1659,7 +1670,7 @@ fn appendWritePlan(runtime: *common.Runtime, musl: MuslLayout) !void {
         // reads HWCAP/HWCAP2 directly from it, but reads AT_SECURE from libc.secure.
         // https://git.musl-libc.org/cgit/musl/tree/src/misc/getauxval.c?h=v1.2.5
         // TODO audit separate auxv-derived startup state, particularly libc.secure
-        // and __hwcap; setting libc.auxv alone does not reproduce __init_libc.
+        // and __hwcap. Setting libc.auxv alone does not reproduce __init_libc.
         .{
             .addr = musl.mapped_address + musl.auxv_offset, // libc.auxv.
             .relative_to = .zero,
@@ -1725,7 +1736,7 @@ test "CET issetugid preserves the secure field RIP target" {
 }
 
 test "hardened calloc requires overflow guard and full pointer result" {
-    // Public calloc's observed entry at ELF 0x16740; call at 0x16763 targets malloc@plt.
+    // Public calloc's observed entry is at ELF 0x16740. The call at 0x16763 targets malloc@plt.
     const bytes =
         "\xf3\x0f\x1e\xfa" ++ // endbr64
         "\x41\x54\x55\x53" ++ // push r12; push rbp; push rbx
@@ -1786,7 +1797,7 @@ test "allocator call detection requires matching arguments and a result check" {
 
 test "calloc detection accepts shared anchors and rejects argument clobbers" {
     // musl's atexit allocation uses calloc(520, 1). Both argument-load anchors
-    // may identify the same call; this must not be mistaken for ambiguity.
+    // may identify the same call. This must not be mistaken for ambiguity.
     // mov edi, 520
     // mov esi, 1
     const arguments = "\xbf\x08\x02\x00\x00\xbe\x01\x00\x00\x00";

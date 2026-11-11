@@ -1,6 +1,6 @@
 //! Process-wide ELF loader for statically linked x86-64 Linux hosts.
 //! Loading is serialized and same-thread reentrant. Initialize and tear down on
-//! the initial thread; library-calling workers must use the managed spawn paths.
+//! the initial thread. Library-calling workers must use the managed spawn paths.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -32,14 +32,14 @@ const Symbol = struct {
 };
 
 /// Registry handle for a loaded root and its dependency scope. Copies refer to
-/// the same load. Handles expire when their object retires; symbol addresses
+/// the same load. Handles expire when their object retires. Symbol addresses
 /// borrow their defining mappings or thread TLS, which may survive NODELETE teardown.
 pub const DynamicLibrary = struct {
     index: usize,
 
     /// Searches preload roots before this library's scope and resolves IFUNCs.
     /// The caller supplies the correct native type and calling convention for `addr`.
-    /// TLS symbols return this thread's instance; look them up again in other threads.
+    /// TLS symbols return this thread's instance. Look them up again in other threads.
     pub fn getSymbol(lib: DynamicLibrary, sym_name: []const u8) !Symbol {
         try requireManaged(.allow_finalization);
         state.transaction_lock.lock(state.io);
@@ -68,7 +68,7 @@ pub const DynamicLibrary = struct {
 };
 
 pub const InitOptions = struct {
-    /// Borrowed process startup data; must outlive any NODELETE runtime.
+    /// Borrows process startup data, which must outlive any NODELETE runtime.
     args: std.process.Args,
     environ: std.process.Environ,
     /// Runtime threshold. Debug output also requires the host's `std_options`
@@ -103,7 +103,7 @@ var lifecycle: std.atomic.Value(Lifecycle) = .init(.bootstrap);
 const DynObjectList = std.AutoArrayHashMapUnmanaged(DynObjectId, DynObject);
 
 /// Kernel-thread-owned recursive transaction lock. Callbacks may reenter on the
-/// owner thread; asynchronous signal-handler reentry is not supported.
+/// owner thread. Asynchronous signal-handler reentry is not supported.
 const LoaderLock = struct {
     mutex: std.Io.Mutex = .init,
     owner: std.atomic.Value(u32) = .init(0),
@@ -137,7 +137,7 @@ const LoaderLock = struct {
 /// Process-wide state. Must remain at a stable address while active or retained.
 /// Workers borrow `libc_runtime`. Teardown is terminal.
 const State = struct {
-    // Runtime storage and synchronous I/O; no backend task pool or signal handlers.
+    // Runtime storage and synchronous I/O without a task pool or signal handlers.
     allocator: std.mem.Allocator = undefined,
     io_backend: std.Io.Threaded = .init_single_threaded,
     io: std.Io = undefined,
@@ -146,7 +146,7 @@ const State = struct {
     environ: std.process.Environ = undefined,
 
     // Object registry and lookup state.
-    // Indices survive array reallocations; pointers into the registry do not.
+    // Indices survive array reallocations. Pointers into the registry do not.
     transaction_lock: LoaderLock = .{},
     dyn_objects: DynObjectList = .empty,
     dyn_objects_sorted_indices: std.ArrayList(usize) = .empty,
@@ -159,10 +159,10 @@ const State = struct {
     irel_resolved_targets: std.AutoArrayHashMapUnmanaged(usize, usize) = .empty,
     unique_symbols: std.StringArrayHashMapUnmanaged(ResolvedSymbol) = .empty,
 
-    // Owns native backend state; worker handles borrow this runtime.
+    // Owns native backend state. Worker handles borrow this runtime.
     libc_runtime: ?libc.Runtime = null,
 
-    // Loader TLS bookkeeping; early executable TLS belongs to ElfTlsRuntime.
+    // Loader TLS bookkeeping. Early executable TLS belongs to ElfTlsRuntime.
     current_surplus_size: usize = 0x100000,
     main_thread_pointer: usize = 0,
     tls_template: []u8 = &.{},
@@ -226,7 +226,7 @@ fn verifySoleThread() !void {
 // ---------------------------------
 
 /// Initializes the loader on the initial thread, before loading or spawning.
-/// Uses an internal allocator and I/O backend; borrows `args` and `environ`.
+/// Uses an internal allocator and I/O backend. Borrows `args` and `environ`.
 /// Pointers into main executable TLS acquired before successful init go stale.
 /// Reinitialization after teardown is unsupported.
 pub fn init(options: InitOptions) !void {
@@ -367,9 +367,7 @@ pub fn deinit() void {
         if (dyn_object.reservation) |reservation| std.posix.munmap(reservation);
 
         dyn_object.syms_array.deinit(state.allocator);
-
         dyn_object.syms.deinit(state.allocator);
-
         dyn_object.relocs.deinit(state.allocator);
         dyn_object.dependencies.deinit(state.allocator);
         dyn_object.deps_breadth_first.deinit(state.allocator);
@@ -481,7 +479,7 @@ pub fn load(name_or_path: []const u8) !DynamicLibrary {
 }
 
 /// Resolves a name in the loader's global scope, including native IFUNC calls.
-/// Ordinary symbols borrow their defining mapping; TLS symbols borrow the
+/// Ordinary symbols borrow their defining mapping. TLS symbols borrow the
 /// calling thread's instance.
 pub fn getSymbol(sym_name: []const u8) !Symbol {
     try requireManaged(.allow_finalization);
@@ -545,7 +543,10 @@ fn appendLdExpansions(list: *std.ArrayList([]const u8), value: []const u8, origi
     }
 
     if (std.mem.find(u8, expanded, "$LIB") == null and std.mem.find(u8, expanded, "${LIB}") == null) {
-        try list.append(state.allocator, try state.allocator.dupe(u8, expanded));
+        const owned = try state.allocator.dupe(u8, expanded);
+        errdefer state.allocator.free(owned);
+
+        try list.append(state.allocator, owned);
         return;
     }
 
@@ -556,14 +557,20 @@ fn appendLdExpansions(list: *std.ArrayList([]const u8), value: []const u8, origi
     if (std.mem.find(u8, expanded, "$LIB")) |idx| {
         for (lib_values) |lv| {
             const expanded_candidate = try std.fmt.bufPrint(&expanded_candidate_buf, "{s}{s}{s}", .{ expanded[0..idx], lv, expanded[idx + "$LIB".len ..] });
-            try list.append(state.allocator, try state.allocator.dupe(u8, expanded_candidate));
+            const owned = try state.allocator.dupe(u8, expanded_candidate);
+            errdefer state.allocator.free(owned);
+
+            try list.append(state.allocator, owned);
         }
     }
 
     if (std.mem.find(u8, expanded, "${LIB}")) |idx| {
         for (lib_values) |lv| {
             const expanded_candidate = try std.fmt.bufPrint(&expanded_candidate_buf, "{s}{s}{s}", .{ expanded[0..idx], lv, expanded[idx + "${LIB}".len ..] });
-            try list.append(state.allocator, try state.allocator.dupe(u8, expanded_candidate));
+            const owned = try state.allocator.dupe(u8, expanded_candidate);
+            errdefer state.allocator.free(owned);
+
+            try list.append(state.allocator, owned);
         }
     }
 }
@@ -642,7 +649,7 @@ fn loadPreloads() void {
 // Log owner-process load errors after cleanup.
 const LoadOwner = enum { host, native };
 
-/// `rpath` contains already-expanded entries; `runpath` retains its ELF tokens.
+/// `rpath` contains already-expanded entries. `runpath` retains its ELF tokens.
 const LibrarySearchContext = struct {
     requester_name: ?[]const u8 = null,
     runpath: ?[]const u8 = null,
@@ -874,7 +881,7 @@ fn loadWithRootResolveContextInner(name_or_path: []const u8, search: LibrarySear
 fn loadDepTree(o_path: []const u8, root_search: LibrarySearchContext) !DynamicLibrary {
     logger.debug("dep tree: checking {s}", .{o_path});
 
-    // The caller's search context locates a dlopen root; it does not become that
+    // The caller's search context locates a dlopen root. It does not become that
     // root's DT_NEEDED ancestry. Only dependency edges inherit RPATH.
     const lib_idx = try loadDso(o_path, root_search, null);
     if (state.dyn_objects.values()[lib_idx].mapped_at != 0) {
@@ -953,7 +960,7 @@ fn makeAbsoluteLibraryPath(allocator: std.mem.Allocator, path: []const u8) ![]co
 }
 
 /// Returns joined RPATH entries owned by `state.allocator`, or null for no entries.
-/// Expands the owner's tokens; relative/empty entries stay relative until lookup.
+/// Expands the owner's tokens. Relative/empty entries stay relative until lookup.
 fn buildInheritedRpath(own_rpath: ?[]const u8, ancestor_rpath: ?[]const u8, origin_dir: []const u8) !?[]const u8 {
     var entries: std.ArrayList([]const u8) = .empty;
     defer {
@@ -980,7 +987,7 @@ fn buildInheritedRpath(own_rpath: ?[]const u8, ancestor_rpath: ?[]const u8, orig
 }
 
 fn searchLibraryDirectories(allocator: std.mem.Allocator, name: []const u8, directories: []const u8, origin_dir: ?[]const u8, expand_tokens: bool) !?[]const u8 {
-    // An empty list is disabled; empty components of a nonempty list mean cwd.
+    // An empty list is disabled. Empty components of a nonempty list mean cwd.
     if (directories.len == 0) return null;
 
     var it = std.mem.splitScalar(u8, directories, ':');
@@ -1017,7 +1024,7 @@ fn searchLibraryDirectories(allocator: std.mem.Allocator, name: []const u8, dire
 }
 
 /// Returns an owned path allocated with `allocator`. `check_mode` only changes
-/// missing-library diagnostics; every candidate is checked for supported ELF format.
+/// missing-library diagnostics. Every candidate is checked for supported ELF format.
 fn resolvePath(allocator: std.mem.Allocator, requested_path: []const u8, check_mode: bool, search: LibrarySearchContext) ![]const u8 {
     const requester_name = search.requester_name;
     const runpath = search.runpath;
@@ -1326,7 +1333,7 @@ fn appendRelaRelocations(relocs: *RelocList, entries: []align(1) const std.elf.E
 }
 
 /// Expands packed RELR entries into ordinary relative-relocation targets. An even
-/// entry is an address; an odd entry uses bits 1..63 for the next 63 pointer slots.
+/// entry is an address. An odd entry uses bits 1..63 for the next 63 pointer slots.
 /// Bitmap entries require an earlier address and advance even across unset bits.
 fn appendRelrRelocations(relocs: *RelocList, entries: []align(1) const std.elf.Elf64_Relr, phdrs: []align(1) const std.elf.Elf64.Phdr) !void {
     var next: ?usize = null;
@@ -1739,8 +1746,8 @@ fn loadDso(o_path: []const u8, search: LibrarySearchContext, ancestor_rpath: ?[]
         syms.deinit(state.allocator);
     }
 
-    // Version indices for undefined symbols refer to requirements (`VERNEED`);
-    // definitions refer to this object's exported versions (`VERDEF`). Several
+    // Version indices for undefined symbols refer to requirements (`VERNEED`).
+    // Definitions refer to this object's exported versions (`VERDEF`). Several
     // entries can share a name, so the name map stores symbol-array indices.
     if (versym_tab_addr) |vst_addr| {
         logger.debug("versym table addr: 0x{x}", .{vst_addr});
@@ -2105,6 +2112,8 @@ fn loadDso(o_path: []const u8, search: LibrarySearchContext, ancestor_rpath: ?[]
             .tls_init_mem_size = tls_init_mem_size,
             .tls_align = tls_align,
             .tls_mapped_at = 0,
+            .tls_module_id = null,
+            .tls_published = false,
             .tls_offset = if (previous_dyn_object) |previous| previous.tls_offset else 0,
             .eh = eh,
             .eh_init_file_offset = eh_init_file_offset,
@@ -2127,9 +2136,14 @@ fn loadDso(o_path: []const u8, search: LibrarySearchContext, ancestor_rpath: ?[]
             .fini_array_addr = fini_array_addr,
             .fini_array_size = fini_array_size,
             .loaded = false,
+            .initializing = false,
+            .initialization_failed = false,
+            .execution_started = false,
             .init_called = false,
             .current_epoch = if (previous_dyn_object) |previous| previous.current_epoch else 0,
             .ref_count = 0,
+            .host_open_count = 0,
+            .nodelete = false,
             .nodelete_requested = nodelete_requested,
             .loaded_at = null,
             .loaded_size = 0,
@@ -2139,6 +2153,7 @@ fn loadDso(o_path: []const u8, search: LibrarySearchContext, ancestor_rpath: ?[]
             .load_requested = true,
             .finalizing = false,
             .pinned = false,
+            .runtime_pinned = false,
             .tls_destructors = 0,
             .binding_dependencies = .empty,
             .phdr_info = null,
@@ -2313,7 +2328,7 @@ fn mapSegments(dyn_object: *DynObject, file_bytes: []const u8) !void {
 
         // p_align constrains the load bias, not the size of a mapping. Rounding
         // to it here can overlap adjacent PT_LOADs with smaller alignments.
-        // The base already satisfies max_align; mmap boundaries use OS pages.
+        // The base already satisfies max_align. mmap boundaries use OS pages.
         const aligned_ptr: [*]align(std.heap.pageSize()) u8 = @ptrFromInt(std.mem.alignBackward(usize, base_addr + segment.mem_offset, std.heap.pageSize()));
         const aligned_end: usize = std.mem.alignForward(usize, base_addr + segment.mem_offset + segment.mem_size, std.heap.pageSize());
         const aligned_size = aligned_end - @intFromPtr(aligned_ptr);
@@ -2438,11 +2453,11 @@ const ElfTlsRuntime = struct {
     //   | native_metadata_capacity bytes           |
     //   +------------------------------------------+
     //
-    // Library slots use offsets below TP; executable TLS keeps its original
+    // Library slots use offsets below TP. Executable TLS keeps its original
     // TP-relative offsets. The native reserve starts with the self-pointer.
     // Before init, the bootstrap area contains only executable TLS, alignment
     // padding, AbiTcb, and ZigTcb. The permanent initial-thread mapping lasts
-    // until process exit; Zig owns worker allocations and reclaims them on join.
+    // until process exit. Zig owns worker allocations and reclaims them on join.
 
     const AreaDesc = struct {
         size: usize,
@@ -2701,7 +2716,7 @@ const TlsLookup = struct {
 
 /// Reserves a fresh module identity and a slot below TP under the transaction
 /// lock. Compatible retired slots may be reused. New reservations consume global
-/// capacity immediately, even if later loading fails; publication is separate.
+/// capacity immediately, even if later loading fails. Publication is separate.
 fn reserveModuleTls(dyn_object: *DynObject) !void {
     const alignment = @max(dyn_object.tls_align, 1);
 
@@ -2762,8 +2777,8 @@ fn publishModuleTls(dyn_object: *DynObject) !void {
 }
 
 // The TLSDESC ABI passes the descriptor in `RAX`, not a System V argument
-// register. Its second word already contains the signed TP-relative offset;
-// return that word without a compiler-generated prologue or other clobbers.
+// register. Its second word already contains the signed TP-relative offset.
+// Return that word without a compiler-generated prologue or other clobbers.
 fn tlsDescResolver() callconv(.naked) void {
     asm volatile (
         \\ movq 8(%%rax), %%rax
@@ -2940,7 +2955,7 @@ fn processRelocations(dyn_object: *DynObject, scope: []const usize) !void {
     // TODO prove relocation-time substitution covers every .plt.got entry before
     // removing this mismatch-detection and executable-stub patching fallback.
     if (dyn_object.plt_got_section_size > 0) {
-        const PltGotEntry = packed struct {
+        const PltGotEntry = bitpack struct {
             inst: u16,
             offset: u32,
             rem: u16,
@@ -3066,7 +3081,7 @@ fn makeTlsDefinition(object: *const DynObject, sym_idx: usize) ResolvedSymbol {
 }
 
 /// Selects a TLS definition and retains any selected preload provider.
-fn lookupTlsSymbol(object: *DynObject, sym_idx: usize, allow_preload_override: bool) anyerror!ResolvedSymbol {
+fn lookupTlsSymbol(object: *DynObject, sym_idx: usize, allow_preload_override: bool) DynObject.SymbolLookupError!ResolvedSymbol {
     const sym = makeTlsDefinition(object, sym_idx);
     const is_preload_root = std.mem.findScalar(usize, state.preload_root_indices.items, sym.dyn_object_idx) != null;
 
@@ -3103,7 +3118,7 @@ fn getRuntimeSymbolAddress(sym: ResolvedSymbol) !usize {
 }
 
 // Looks up libc runtime data without invoking IFUNC resolvers or applying
-// substitutions; this can run before relocation completes.
+// substitutions. This can run before relocation completes.
 // TODO replace registry-order lookup with explicit scopes: private runtime
 // metadata should come from its owner, and interposable globals should follow
 // relocation lookup precedence.
@@ -3152,12 +3167,12 @@ fn resolveLibcRuntimeSymbol(sym_name: []const u8) !ResolvedSymbol {
 
 /// Selects preload-only, object breadth-first, or global load-order scope. These
 /// modes are mutually exclusive where asserted below. `find_next` skips the first
-/// object in the supplied dependency scope; it is the current RTLD_NEXT policy.
+/// object in the supplied dependency scope. This is the current RTLD_NEXT policy.
 fn getResolvedSymbolByName(maybe_dyn_object: ?*DynObject, sym_name: []const u8, find_next: bool, only_preload: bool, allow_preload_override: bool) !ResolvedSymbol {
     return canonicalizeUniqueSymbol(try getResolvedSymbolByNameInner(maybe_dyn_object, sym_name, find_next, only_preload, allow_preload_override));
 }
 
-fn getResolvedSymbolByNameInner(maybe_dyn_object: ?*DynObject, sym_name: []const u8, find_next: bool, only_preload: bool, allow_preload_override: bool) anyerror!ResolvedSymbol {
+fn getResolvedSymbolByNameInner(maybe_dyn_object: ?*DynObject, sym_name: []const u8, find_next: bool, only_preload: bool, allow_preload_override: bool) DynObject.SymbolLookupError!ResolvedSymbol {
     logger.debug("symbol.lookup: requester={s} symbol={s} next={} preload_only={} preload_override={}", .{ if (maybe_dyn_object) |object| object.name else "<global>", sym_name, find_next, only_preload, allow_preload_override });
     errdefer logger.debug("symbol.lookup: symbol={s} action=failed", .{sym_name});
     std.debug.assert(!(find_next and only_preload));
@@ -3363,7 +3378,7 @@ fn getResolvedSymbolByNameAndVersion(maybe_dyn_object: ?*DynObject, sym_name: []
     return canonicalizeUniqueSymbol(try getResolvedSymbolByNameAndVersionInner(maybe_dyn_object, sym_name, version, find_next, only_preload, allow_preload_override));
 }
 
-fn getResolvedSymbolByNameAndVersionInner(maybe_dyn_object: ?*DynObject, sym_name: []const u8, version: []const u8, find_next: bool, only_preload: bool, allow_preload_override: bool) anyerror!ResolvedSymbol {
+fn getResolvedSymbolByNameAndVersionInner(maybe_dyn_object: ?*DynObject, sym_name: []const u8, version: []const u8, find_next: bool, only_preload: bool, allow_preload_override: bool) DynObject.SymbolLookupError!ResolvedSymbol {
     logger.debug("symbol.lookup: requester={s} symbol={s} version={s} next={} preload_only={} preload_override={}", .{ if (maybe_dyn_object) |object| object.name else "<global>", sym_name, version, find_next, only_preload, allow_preload_override });
     errdefer logger.debug("symbol.lookup: symbol={s} version={s} action=failed", .{ sym_name, version });
     std.debug.assert(!(find_next and only_preload));
@@ -3906,7 +3921,7 @@ fn unloadUnreferencedObjects() !void {
 }
 
 /// The caller has already released its references. `.release` uses normal lifetime
-/// rules; `.deinit` drops host-lifetime pins while preserving the NODELETE runtime.
+/// rules. `.deinit` drops host-lifetime pins while preserving the NODELETE runtime.
 fn unloadObjects(mode: enum { release, deinit }) !void {
     const keep = try state.allocator.alloc(bool, state.dyn_objects.count());
     defer state.allocator.free(keep);
@@ -3919,7 +3934,7 @@ fn unloadObjects(mode: enum { release, deinit }) !void {
     state.thread_mutex.unlock(state.io);
 
     for (state.dyn_objects.values(), keep) |dyn_object, *live| {
-        // Escaped-load pins last until host teardown; native runtime pins must
+        // Escaped-load pins last until host teardown. Native runtime pins must
         // also survive retained teardown because backend state borrows them.
         const escaped_pin = dyn_object.pinned and !deinitializing;
         const destructor_pin = dyn_object.tls_destructors != 0 and !deinitializing;
@@ -4312,7 +4327,7 @@ const substitutes = std.StaticStringMap(*const anyopaque).initComptime([_]struct
 
 /// Chooses a native symbol substitute. Returns `null` to keep the native address.
 /// A preload's own lookup skips recursive overrides to reach the next implementation.
-fn getSubstituteAddress(sym: ResolvedSymbol, for_obj: *DynObject, allow_preload_override: bool) anyerror!?usize {
+fn getSubstituteAddress(sym: ResolvedSymbol, for_obj: *DynObject, allow_preload_override: bool) DynObject.SymbolLookupError!?usize {
     const native_address = switch (sym.location) {
         .address => |address| address,
         .tls => return null,
@@ -4496,7 +4511,7 @@ fn freeSubstitute(p: ?*anyopaque) callconv(.c) void {
             state.alloc_allocator.rawFree(storage, allocation.alignment, @returnAddress());
             _ = state.extra_allocations.swapRemove(address);
         } else {
-            // Panic does not run defers; unlock before logging and panicking.
+            // Panic does not run defers. Unlock before logging and panicking.
             state.alloc_mutex.unlock(state.io);
             logger.err("intercepted call: failed: free(0x{x}): externally allocated memory", .{@intFromPtr(p)});
             @panic("free failed: externally allocated memory");
@@ -4506,7 +4521,7 @@ fn freeSubstitute(p: ?*anyopaque) callconv(.c) void {
     logger.debug("intercepted call: success: free(0x{x}) [{d} allocs remaining]", .{ @intFromPtr(p), state.extra_allocations.count() });
 }
 
-/// Reports only recorded backing storage; allocator-internal spare capacity is
+/// Reports only recorded backing storage. Allocator-internal spare capacity is
 /// unknown. Non-null zero-size allocations have one byte of backing storage.
 fn mallocUsableSizeSubstitute(p: ?*anyopaque) callconv(.c) usize {
     const errno_location = state.libc_runtime.?.getErrnoLocation();
@@ -4650,7 +4665,7 @@ fn reallocarraySubstitute(p: ?*anyopaque, n: usize, size: usize) callconv(.c) ?*
 
 /// Encoded native API handle, never dereferenced as an address. Registry index
 /// and load epoch reject stale handles even when a retired slot is reused.
-const DlHandle = packed struct(u64) {
+const DlHandle = bitpack struct(u64) {
     tag: u2,
     epoch: u30,
     index: u32,
@@ -5499,14 +5514,14 @@ const WorkerStartup = struct {
     }
 };
 
-/// A single join obligation. Copies alias that obligation; detach is unsupported.
+/// A single join obligation. Copies alias that obligation. Detach is unsupported.
 pub const Thread = struct {
     index: usize,
     native_handle: c_ulong,
 
     /// Requires a managed caller, including during controlled finalization.
     /// Consumes the single join obligation shared by all copies. Invalid, stale,
-    /// duplicate, or self joins panic; fork children terminate with status 127.
+    /// duplicate, or self joins panic. Fork children terminate with status 127.
     pub fn join(self: Thread) void {
         requireOwnerProcessOrExit();
         if (joinThread(self.native_handle, self.index, null) != 0) @panic("invalid managed join ownership");
@@ -5515,8 +5530,8 @@ pub const Thread = struct {
 
 /// Runs a void-returning Zig routine with executable and native library TLS.
 /// Requires a managed caller, active or retained loader, and ready native threading.
-/// Arguments are copied by value; pointed-to data remains borrowed by the worker. A failed
-/// startup returns an error only after reclaiming any failed child and resources.
+/// Arguments are copied by value. Pointed-to data remains borrowed by the worker.
+/// Failed startup reclaims the child and its resources before returning an error.
 pub fn spawn(config: std.Thread.SpawnConfig, comptime function: anytype, args: anytype) !Thread {
     const Context = struct {
         arguments: @TypeOf(args),
@@ -5557,7 +5572,7 @@ fn requireOwnerProcessOrExit() void {
     @disableInstrumentation();
 
     // Even @trap may invoke Zig's inherited signal handler and debug locks.
-    // This child cannot recover host state; terminate without running callbacks.
+    // This child cannot recover host state. Terminate without running callbacks.
     if (!isOwnerProcess()) std.os.linux.exit_group(127);
 }
 
@@ -5759,7 +5774,7 @@ fn threadRoutine(ctx: ThreadRoutineContext) void {
 const TeardownWorkerState = enum { sleeping, stopped, exited, running, unknown };
 
 fn parseWorkerState(stat: []const u8) TeardownWorkerState {
-    // comm can itself contain spaces and parentheses; state follows the last ')'.
+    // comm can itself contain spaces and parentheses. State follows the last ')'.
     const end = std.mem.lastIndexOfScalar(u8, stat, ')') orelse return .unknown;
     if (stat.len <= end + 3 or stat[end + 1] != ' ' or stat[end + 3] != ' ') return .unknown;
 
@@ -5830,7 +5845,7 @@ fn inspectTeardownWorkers() void {
         switch (observed) {
             .exited => {
                 if (joinThread(worker.handle, worker.idx, null) != 0) @panic("unable to reap completed worker during teardown");
-                // Joining swap-removes the entry; inspect its replacement next.
+                // Joining swap-removes the entry. Inspect its replacement next.
             },
             .sleeping, .stopped, .running, .unknown => {
                 logger.err("loader.deinit: worker={d} tid={d} observed={t}", .{ worker.idx, worker.tid, observed });
@@ -6021,7 +6036,7 @@ fn pthreadExitSubstitute(_: ?*anyopaque) callconv(.c) noreturn {
     requireOwnerProcessOrExit();
 
     logger.debug("intercepted call: pthread_exit()", .{});
-    // Zig's entry trampoline owns exit; native pthread_exit cannot bypass it.
+    // Zig's entry trampoline owns exit. Native pthread_exit cannot bypass it.
     logger.err("intercepted call: failed: pthread_exit(): unimplemented", .{});
 
     @panic("unimplemented pthread_exit");
@@ -6451,6 +6466,92 @@ fn resolveSymbol(dyn_object: *DynObject, sym_idx: usize) !ResolvedSymbol {
     return resolveSymbolInScope(dyn_object, sym_idx, dyn_object.deps_breadth_first.items);
 }
 
+fn initSymbolTestObjects(allocator: std.mem.Allocator, bind: std.elf.STB) !void {
+    state = .{ .allocator = allocator };
+    for ([_][]const u8{ "first", "second" }, 0..) |name, index| {
+        const key: DynObjectId = .{ .ino = index + 1 };
+        try state.dyn_objects.put(allocator, key, DynObject.init(key, name, name));
+        const object = &state.dyn_objects.values()[index];
+
+        var segment = std.mem.zeroes(DynObject.LoadSegment);
+        segment.loaded_at = 0x1000 * (index + 1);
+        segment.mem_size = 4;
+        try object.segments.put(allocator, 0, segment);
+
+        const symbol: DynSym = .{
+            .name = "identity",
+            .version = "",
+            .hidden = false,
+            .default_version = true,
+            .offset = 0,
+            .type = .OBJECT,
+            .bind = bind,
+            .shidx = 1,
+            .value = 0,
+            .size = 4,
+        };
+        var zero = symbol;
+        zero.name = "";
+        zero.shidx = std.elf.SHN_UNDEF;
+        try object.syms_array.append(allocator, zero);
+        try object.syms_array.append(allocator, symbol);
+        try object.syms.build(allocator, object.syms_array.items);
+    }
+}
+
+fn deinitSymbolTestObjects() void {
+    for (state.dyn_objects.values()) |*object| {
+        object.segments.deinit(state.allocator);
+        object.syms_array.deinit(state.allocator);
+        object.syms.deinit(state.allocator);
+        object.binding_dependencies.deinit(state.allocator);
+    }
+    state.unique_symbols.deinit(state.allocator);
+    state.dyn_objects.deinit(state.allocator);
+    state = .{};
+}
+
+fn checkUniqueRegistration(allocator: std.mem.Allocator) !void {
+    defer deinitSymbolTestObjects();
+    try initSymbolTestObjects(allocator, std.elf.STB.GNU_UNIQUE);
+
+    const first = &state.dyn_objects.values()[0];
+    const second = &state.dyn_objects.values()[1];
+    first.init_called = true;
+    const definition = (try resolveSymbolDefinition(first, 1)).symbol;
+
+    const canonical = canonicalizeUniqueSymbol(definition) catch |err| {
+        try std.testing.expect(!first.nodelete);
+        try std.testing.expectEqual(@as(usize, 0), state.unique_symbols.count());
+        return err;
+    };
+
+    try std.testing.expect(first.nodelete);
+
+    // Separate local scopes still return the first registered definition.
+    const other = try resolveSymbolInScope(second, 1, &.{1});
+
+    try std.testing.expectEqual(canonical.dyn_object_idx, other.dyn_object_idx);
+    try std.testing.expectEqualSlices(usize, &.{0}, second.binding_dependencies.items);
+    try std.testing.expect(!second.nodelete and !second.nodelete_requested);
+}
+
+fn checkPathExpansion(allocator: std.mem.Allocator, value: []const u8, expected: []const []const u8) !void {
+    state = .{ .allocator = allocator };
+    defer state = .{};
+
+    var paths: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (paths.items) |path| allocator.free(path);
+        paths.deinit(allocator);
+    }
+
+    try appendLdExpansions(&paths, value, "/origin");
+
+    try std.testing.expectEqual(expected.len, paths.items.len);
+    for (expected, paths.items) |wanted, actual| try std.testing.expectEqualStrings(wanted, actual);
+}
+
 test {
     _ = @import("CustomSelfInfo.zig");
     _ = @import("DynObject.zig");
@@ -6472,42 +6573,22 @@ test "worker stat classification handles comm delimiters and unknown states" {
     try std.testing.expectEqual(TeardownWorkerState.exited, observeWorkerState(std.math.maxInt(std.os.linux.pid_t)));
 }
 
-test "shared symbol indices preserve order and rebuild without stale names" {
-    try exerciseSymbolIndex(std.testing.allocator);
-}
-
-test "shared symbol index allocation failures clean up" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, exerciseSymbolIndex, .{});
-}
-
-fn exerciseSymbolIndex(allocator: std.mem.Allocator) !void {
-    var index: DynSymList = .empty;
-    defer index.deinit(allocator);
-    var symbols: [96]DynSym = @splat(std.mem.zeroes(DynSym));
-    for (&symbols, 0..) |*symbol, i| {
-        symbol.name = if (i % 2 == 0) "versioned" else "other";
-    }
-    symbols[3].name = "removed";
-    try index.build(allocator, symbols[0..5]);
-    try std.testing.expectEqualSlices(usize, &.{ 0, 2, 4 }, index.get("versioned").?);
-    try std.testing.expectEqualSlices(usize, &.{1}, index.get("other").?);
-    try std.testing.expectEqualSlices(usize, &.{3}, index.get("removed").?);
-    try std.testing.expect(index.get("absent") == null);
-
-    symbols[3].name = "other";
-    index.build(allocator, &symbols) catch |err| {
-        try std.testing.expectEqual(@as(usize, 0), index.count());
-        try std.testing.expect(index.get("versioned") == null);
-        return err;
-    };
-    try std.testing.expect(index.get("removed") == null);
-    try std.testing.expectEqual(@as(usize, 48), index.get("versioned").?.len);
-    try std.testing.expectEqual(@as(usize, 48), index.get("other").?.len);
-    for (index.get("versioned").?, 0..) |value, i| try std.testing.expectEqual(i * 2, value);
-    for (index.get("other").?, 0..) |value, i| try std.testing.expectEqual(i * 2 + 1, value);
-    try index.build(allocator, &.{});
-    try std.testing.expectEqual(@as(usize, 0), index.count());
-    try std.testing.expect(index.get("other") == null);
+test "path expansion releases strings when list growth fails" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkPathExpansion, .{
+        "$ORIGIN/plain.so", &[_][]const u8{"/origin/plain.so"},
+    });
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkPathExpansion, .{
+        "$ORIGIN/$LIB/lib.so",
+        &[_][]const u8{
+            "/origin/lib/x86_64-linux-gnu/lib.so", "/origin/lib64/lib.so", "/origin/lib/lib.so",
+        },
+    });
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkPathExpansion, .{
+        "$ORIGIN/${LIB}/lib.so",
+        &[_][]const u8{
+            "/origin/lib/x86_64-linux-gnu/lib.so", "/origin/lib64/lib.so", "/origin/lib/lib.so",
+        },
+    });
 }
 
 test "published module identities stay distinct and invalid lookups fail" {
@@ -6808,7 +6889,7 @@ test "binding retention follows resolution provenance and declared reachability"
         state = .{};
     }
 
-    // Synthetic, disjoint object ranges; the callable resolver is added below.
+    // Synthetic, disjoint object ranges. The callable resolver is added below.
     for ([_][]const u8{ "requester", "provider", "implementation" }, 0..) |name, index| {
         const key: DynObjectId = .{ .ino = index + 1 };
         try state.dyn_objects.put(state.allocator, key, DynObject.init(key, name, name));
@@ -6925,89 +7006,33 @@ test "binding retention follows resolution provenance and declared reachability"
     try std.testing.expectEqual(@as(usize, 0), requester.binding_dependencies.items.len);
 }
 
-fn initSymbolTestObjects(allocator: std.mem.Allocator, bind: std.elf.STB) !void {
-    state = .{ .allocator = allocator };
-    for ([_][]const u8{ "first", "second" }, 0..) |name, index| {
-        const key: DynObjectId = .{ .ino = index + 1 };
-        try state.dyn_objects.put(allocator, key, DynObject.init(key, name, name));
-        const object = &state.dyn_objects.values()[index];
-        var segment = std.mem.zeroes(DynObject.LoadSegment);
-        segment.loaded_at = 0x1000 * (index + 1);
-        segment.mem_size = 4;
-        try object.segments.put(allocator, 0, segment);
-        const symbol: DynSym = .{
-            .name = "identity",
-            .version = "",
-            .hidden = false,
-            .default_version = true,
-            .offset = 0,
-            .type = .OBJECT,
-            .bind = bind,
-            .shidx = 1,
-            .value = 0,
-            .size = 4,
-        };
-        var zero = symbol;
-        zero.name = "";
-        zero.shidx = std.elf.SHN_UNDEF;
-        try object.syms_array.append(allocator, zero);
-        try object.syms_array.append(allocator, symbol);
-        try object.syms.build(allocator, object.syms_array.items);
-    }
-}
-
-fn deinitSymbolTestObjects() void {
-    for (state.dyn_objects.values()) |*object| {
-        object.segments.deinit(state.allocator);
-        object.syms_array.deinit(state.allocator);
-        object.syms.deinit(state.allocator);
-        object.binding_dependencies.deinit(state.allocator);
-    }
-    state.unique_symbols.deinit(state.allocator);
-    state.dyn_objects.deinit(state.allocator);
-    state = .{};
-}
-
 test "defined symbols follow scope except local hidden and protected definitions" {
     defer deinitSymbolTestObjects();
     try initSymbolTestObjects(std.testing.allocator, .WEAK);
+
     const requester = &state.dyn_objects.values()[1];
     for ([_]std.elf.STB{ .WEAK, .GLOBAL }) |bind| {
         requester.syms_array.items[1].bind = bind;
+
         const result = try resolveSymbolInScope(requester, 1, &.{ 0, 1 });
+
         try std.testing.expectEqual(@as(usize, 0x1000), try result.getStaticAddress());
         try std.testing.expectEqualSlices(usize, &.{0}, requester.binding_dependencies.items);
     }
+
     for (0..3) |mode| {
         requester.syms_array.items[1].bind = if (mode == 0) .LOCAL else .GLOBAL;
         requester.syms_array.items[1].hidden = mode == 1;
         requester.syms_array.items[1].protected = mode == 2;
+
         const result = try resolveSymbolInScope(requester, 1, &.{ 0, 1 });
+
         try std.testing.expectEqual(@as(usize, 0x2000), try result.getStaticAddress());
     }
+
     // Protected definitions remain visible to other objects.
     const result = try resolveSymbolInScope(&state.dyn_objects.values()[0], 1, &.{ 1, 0 });
     try std.testing.expectEqual(@as(usize, 0x2000), try result.getStaticAddress());
-}
-
-fn checkUniqueRegistration(allocator: std.mem.Allocator) !void {
-    defer deinitSymbolTestObjects();
-    try initSymbolTestObjects(allocator, std.elf.STB.GNU_UNIQUE);
-    const first = &state.dyn_objects.values()[0];
-    const second = &state.dyn_objects.values()[1];
-    first.init_called = true;
-    const definition = (try resolveSymbolDefinition(first, 1)).symbol;
-    const canonical = canonicalizeUniqueSymbol(definition) catch |err| {
-        try std.testing.expect(!first.nodelete);
-        try std.testing.expectEqual(@as(usize, 0), state.unique_symbols.count());
-        return err;
-    };
-    try std.testing.expect(first.nodelete);
-    // Separate local scopes still return the first registered definition.
-    const other = try resolveSymbolInScope(second, 1, &.{1});
-    try std.testing.expectEqual(canonical.dyn_object_idx, other.dyn_object_idx);
-    try std.testing.expectEqualSlices(usize, &.{0}, second.binding_dependencies.items);
-    try std.testing.expect(!second.nodelete and !second.nodelete_requested);
 }
 
 test "unique registration preserves identity and commits retention after allocation" {

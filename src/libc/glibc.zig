@@ -102,7 +102,7 @@ pub fn timerBindingIndex(version: []const u8) usize {
     return 0;
 }
 
-/// Tests for the runtime marker; recognition alone does not validate its layout.
+/// Tests for the runtime marker. Recognition alone does not validate its layout.
 pub fn recognizes(services: *const Services, object: *DynObject) !bool {
     return try findLibcSymbol(services, object, "_rtld_global_ro") != null;
 }
@@ -206,7 +206,7 @@ fn appendDlHookWrites(runtime: *common.Runtime, object: *DynObject, rtld_address
     }
 
     // The modern table lives in _rtld_global_ro. Require two independent
-    // wrappers to agree on its offset; never assume a release-specific layout.
+    // wrappers to agree on its offset. Never assume a release-specific layout.
     const slot = try globalSlot(object, "_rtld_global_ro");
     var offset: ?usize = null;
     inline for (.{ "dlclose", "dladdr" }) |name| {
@@ -289,14 +289,17 @@ fn prepareThreads(runtime: *common.Runtime) !void {
 
 /// Discovers thread support when an older glibc's libpthread is prepared.
 /// Pins that object because the retained list and lock addresses belong to it.
-fn prepareObject(runtime: *common.Runtime, object: *DynObject) !void {
+fn prepareObject(runtime: *common.Runtime, object: *DynObject) common.ObjectPreparationError!void {
     const state = getState(runtime);
     if (state.threads != null or !isThreadSupportName(object.name)) return;
 
     logger.debug("glibc.threads: object={s} mode=legacy action=inspect", .{object.name});
     const layout = detectLegacyGlibcThreadLayout(runtime.allocator, runtime.services, object) catch |err| switch (err) {
-        error.CodePatternMismatch => return error.UnrecognizedGlibcThreadLayout,
-        else => return err,
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {
+            logger.err("glibc.threads: object={s} action=inspection_failed error={t}", .{ object.name, err });
+            return error.UnrecognizedGlibcThreadLayout;
+        },
     };
     try validateThreadStorage(layout, runtime.services.native_metadata_capacity);
     state.threads = layout;
@@ -306,8 +309,8 @@ fn prepareObject(runtime: *common.Runtime, object: *DynObject) !void {
 
 fn threadStorageSize(runtime: *const common.Runtime) usize {
     // Use the loaded library's `sizeof(struct pthread)`, not a host-side copy of
-    // its private C definition. The extra page is reserved descriptor space;
-    // this value is not the worker's stack size or ELF TLS payload size.
+    // its private C definition. The extra page is reserved descriptor space.
+    // This value is not the worker's stack size or ELF TLS payload size.
     const symbol = runtime.services.lookupRuntimeSymbol("_thread_db_sizeof_pthread") catch return common.bootstrapThreadStorageSize();
     const address = symbol.getStaticAddress() catch return common.bootstrapThreadStorageSize();
     const size: *const u32 = @ptrFromInt(address);
@@ -399,7 +402,7 @@ fn detectGlibcTlsOffsets(allocator: std.mem.Allocator, object: *DynObject, code:
 }
 
 /// glibc `list_t` stores addresses of embedded list nodes, not thread pointers.
-/// Empty heads point to themselves; a zero-filled node is not yet registered.
+/// Empty heads point to themselves. A zero-filled node is not yet registered.
 const GlibcThreadList = extern struct {
     next: usize,
     prev: usize,
@@ -435,7 +438,7 @@ const GlibcThreadLayout = struct {
 };
 
 const GlibcForkLists = struct {
-    // `cache` is an offset in `_rtld_global`; `ownership` contains a pthread offset.
+    // `cache` is an offset in `_rtld_global`. `ownership` contains a pthread offset.
     cache: usize,
     ownership: GlibcThreadLayout.Ownership,
 };
@@ -616,7 +619,7 @@ fn detectLegacyGlibcThreadLayout(allocator: std.mem.Allocator, services: *const 
         try uniqueOffset(&callback, argument.a);
     }
 
-    // The callback has no exported size. The window bounds inspection; reachable
+    // The callback has no exported size. The window bounds inspection. Reachable
     // decoding and recognized non-returning calls determine which bytes are used.
     const callback_address = callback orelse return error.GlibcReclaimCallbackNotFound;
     const callback_code = try CodeView.fromDynObject(dyn_object, callback_address, 0x300);
@@ -729,8 +732,8 @@ fn detectLegacyGlibcThreadLayout(allocator: std.mem.Allocator, services: *const 
         .in_flight = @ptrFromInt(try dyn_object.mappedWritableDataAddress(in_flight, 8, 8)),
         .nthreads = @ptrFromInt(try dyn_object.mappedWritableDataAddress(nthreads, 4, 4)),
         .single_threaded = null,
-        // Legacy native initialization establishes the initial-thread lists;
-        // the manual zero-state setup used for integrated NPTL must not repeat it.
+        // Legacy native initialization establishes the initial-thread lists.
+        // The manual zero-state setup used for integrated NPTL must not repeat it.
         .initialized = true,
     };
 }
@@ -768,7 +771,7 @@ fn detectStackCache(flow: InstructionFlow, used: InstructionFlow.Value) !Instruc
 
 /// Associates a descriptor field with the branch that reinserts the surviving
 /// thread into the caller-owned list. A byte flag selects that branch when
-/// nonzero; a word mode selects it when equal to a particular enum value.
+/// nonzero. A word mode selects it when equal to a particular enum value.
 /// Both links of the node and both links of the empty head must be assigned.
 fn detectOwnership(flow: InstructionFlow, user: InstructionFlow.Value, list_offset: usize) !GlibcThreadLayout.Ownership {
     var result: ?GlibcThreadLayout.Ownership = null;
@@ -789,7 +792,7 @@ fn detectOwnership(flow: InstructionFlow, user: InstructionFlow.Value, list_offs
         const branch = flow.nodes.items[branch_index].instruction;
         if (branch.op != .branch or branch.target == null or branch.target.? < flow.code.address) continue;
 
-        // x86 condition 4 is equal/zero (`JE`); 5 is not-equal/nonzero (`JNE`).
+        // x86 condition 4 is equal/zero (`JE`). 5 is not-equal/nonzero (`JNE`).
         // A self-test compares the byte with itself in the decoder's operand
         // representation. Its nonzero branch corresponds to a set ownership flag.
         var ownership: GlibcThreadLayout.Ownership = undefined;
@@ -984,7 +987,7 @@ fn firstArgumentWriteSize(flow: InstructionFlow, object: ?*DynObject) !?usize {
         if (instruction.op == .call or instruction.op == .syscall or tail_call) {
             // Include function argument registers and Linux's fourth syscall
             // argument (`R10`). Recognized one-argument lock helpers consume only
-            // `RDI`; stale values in other volatile registers are not arguments.
+            // `RDI`. Stale values in other volatile registers are not arguments.
             const one_argument_lock = object != null and instruction.target != null and
                 (try callsSymbol(object.?, instruction.target.?, "__lll_lock_wait_private") or try callsSymbol(object.?, instruction.target.?, "__lll_lock_wake_private"));
             if (tail_call and !one_argument_lock) return null;
@@ -1001,7 +1004,7 @@ fn firstArgumentWriteSize(flow: InstructionFlow, object: ?*DynObject) !?usize {
         }
 
         // Reading snapshot contents is distinct from retaining its address.
-        // Scalar private spills are allowed; packed pointer stores are rejected
+        // Scalar private spills are allowed. Packed pointer stores are rejected
         // conservatively because this proof does not track their escape by lane.
         if (source.is(.call_field, -1)) argument_used = true;
         if (source.tainted and instruction.dst == .memory and destination.kind != .stack) return null;
@@ -1076,7 +1079,7 @@ fn tlsOffsets(flow: InstructionFlow, slot: usize) !GlibcTlsOffsets {
         if (!divisor.is(.global_field, @intCast(slot)) or !numerator.is(.sum, @intCast(slot)) or
             numerator.bias != -1 or !node.state.registers[Register.rdx].is(.constant, 0)) continue;
 
-        // Addition is commutative; whichever field equals the divisor supplies
+        // Addition is commutative. Whichever field equals the divisor supplies
         // alignment. The other field supplies size and must be distinct.
         const size = if (numerator.b == divisor.b) numerator.c else if (numerator.c == divisor.b) numerator.b else continue;
         if (size == divisor.b or size < 0 or divisor.b < 0 or @mod(size, 8) != 0 or @mod(divisor.b, 8) != 0) return error.InvalidGlibcTlsLayout;
@@ -1126,14 +1129,52 @@ fn shifted(address: Value, offset: i64) Value {
 }
 
 /// Symbolic load from an absolute or indirect-global address. Callers supply
-/// only these two forms; this does not read the native mapping.
+/// only these two forms. This does not read the native mapping.
 fn contents(address: Value) Value {
-    return if (address.kind == .address) .{ .kind = .global, .a = address.a } else .{ .kind = .global_field, .a = address.a, .b = address.b };
+    return switch (address.kind) {
+        .address => .{ .kind = .global, .a = address.a },
+        .global_address => .{ .kind = .global_field, .a = address.a, .b = address.b },
+        .unknown,
+        .constant,
+        .range,
+        .global,
+        .global_field,
+        .indirect_address,
+        .indirect_field,
+        .sum,
+        .thread,
+        .stack,
+        .call,
+        .thread_field,
+        .call_field,
+        .thread_address,
+        .call_address,
+        => unreachable,
+    };
 }
 
 /// Adds an offset through a previously loaded global pointer or global field.
 fn through(pointer: Value, offset: i64) Value {
-    return if (pointer.kind == .global) .{ .kind = .global_address, .a = pointer.a, .b = offset } else .{ .kind = .indirect_address, .a = pointer.a, .b = pointer.b, .c = offset };
+    return switch (pointer.kind) {
+        .global => .{ .kind = .global_address, .a = pointer.a, .b = offset },
+        .global_field => .{ .kind = .indirect_address, .a = pointer.a, .b = pointer.b, .c = offset },
+        .unknown,
+        .constant,
+        .range,
+        .address,
+        .global_address,
+        .indirect_address,
+        .indirect_field,
+        .sum,
+        .thread,
+        .stack,
+        .call,
+        .thread_field,
+        .call_field,
+        .thread_address,
+        .call_address,
+        => unreachable,
+    };
 }
 
 /// Treats a packed two-pointer store as two scalar stores.
@@ -1253,7 +1294,7 @@ fn unregisterGlibcWorker(layout: *GlibcThreadLayout, tp: usize) void {
     defer unlockGlibcThreadList(layout);
 
     // glibc journals deletions because `fork` can copy memory between the two
-    // link stores. A node address with bit zero clear means deletion; recovery
+    // link stores. A node address with bit zero clear means deletion. Recovery
     // can replay both stores. Clear the journal only after both are visible.
     // This follows `__nptl_stack_list_del`, not native stack deallocation: Zig
     // still owns the descriptor and will reclaim it after kernel thread exit.
@@ -1268,7 +1309,7 @@ fn unregisterGlibcWorker(layout: *GlibcThreadLayout, tp: usize) void {
 }
 
 /// Describes writes applied by `common.Runtime` after the loader establishes TLS.
-/// Absolute entries populate rtld globals; TP-relative entries are also applied
+/// Absolute entries populate rtld globals. TP-relative entries are also applied
 /// in each worker. `auxv` is the host auxiliary vector, and TLS dimensions come
 /// from the loader's current allocation, not glibc's native TLS allocator.
 fn appendWritePlan(runtime: *common.Runtime, glibc: Layout) !void {
@@ -1276,7 +1317,7 @@ fn appendWritePlan(runtime: *common.Runtime, glibc: Layout) !void {
     // TODO recover or validate the fixed field offset (104) against the loaded glibc.
     // TODO initialize auxv-derived glibc state, notably _dl_hwcap2, before any
     // native IFUNC/IRELATIVE resolver runs. Setting _dl_auxv alone does not populate
-    // those cached fields; this requires preparation before the relocation loop.
+    // those cached fields. This requires preparation before the relocation loop.
     const auxv_field_address = std.math.add(usize, glibc.rtld_mapped_address, 104) catch return error.InvalidDataAddress;
     try runtime.write_ops.append(runtime.allocator, .{
         .addr = auxv_field_address,

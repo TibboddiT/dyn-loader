@@ -1,5 +1,7 @@
 const std = @import("std");
+
 const dyn_loader = @import("dyn_loader");
+
 const vk = @import("vk.zig");
 const wl = @import("wayland.zig");
 const VulkanProcResolver = @import("vulkan_proc_resolver.zig").VulkanProcResolver;
@@ -262,12 +264,25 @@ pub fn main(init: std.process.Init) !void {
     defer destroyCommandBuffers(&gc, pool, allocator, cmdbufs);
 
     var state: Swapchain.PresentState = .optimal;
+    // Stop GPU access before deferred destruction, including on presentation errors.
+    defer gc.dev.deviceWaitIdle() catch |err| switch (err) {
+        error.DeviceLost => {},
+        else => @panic("unable to quiesce Vulkan device"),
+    };
+
     main_loop: while (window.running) {
         try dispatchWayland(&wayland, display);
         if (!window.running) break :main_loop;
 
         if (state == .suboptimal or window.resize_pending) {
             window.resize_pending = false;
+
+            try gc.dev.deviceWaitIdle();
+            destroyCommandBuffers(&gc, pool, allocator, cmdbufs);
+            cmdbufs = &.{};
+            destroyFramebuffers(&gc, allocator, framebuffers);
+            framebuffers = &.{};
+
             var do_recycle = true;
             while (true) {
                 swapchain.recreate(window.extent, do_recycle) catch |err| switch (err) {
@@ -282,10 +297,8 @@ pub fn main(init: std.process.Init) !void {
                 break;
             }
 
-            destroyFramebuffers(&gc, allocator, framebuffers);
             framebuffers = try createFramebuffers(&gc, allocator, render_pass, swapchain);
 
-            destroyCommandBuffers(&gc, pool, allocator, cmdbufs);
             cmdbufs = try createCommandBuffers(
                 &gc,
                 pool,
@@ -460,6 +473,8 @@ fn createCommandBuffers(
 }
 
 fn destroyCommandBuffers(gc: *const GraphicsContext, pool: vk.CommandPool, allocator: Allocator, cmdbufs: []vk.CommandBuffer) void {
+    if (cmdbufs.len == 0) return;
+
     gc.dev.freeCommandBuffers(pool, @truncate(cmdbufs.len), cmdbufs.ptr);
     allocator.free(cmdbufs);
 }

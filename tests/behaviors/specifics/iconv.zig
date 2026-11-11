@@ -14,10 +14,10 @@ pub fn run(init: std.process.Init, fixtures: support.SpecificContext) !void {
     defer dyn_loader.deinit();
 
     const library = try dyn_loader.load(fixtures.target_path);
-    const open: *const fn ([*:0]const u8, [*:0]const u8) callconv(.c) usize = @ptrFromInt((try library.getSymbol("iconv_open")).addr);
-    const convert: *const fn (usize, *[*]const u8, *usize, *[*]u8, *usize) callconv(.c) usize = @ptrFromInt((try library.getSymbol("iconv")).addr);
-    const close: *const fn (usize) callconv(.c) c_int = @ptrFromInt((try library.getSymbol("iconv_close")).addr);
-    const lookup: *const fn (?*anyopaque, [*:0]const u8) callconv(.c) ?*anyopaque = @ptrFromInt((try library.getSymbol("dlsym")).addr);
+    const open: *const fn (to_encoding: [*:0]const u8, from_encoding: [*:0]const u8) callconv(.c) usize = @ptrFromInt((try library.getSymbol("iconv_open")).addr);
+    const convert: *const fn (descriptor: usize, input: *[*]const u8, input_remaining: *usize, output: *[*]u8, output_remaining: *usize) callconv(.c) usize = @ptrFromInt((try library.getSymbol("iconv")).addr);
+    const close: *const fn (descriptor: usize) callconv(.c) c_int = @ptrFromInt((try library.getSymbol("iconv_close")).addr);
+    const lookup: *const fn (handle: ?*anyopaque, name: [*:0]const u8) callconv(.c) ?*anyopaque = @ptrFromInt((try library.getSymbol("dlsym")).addr);
     const readError: *const fn () callconv(.c) ?[*:0]const u8 = @ptrFromInt((try library.getSymbol("dlerror")).addr);
 
     // Conversion must preserve a pending loader error, including when libc

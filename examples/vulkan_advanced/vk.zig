@@ -67,7 +67,7 @@ fn FlagFormatMixin(comptime FlagsType: type) type {
         }
     };
 }
-pub const Version = packed struct(u32) {
+pub const Version = bitpack struct(u32) {
     patch: u12,
     minor: u10,
     major: u7,
@@ -175,7 +175,7 @@ pub const DeviceAddress = u64;
 pub const OHNativeWindow = if (@hasDecl(root, "OHNativeWindow")) root.OHNativeWindow else opaque {};
 pub const OHBufferHandle = if (@hasDecl(root, "OHBufferHandle")) root.OHBufferHandle else opaque {};
 pub const OH_NativeBuffer = if (@hasDecl(root, "OH_NativeBuffer")) root.OH_NativeBuffer else opaque {};
-pub const PipelineDynamicStateCreateFlags = packed struct(Flags) {
+pub const PipelineDynamicStateCreateFlags = bitpack struct(Flags) {
     _reserved_bits: Flags = 0,
     pub const toInt = FlagsMixin(PipelineDynamicStateCreateFlags).toInt;
     pub const fromInt = FlagsMixin(PipelineDynamicStateCreateFlags).fromInt;
@@ -186,7 +186,7 @@ pub const PipelineDynamicStateCreateFlags = packed struct(Flags) {
     pub const contains = FlagsMixin(PipelineDynamicStateCreateFlags).contains;
     pub const format = FlagFormatMixin(PipelineDynamicStateCreateFlags).format;
 };
-pub const PipelineMultisampleStateCreateFlags = packed struct(Flags) {
+pub const PipelineMultisampleStateCreateFlags = bitpack struct(Flags) {
     _reserved_bits: Flags = 0,
     pub const toInt = FlagsMixin(PipelineMultisampleStateCreateFlags).toInt;
     pub const fromInt = FlagsMixin(PipelineMultisampleStateCreateFlags).fromInt;
@@ -197,7 +197,7 @@ pub const PipelineMultisampleStateCreateFlags = packed struct(Flags) {
     pub const contains = FlagsMixin(PipelineMultisampleStateCreateFlags).contains;
     pub const format = FlagFormatMixin(PipelineMultisampleStateCreateFlags).format;
 };
-pub const PipelineRasterizationStateCreateFlags = packed struct(Flags) {
+pub const PipelineRasterizationStateCreateFlags = bitpack struct(Flags) {
     _reserved_bits: Flags = 0,
     pub const toInt = FlagsMixin(PipelineRasterizationStateCreateFlags).toInt;
     pub const fromInt = FlagsMixin(PipelineRasterizationStateCreateFlags).fromInt;
@@ -208,7 +208,7 @@ pub const PipelineRasterizationStateCreateFlags = packed struct(Flags) {
     pub const contains = FlagsMixin(PipelineRasterizationStateCreateFlags).contains;
     pub const format = FlagFormatMixin(PipelineRasterizationStateCreateFlags).format;
 };
-pub const PipelineViewportStateCreateFlags = packed struct(Flags) {
+pub const PipelineViewportStateCreateFlags = bitpack struct(Flags) {
     _reserved_bits: Flags = 0,
     pub const toInt = FlagsMixin(PipelineViewportStateCreateFlags).toInt;
     pub const fromInt = FlagsMixin(PipelineViewportStateCreateFlags).fromInt;
@@ -219,7 +219,7 @@ pub const PipelineViewportStateCreateFlags = packed struct(Flags) {
     pub const contains = FlagsMixin(PipelineViewportStateCreateFlags).contains;
     pub const format = FlagFormatMixin(PipelineViewportStateCreateFlags).format;
 };
-pub const PipelineTessellationStateCreateFlags = packed struct(Flags) {
+pub const PipelineTessellationStateCreateFlags = bitpack struct(Flags) {
     _reserved_bits: Flags = 0,
     pub const toInt = FlagsMixin(PipelineTessellationStateCreateFlags).toInt;
     pub const fromInt = FlagsMixin(PipelineTessellationStateCreateFlags).fromInt;
@@ -230,7 +230,7 @@ pub const PipelineTessellationStateCreateFlags = packed struct(Flags) {
     pub const contains = FlagsMixin(PipelineTessellationStateCreateFlags).contains;
     pub const format = FlagFormatMixin(PipelineTessellationStateCreateFlags).format;
 };
-pub const PipelineInputAssemblyStateCreateFlags = packed struct(Flags) {
+pub const PipelineInputAssemblyStateCreateFlags = bitpack struct(Flags) {
     _reserved_bits: Flags = 0,
     pub const toInt = FlagsMixin(PipelineInputAssemblyStateCreateFlags).toInt;
     pub const fromInt = FlagsMixin(PipelineInputAssemblyStateCreateFlags).fromInt;
@@ -241,7 +241,7 @@ pub const PipelineInputAssemblyStateCreateFlags = packed struct(Flags) {
     pub const contains = FlagsMixin(PipelineInputAssemblyStateCreateFlags).contains;
     pub const format = FlagFormatMixin(PipelineInputAssemblyStateCreateFlags).format;
 };
-pub const PipelineVertexInputStateCreateFlags = packed struct(Flags) {
+pub const PipelineVertexInputStateCreateFlags = bitpack struct(Flags) {
     _reserved_bits: Flags = 0,
     pub const toInt = FlagsMixin(PipelineVertexInputStateCreateFlags).toInt;
     pub const fromInt = FlagsMixin(PipelineVertexInputStateCreateFlags).fromInt;
@@ -252,7 +252,7 @@ pub const PipelineVertexInputStateCreateFlags = packed struct(Flags) {
     pub const contains = FlagsMixin(PipelineVertexInputStateCreateFlags).contains;
     pub const format = FlagFormatMixin(PipelineVertexInputStateCreateFlags).format;
 };
-pub const BufferViewCreateFlags = packed struct(Flags) {
+pub const BufferViewCreateFlags = bitpack struct(Flags) {
     _reserved_bits: Flags = 0,
     pub const toInt = FlagsMixin(BufferViewCreateFlags).toInt;
     pub const fromInt = FlagsMixin(BufferViewCreateFlags).fromInt;
@@ -263,7 +263,7 @@ pub const BufferViewCreateFlags = packed struct(Flags) {
     pub const contains = FlagsMixin(BufferViewCreateFlags).contains;
     pub const format = FlagFormatMixin(BufferViewCreateFlags).format;
 };
-pub const DeviceCreateFlags = packed struct(Flags) {
+pub const DeviceCreateFlags = bitpack struct(Flags) {
     _reserved_bits: Flags = 0,
     pub const toInt = FlagsMixin(DeviceCreateFlags).toInt;
     pub const fromInt = FlagsMixin(DeviceCreateFlags).fromInt;
@@ -274,7 +274,7 @@ pub const DeviceCreateFlags = packed struct(Flags) {
     pub const contains = FlagsMixin(DeviceCreateFlags).contains;
     pub const format = FlagFormatMixin(DeviceCreateFlags).format;
 };
-pub const SemaphoreCreateFlags = packed struct(Flags) {
+pub const SemaphoreCreateFlags = bitpack struct(Flags) {
     _reserved_bits: Flags = 0,
     pub const toInt = FlagsMixin(SemaphoreCreateFlags).toInt;
     pub const fromInt = FlagsMixin(SemaphoreCreateFlags).fromInt;
@@ -285,7 +285,7 @@ pub const SemaphoreCreateFlags = packed struct(Flags) {
     pub const contains = FlagsMixin(SemaphoreCreateFlags).contains;
     pub const format = FlagFormatMixin(SemaphoreCreateFlags).format;
 };
-pub const ShaderModuleCreateFlags = packed struct(Flags) {
+pub const ShaderModuleCreateFlags = bitpack struct(Flags) {
     _reserved_bits: Flags = 0,
     pub const toInt = FlagsMixin(ShaderModuleCreateFlags).toInt;
     pub const fromInt = FlagsMixin(ShaderModuleCreateFlags).fromInt;
@@ -297,7 +297,7 @@ pub const ShaderModuleCreateFlags = packed struct(Flags) {
     pub const format = FlagFormatMixin(ShaderModuleCreateFlags).format;
 };
 pub const MemoryUnmapFlagsKHR = MemoryUnmapFlags;
-pub const DescriptorPoolResetFlags = packed struct(Flags) {
+pub const DescriptorPoolResetFlags = bitpack struct(Flags) {
     _reserved_bits: Flags = 0,
     pub const toInt = FlagsMixin(DescriptorPoolResetFlags).toInt;
     pub const fromInt = FlagsMixin(DescriptorPoolResetFlags).fromInt;
@@ -311,7 +311,7 @@ pub const DescriptorPoolResetFlags = packed struct(Flags) {
 pub const GeometryFlagsNV = GeometryFlagsKHR;
 pub const GeometryInstanceFlagsNV = GeometryInstanceFlagsKHR;
 pub const BuildAccelerationStructureFlagsNV = BuildAccelerationStructureFlagsKHR;
-pub const PrivateDataSlotCreateFlags = packed struct(Flags) {
+pub const PrivateDataSlotCreateFlags = bitpack struct(Flags) {
     _reserved_bits: Flags = 0,
     pub const toInt = FlagsMixin(PrivateDataSlotCreateFlags).toInt;
     pub const fromInt = FlagsMixin(PrivateDataSlotCreateFlags).fromInt;
@@ -323,7 +323,7 @@ pub const PrivateDataSlotCreateFlags = packed struct(Flags) {
     pub const format = FlagFormatMixin(PrivateDataSlotCreateFlags).format;
 };
 pub const PrivateDataSlotCreateFlagsEXT = PrivateDataSlotCreateFlags;
-pub const DescriptorUpdateTemplateCreateFlags = packed struct(Flags) {
+pub const DescriptorUpdateTemplateCreateFlags = bitpack struct(Flags) {
     _reserved_bits: Flags = 0,
     pub const toInt = FlagsMixin(DescriptorUpdateTemplateCreateFlags).toInt;
     pub const fromInt = FlagsMixin(DescriptorUpdateTemplateCreateFlags).fromInt;
@@ -339,7 +339,7 @@ pub const PipelineCreationFeedbackFlagsEXT = PipelineCreationFeedbackFlags;
 pub const SemaphoreWaitFlagsKHR = SemaphoreWaitFlags;
 pub const AccessFlags2KHR = AccessFlags2;
 pub const PipelineStageFlags2KHR = PipelineStageFlags2;
-pub const AccelerationStructureMotionInfoFlagsNV = packed struct(Flags) {
+pub const AccelerationStructureMotionInfoFlagsNV = bitpack struct(Flags) {
     _reserved_bits: Flags = 0,
     pub const toInt = FlagsMixin(AccelerationStructureMotionInfoFlagsNV).toInt;
     pub const fromInt = FlagsMixin(AccelerationStructureMotionInfoFlagsNV).fromInt;
@@ -350,7 +350,7 @@ pub const AccelerationStructureMotionInfoFlagsNV = packed struct(Flags) {
     pub const contains = FlagsMixin(AccelerationStructureMotionInfoFlagsNV).contains;
     pub const format = FlagFormatMixin(AccelerationStructureMotionInfoFlagsNV).format;
 };
-pub const AccelerationStructureMotionInstanceFlagsNV = packed struct(Flags) {
+pub const AccelerationStructureMotionInstanceFlagsNV = bitpack struct(Flags) {
     _reserved_bits: Flags = 0,
     pub const toInt = FlagsMixin(AccelerationStructureMotionInstanceFlagsNV).toInt;
     pub const fromInt = FlagsMixin(AccelerationStructureMotionInstanceFlagsNV).fromInt;
@@ -364,7 +364,7 @@ pub const AccelerationStructureMotionInstanceFlagsNV = packed struct(Flags) {
 pub const FormatFeatureFlags2KHR = FormatFeatureFlags2;
 pub const MemoryDecompressionMethodFlagsNV = MemoryDecompressionMethodFlagsEXT;
 pub const RenderingFlagsKHR = RenderingFlags;
-pub const DirectDriverLoadingFlagsLUNARG = packed struct(Flags) {
+pub const DirectDriverLoadingFlagsLUNARG = bitpack struct(Flags) {
     _reserved_bits: Flags = 0,
     pub const toInt = FlagsMixin(DirectDriverLoadingFlagsLUNARG).toInt;
     pub const fromInt = FlagsMixin(DirectDriverLoadingFlagsLUNARG).fromInt;
@@ -377,7 +377,7 @@ pub const DirectDriverLoadingFlagsLUNARG = packed struct(Flags) {
 };
 pub const PipelineCreateFlags2KHR = PipelineCreateFlags2;
 pub const BufferUsageFlags2KHR = BufferUsageFlags2;
-pub const DisplayModeCreateFlagsKHR = packed struct(Flags) {
+pub const DisplayModeCreateFlagsKHR = bitpack struct(Flags) {
     _reserved_bits: Flags = 0,
     pub const toInt = FlagsMixin(DisplayModeCreateFlagsKHR).toInt;
     pub const fromInt = FlagsMixin(DisplayModeCreateFlagsKHR).fromInt;
@@ -388,7 +388,7 @@ pub const DisplayModeCreateFlagsKHR = packed struct(Flags) {
     pub const contains = FlagsMixin(DisplayModeCreateFlagsKHR).contains;
     pub const format = FlagFormatMixin(DisplayModeCreateFlagsKHR).format;
 };
-pub const DisplaySurfaceCreateFlagsKHR = packed struct(Flags) {
+pub const DisplaySurfaceCreateFlagsKHR = bitpack struct(Flags) {
     _reserved_bits: Flags = 0,
     pub const toInt = FlagsMixin(DisplaySurfaceCreateFlagsKHR).toInt;
     pub const fromInt = FlagsMixin(DisplaySurfaceCreateFlagsKHR).fromInt;
@@ -399,7 +399,7 @@ pub const DisplaySurfaceCreateFlagsKHR = packed struct(Flags) {
     pub const contains = FlagsMixin(DisplaySurfaceCreateFlagsKHR).contains;
     pub const format = FlagFormatMixin(DisplaySurfaceCreateFlagsKHR).format;
 };
-pub const AndroidSurfaceCreateFlagsKHR = packed struct(Flags) {
+pub const AndroidSurfaceCreateFlagsKHR = bitpack struct(Flags) {
     _reserved_bits: Flags = 0,
     pub const toInt = FlagsMixin(AndroidSurfaceCreateFlagsKHR).toInt;
     pub const fromInt = FlagsMixin(AndroidSurfaceCreateFlagsKHR).fromInt;
@@ -410,7 +410,7 @@ pub const AndroidSurfaceCreateFlagsKHR = packed struct(Flags) {
     pub const contains = FlagsMixin(AndroidSurfaceCreateFlagsKHR).contains;
     pub const format = FlagFormatMixin(AndroidSurfaceCreateFlagsKHR).format;
 };
-pub const ViSurfaceCreateFlagsNN = packed struct(Flags) {
+pub const ViSurfaceCreateFlagsNN = bitpack struct(Flags) {
     _reserved_bits: Flags = 0,
     pub const toInt = FlagsMixin(ViSurfaceCreateFlagsNN).toInt;
     pub const fromInt = FlagsMixin(ViSurfaceCreateFlagsNN).fromInt;
@@ -421,7 +421,7 @@ pub const ViSurfaceCreateFlagsNN = packed struct(Flags) {
     pub const contains = FlagsMixin(ViSurfaceCreateFlagsNN).contains;
     pub const format = FlagFormatMixin(ViSurfaceCreateFlagsNN).format;
 };
-pub const WaylandSurfaceCreateFlagsKHR = packed struct(Flags) {
+pub const WaylandSurfaceCreateFlagsKHR = bitpack struct(Flags) {
     _reserved_bits: Flags = 0,
     pub const toInt = FlagsMixin(WaylandSurfaceCreateFlagsKHR).toInt;
     pub const fromInt = FlagsMixin(WaylandSurfaceCreateFlagsKHR).fromInt;
@@ -432,7 +432,7 @@ pub const WaylandSurfaceCreateFlagsKHR = packed struct(Flags) {
     pub const contains = FlagsMixin(WaylandSurfaceCreateFlagsKHR).contains;
     pub const format = FlagFormatMixin(WaylandSurfaceCreateFlagsKHR).format;
 };
-pub const Win32SurfaceCreateFlagsKHR = packed struct(Flags) {
+pub const Win32SurfaceCreateFlagsKHR = bitpack struct(Flags) {
     _reserved_bits: Flags = 0,
     pub const toInt = FlagsMixin(Win32SurfaceCreateFlagsKHR).toInt;
     pub const fromInt = FlagsMixin(Win32SurfaceCreateFlagsKHR).fromInt;
@@ -443,7 +443,7 @@ pub const Win32SurfaceCreateFlagsKHR = packed struct(Flags) {
     pub const contains = FlagsMixin(Win32SurfaceCreateFlagsKHR).contains;
     pub const format = FlagFormatMixin(Win32SurfaceCreateFlagsKHR).format;
 };
-pub const XlibSurfaceCreateFlagsKHR = packed struct(Flags) {
+pub const XlibSurfaceCreateFlagsKHR = bitpack struct(Flags) {
     _reserved_bits: Flags = 0,
     pub const toInt = FlagsMixin(XlibSurfaceCreateFlagsKHR).toInt;
     pub const fromInt = FlagsMixin(XlibSurfaceCreateFlagsKHR).fromInt;
@@ -454,7 +454,7 @@ pub const XlibSurfaceCreateFlagsKHR = packed struct(Flags) {
     pub const contains = FlagsMixin(XlibSurfaceCreateFlagsKHR).contains;
     pub const format = FlagFormatMixin(XlibSurfaceCreateFlagsKHR).format;
 };
-pub const XcbSurfaceCreateFlagsKHR = packed struct(Flags) {
+pub const XcbSurfaceCreateFlagsKHR = bitpack struct(Flags) {
     _reserved_bits: Flags = 0,
     pub const toInt = FlagsMixin(XcbSurfaceCreateFlagsKHR).toInt;
     pub const fromInt = FlagsMixin(XcbSurfaceCreateFlagsKHR).fromInt;
@@ -465,7 +465,7 @@ pub const XcbSurfaceCreateFlagsKHR = packed struct(Flags) {
     pub const contains = FlagsMixin(XcbSurfaceCreateFlagsKHR).contains;
     pub const format = FlagFormatMixin(XcbSurfaceCreateFlagsKHR).format;
 };
-pub const DirectFBSurfaceCreateFlagsEXT = packed struct(Flags) {
+pub const DirectFBSurfaceCreateFlagsEXT = bitpack struct(Flags) {
     _reserved_bits: Flags = 0,
     pub const toInt = FlagsMixin(DirectFBSurfaceCreateFlagsEXT).toInt;
     pub const fromInt = FlagsMixin(DirectFBSurfaceCreateFlagsEXT).fromInt;
@@ -476,7 +476,7 @@ pub const DirectFBSurfaceCreateFlagsEXT = packed struct(Flags) {
     pub const contains = FlagsMixin(DirectFBSurfaceCreateFlagsEXT).contains;
     pub const format = FlagFormatMixin(DirectFBSurfaceCreateFlagsEXT).format;
 };
-pub const IOSSurfaceCreateFlagsMVK = packed struct(Flags) {
+pub const IOSSurfaceCreateFlagsMVK = bitpack struct(Flags) {
     _reserved_bits: Flags = 0,
     pub const toInt = FlagsMixin(IOSSurfaceCreateFlagsMVK).toInt;
     pub const fromInt = FlagsMixin(IOSSurfaceCreateFlagsMVK).fromInt;
@@ -487,7 +487,7 @@ pub const IOSSurfaceCreateFlagsMVK = packed struct(Flags) {
     pub const contains = FlagsMixin(IOSSurfaceCreateFlagsMVK).contains;
     pub const format = FlagFormatMixin(IOSSurfaceCreateFlagsMVK).format;
 };
-pub const MacOSSurfaceCreateFlagsMVK = packed struct(Flags) {
+pub const MacOSSurfaceCreateFlagsMVK = bitpack struct(Flags) {
     _reserved_bits: Flags = 0,
     pub const toInt = FlagsMixin(MacOSSurfaceCreateFlagsMVK).toInt;
     pub const fromInt = FlagsMixin(MacOSSurfaceCreateFlagsMVK).fromInt;
@@ -498,7 +498,7 @@ pub const MacOSSurfaceCreateFlagsMVK = packed struct(Flags) {
     pub const contains = FlagsMixin(MacOSSurfaceCreateFlagsMVK).contains;
     pub const format = FlagFormatMixin(MacOSSurfaceCreateFlagsMVK).format;
 };
-pub const MetalSurfaceCreateFlagsEXT = packed struct(Flags) {
+pub const MetalSurfaceCreateFlagsEXT = bitpack struct(Flags) {
     _reserved_bits: Flags = 0,
     pub const toInt = FlagsMixin(MetalSurfaceCreateFlagsEXT).toInt;
     pub const fromInt = FlagsMixin(MetalSurfaceCreateFlagsEXT).fromInt;
@@ -509,7 +509,7 @@ pub const MetalSurfaceCreateFlagsEXT = packed struct(Flags) {
     pub const contains = FlagsMixin(MetalSurfaceCreateFlagsEXT).contains;
     pub const format = FlagFormatMixin(MetalSurfaceCreateFlagsEXT).format;
 };
-pub const ImagePipeSurfaceCreateFlagsFUCHSIA = packed struct(Flags) {
+pub const ImagePipeSurfaceCreateFlagsFUCHSIA = bitpack struct(Flags) {
     _reserved_bits: Flags = 0,
     pub const toInt = FlagsMixin(ImagePipeSurfaceCreateFlagsFUCHSIA).toInt;
     pub const fromInt = FlagsMixin(ImagePipeSurfaceCreateFlagsFUCHSIA).fromInt;
@@ -520,7 +520,7 @@ pub const ImagePipeSurfaceCreateFlagsFUCHSIA = packed struct(Flags) {
     pub const contains = FlagsMixin(ImagePipeSurfaceCreateFlagsFUCHSIA).contains;
     pub const format = FlagFormatMixin(ImagePipeSurfaceCreateFlagsFUCHSIA).format;
 };
-pub const StreamDescriptorSurfaceCreateFlagsGGP = packed struct(Flags) {
+pub const StreamDescriptorSurfaceCreateFlagsGGP = bitpack struct(Flags) {
     _reserved_bits: Flags = 0,
     pub const toInt = FlagsMixin(StreamDescriptorSurfaceCreateFlagsGGP).toInt;
     pub const fromInt = FlagsMixin(StreamDescriptorSurfaceCreateFlagsGGP).fromInt;
@@ -531,7 +531,7 @@ pub const StreamDescriptorSurfaceCreateFlagsGGP = packed struct(Flags) {
     pub const contains = FlagsMixin(StreamDescriptorSurfaceCreateFlagsGGP).contains;
     pub const format = FlagFormatMixin(StreamDescriptorSurfaceCreateFlagsGGP).format;
 };
-pub const HeadlessSurfaceCreateFlagsEXT = packed struct(Flags) {
+pub const HeadlessSurfaceCreateFlagsEXT = bitpack struct(Flags) {
     _reserved_bits: Flags = 0,
     pub const toInt = FlagsMixin(HeadlessSurfaceCreateFlagsEXT).toInt;
     pub const fromInt = FlagsMixin(HeadlessSurfaceCreateFlagsEXT).fromInt;
@@ -542,7 +542,7 @@ pub const HeadlessSurfaceCreateFlagsEXT = packed struct(Flags) {
     pub const contains = FlagsMixin(HeadlessSurfaceCreateFlagsEXT).contains;
     pub const format = FlagFormatMixin(HeadlessSurfaceCreateFlagsEXT).format;
 };
-pub const ScreenSurfaceCreateFlagsQNX = packed struct(Flags) {
+pub const ScreenSurfaceCreateFlagsQNX = bitpack struct(Flags) {
     _reserved_bits: Flags = 0,
     pub const toInt = FlagsMixin(ScreenSurfaceCreateFlagsQNX).toInt;
     pub const fromInt = FlagsMixin(ScreenSurfaceCreateFlagsQNX).fromInt;
@@ -555,7 +555,7 @@ pub const ScreenSurfaceCreateFlagsQNX = packed struct(Flags) {
 };
 pub const PeerMemoryFeatureFlagsKHR = PeerMemoryFeatureFlags;
 pub const MemoryAllocateFlagsKHR = MemoryAllocateFlags;
-pub const CommandPoolTrimFlags = packed struct(Flags) {
+pub const CommandPoolTrimFlags = bitpack struct(Flags) {
     _reserved_bits: Flags = 0,
     pub const toInt = FlagsMixin(CommandPoolTrimFlags).toInt;
     pub const fromInt = FlagsMixin(CommandPoolTrimFlags).fromInt;
@@ -575,7 +575,7 @@ pub const SemaphoreImportFlagsKHR = SemaphoreImportFlags;
 pub const ExternalFenceHandleTypeFlagsKHR = ExternalFenceHandleTypeFlags;
 pub const ExternalFenceFeatureFlagsKHR = ExternalFenceFeatureFlags;
 pub const FenceImportFlagsKHR = FenceImportFlags;
-pub const PipelineViewportSwizzleStateCreateFlagsNV = packed struct(Flags) {
+pub const PipelineViewportSwizzleStateCreateFlagsNV = bitpack struct(Flags) {
     _reserved_bits: Flags = 0,
     pub const toInt = FlagsMixin(PipelineViewportSwizzleStateCreateFlagsNV).toInt;
     pub const fromInt = FlagsMixin(PipelineViewportSwizzleStateCreateFlagsNV).fromInt;
@@ -586,7 +586,7 @@ pub const PipelineViewportSwizzleStateCreateFlagsNV = packed struct(Flags) {
     pub const contains = FlagsMixin(PipelineViewportSwizzleStateCreateFlagsNV).contains;
     pub const format = FlagFormatMixin(PipelineViewportSwizzleStateCreateFlagsNV).format;
 };
-pub const PipelineDiscardRectangleStateCreateFlagsEXT = packed struct(Flags) {
+pub const PipelineDiscardRectangleStateCreateFlagsEXT = bitpack struct(Flags) {
     _reserved_bits: Flags = 0,
     pub const toInt = FlagsMixin(PipelineDiscardRectangleStateCreateFlagsEXT).toInt;
     pub const fromInt = FlagsMixin(PipelineDiscardRectangleStateCreateFlagsEXT).fromInt;
@@ -597,7 +597,7 @@ pub const PipelineDiscardRectangleStateCreateFlagsEXT = packed struct(Flags) {
     pub const contains = FlagsMixin(PipelineDiscardRectangleStateCreateFlagsEXT).contains;
     pub const format = FlagFormatMixin(PipelineDiscardRectangleStateCreateFlagsEXT).format;
 };
-pub const PipelineCoverageToColorStateCreateFlagsNV = packed struct(Flags) {
+pub const PipelineCoverageToColorStateCreateFlagsNV = bitpack struct(Flags) {
     _reserved_bits: Flags = 0,
     pub const toInt = FlagsMixin(PipelineCoverageToColorStateCreateFlagsNV).toInt;
     pub const fromInt = FlagsMixin(PipelineCoverageToColorStateCreateFlagsNV).fromInt;
@@ -608,7 +608,7 @@ pub const PipelineCoverageToColorStateCreateFlagsNV = packed struct(Flags) {
     pub const contains = FlagsMixin(PipelineCoverageToColorStateCreateFlagsNV).contains;
     pub const format = FlagFormatMixin(PipelineCoverageToColorStateCreateFlagsNV).format;
 };
-pub const PipelineCoverageModulationStateCreateFlagsNV = packed struct(Flags) {
+pub const PipelineCoverageModulationStateCreateFlagsNV = bitpack struct(Flags) {
     _reserved_bits: Flags = 0,
     pub const toInt = FlagsMixin(PipelineCoverageModulationStateCreateFlagsNV).toInt;
     pub const fromInt = FlagsMixin(PipelineCoverageModulationStateCreateFlagsNV).fromInt;
@@ -619,7 +619,7 @@ pub const PipelineCoverageModulationStateCreateFlagsNV = packed struct(Flags) {
     pub const contains = FlagsMixin(PipelineCoverageModulationStateCreateFlagsNV).contains;
     pub const format = FlagFormatMixin(PipelineCoverageModulationStateCreateFlagsNV).format;
 };
-pub const PipelineCoverageReductionStateCreateFlagsNV = packed struct(Flags) {
+pub const PipelineCoverageReductionStateCreateFlagsNV = bitpack struct(Flags) {
     _reserved_bits: Flags = 0,
     pub const toInt = FlagsMixin(PipelineCoverageReductionStateCreateFlagsNV).toInt;
     pub const fromInt = FlagsMixin(PipelineCoverageReductionStateCreateFlagsNV).fromInt;
@@ -630,7 +630,7 @@ pub const PipelineCoverageReductionStateCreateFlagsNV = packed struct(Flags) {
     pub const contains = FlagsMixin(PipelineCoverageReductionStateCreateFlagsNV).contains;
     pub const format = FlagFormatMixin(PipelineCoverageReductionStateCreateFlagsNV).format;
 };
-pub const ValidationCacheCreateFlagsEXT = packed struct(Flags) {
+pub const ValidationCacheCreateFlagsEXT = bitpack struct(Flags) {
     _reserved_bits: Flags = 0,
     pub const toInt = FlagsMixin(ValidationCacheCreateFlagsEXT).toInt;
     pub const fromInt = FlagsMixin(ValidationCacheCreateFlagsEXT).fromInt;
@@ -641,7 +641,7 @@ pub const ValidationCacheCreateFlagsEXT = packed struct(Flags) {
     pub const contains = FlagsMixin(ValidationCacheCreateFlagsEXT).contains;
     pub const format = FlagFormatMixin(ValidationCacheCreateFlagsEXT).format;
 };
-pub const DebugUtilsMessengerCreateFlagsEXT = packed struct(Flags) {
+pub const DebugUtilsMessengerCreateFlagsEXT = bitpack struct(Flags) {
     _reserved_bits: Flags = 0,
     pub const toInt = FlagsMixin(DebugUtilsMessengerCreateFlagsEXT).toInt;
     pub const fromInt = FlagsMixin(DebugUtilsMessengerCreateFlagsEXT).fromInt;
@@ -652,7 +652,7 @@ pub const DebugUtilsMessengerCreateFlagsEXT = packed struct(Flags) {
     pub const contains = FlagsMixin(DebugUtilsMessengerCreateFlagsEXT).contains;
     pub const format = FlagFormatMixin(DebugUtilsMessengerCreateFlagsEXT).format;
 };
-pub const DebugUtilsMessengerCallbackDataFlagsEXT = packed struct(Flags) {
+pub const DebugUtilsMessengerCallbackDataFlagsEXT = bitpack struct(Flags) {
     _reserved_bits: Flags = 0,
     pub const toInt = FlagsMixin(DebugUtilsMessengerCallbackDataFlagsEXT).toInt;
     pub const fromInt = FlagsMixin(DebugUtilsMessengerCallbackDataFlagsEXT).fromInt;
@@ -663,7 +663,7 @@ pub const DebugUtilsMessengerCallbackDataFlagsEXT = packed struct(Flags) {
     pub const contains = FlagsMixin(DebugUtilsMessengerCallbackDataFlagsEXT).contains;
     pub const format = FlagFormatMixin(DebugUtilsMessengerCallbackDataFlagsEXT).format;
 };
-pub const DeviceMemoryReportFlagsEXT = packed struct(Flags) {
+pub const DeviceMemoryReportFlagsEXT = bitpack struct(Flags) {
     _reserved_bits: Flags = 0,
     pub const toInt = FlagsMixin(DeviceMemoryReportFlagsEXT).toInt;
     pub const fromInt = FlagsMixin(DeviceMemoryReportFlagsEXT).fromInt;
@@ -674,7 +674,7 @@ pub const DeviceMemoryReportFlagsEXT = packed struct(Flags) {
     pub const contains = FlagsMixin(DeviceMemoryReportFlagsEXT).contains;
     pub const format = FlagFormatMixin(DeviceMemoryReportFlagsEXT).format;
 };
-pub const PipelineRasterizationConservativeStateCreateFlagsEXT = packed struct(Flags) {
+pub const PipelineRasterizationConservativeStateCreateFlagsEXT = bitpack struct(Flags) {
     _reserved_bits: Flags = 0,
     pub const toInt = FlagsMixin(PipelineRasterizationConservativeStateCreateFlagsEXT).toInt;
     pub const fromInt = FlagsMixin(PipelineRasterizationConservativeStateCreateFlagsEXT).fromInt;
@@ -687,7 +687,7 @@ pub const PipelineRasterizationConservativeStateCreateFlagsEXT = packed struct(F
 };
 pub const DescriptorBindingFlagsEXT = DescriptorBindingFlags;
 pub const ResolveModeFlagsKHR = ResolveModeFlags;
-pub const PipelineRasterizationStateStreamCreateFlagsEXT = packed struct(Flags) {
+pub const PipelineRasterizationStateStreamCreateFlagsEXT = bitpack struct(Flags) {
     _reserved_bits: Flags = 0,
     pub const toInt = FlagsMixin(PipelineRasterizationStateStreamCreateFlagsEXT).toInt;
     pub const fromInt = FlagsMixin(PipelineRasterizationStateStreamCreateFlagsEXT).fromInt;
@@ -698,7 +698,7 @@ pub const PipelineRasterizationStateStreamCreateFlagsEXT = packed struct(Flags) 
     pub const contains = FlagsMixin(PipelineRasterizationStateStreamCreateFlagsEXT).contains;
     pub const format = FlagFormatMixin(PipelineRasterizationStateStreamCreateFlagsEXT).format;
 };
-pub const PipelineRasterizationDepthClipStateCreateFlagsEXT = packed struct(Flags) {
+pub const PipelineRasterizationDepthClipStateCreateFlagsEXT = bitpack struct(Flags) {
     _reserved_bits: Flags = 0,
     pub const toInt = FlagsMixin(PipelineRasterizationDepthClipStateCreateFlagsEXT).toInt;
     pub const fromInt = FlagsMixin(PipelineRasterizationDepthClipStateCreateFlagsEXT).fromInt;
@@ -711,7 +711,7 @@ pub const PipelineRasterizationDepthClipStateCreateFlagsEXT = packed struct(Flag
 };
 pub const ToolPurposeFlagsEXT = ToolPurposeFlags;
 pub const SubmitFlagsKHR = SubmitFlags;
-pub const ImageFormatConstraintsFlagsFUCHSIA = packed struct(Flags) {
+pub const ImageFormatConstraintsFlagsFUCHSIA = bitpack struct(Flags) {
     _reserved_bits: Flags = 0,
     pub const toInt = FlagsMixin(ImageFormatConstraintsFlagsFUCHSIA).toInt;
     pub const fromInt = FlagsMixin(ImageFormatConstraintsFlagsFUCHSIA).fromInt;
@@ -725,7 +725,7 @@ pub const ImageFormatConstraintsFlagsFUCHSIA = packed struct(Flags) {
 pub const HostImageCopyFlagsEXT = HostImageCopyFlags;
 pub const PresentScalingFlagsEXT = PresentScalingFlagsKHR;
 pub const PresentGravityFlagsEXT = PresentGravityFlagsKHR;
-pub const SurfaceCreateFlagsOHOS = packed struct(Flags) {
+pub const SurfaceCreateFlagsOHOS = bitpack struct(Flags) {
     _reserved_bits: Flags = 0,
     pub const toInt = FlagsMixin(SurfaceCreateFlagsOHOS).toInt;
     pub const fromInt = FlagsMixin(SurfaceCreateFlagsOHOS).fromInt;
@@ -736,7 +736,7 @@ pub const SurfaceCreateFlagsOHOS = packed struct(Flags) {
     pub const contains = FlagsMixin(SurfaceCreateFlagsOHOS).contains;
     pub const format = FlagFormatMixin(SurfaceCreateFlagsOHOS).format;
 };
-pub const PerformanceCounterDescriptionFlagsARM = packed struct(Flags) {
+pub const PerformanceCounterDescriptionFlagsARM = bitpack struct(Flags) {
     _reserved_bits: Flags = 0,
     pub const toInt = FlagsMixin(PerformanceCounterDescriptionFlagsARM).toInt;
     pub const fromInt = FlagsMixin(PerformanceCounterDescriptionFlagsARM).fromInt;
@@ -747,7 +747,7 @@ pub const PerformanceCounterDescriptionFlagsARM = packed struct(Flags) {
     pub const contains = FlagsMixin(PerformanceCounterDescriptionFlagsARM).contains;
     pub const format = FlagFormatMixin(PerformanceCounterDescriptionFlagsARM).format;
 };
-pub const VideoBeginCodingFlagsKHR = packed struct(Flags) {
+pub const VideoBeginCodingFlagsKHR = bitpack struct(Flags) {
     _reserved_bits: Flags = 0,
     pub const toInt = FlagsMixin(VideoBeginCodingFlagsKHR).toInt;
     pub const fromInt = FlagsMixin(VideoBeginCodingFlagsKHR).fromInt;
@@ -758,7 +758,7 @@ pub const VideoBeginCodingFlagsKHR = packed struct(Flags) {
     pub const contains = FlagsMixin(VideoBeginCodingFlagsKHR).contains;
     pub const format = FlagFormatMixin(VideoBeginCodingFlagsKHR).format;
 };
-pub const VideoEndCodingFlagsKHR = packed struct(Flags) {
+pub const VideoEndCodingFlagsKHR = bitpack struct(Flags) {
     _reserved_bits: Flags = 0,
     pub const toInt = FlagsMixin(VideoEndCodingFlagsKHR).toInt;
     pub const fromInt = FlagsMixin(VideoEndCodingFlagsKHR).fromInt;
@@ -769,7 +769,7 @@ pub const VideoEndCodingFlagsKHR = packed struct(Flags) {
     pub const contains = FlagsMixin(VideoEndCodingFlagsKHR).contains;
     pub const format = FlagFormatMixin(VideoEndCodingFlagsKHR).format;
 };
-pub const VideoDecodeFlagsKHR = packed struct(Flags) {
+pub const VideoDecodeFlagsKHR = bitpack struct(Flags) {
     _reserved_bits: Flags = 0,
     pub const toInt = FlagsMixin(VideoDecodeFlagsKHR).toInt;
     pub const fromInt = FlagsMixin(VideoDecodeFlagsKHR).fromInt;
@@ -780,7 +780,7 @@ pub const VideoDecodeFlagsKHR = packed struct(Flags) {
     pub const contains = FlagsMixin(VideoDecodeFlagsKHR).contains;
     pub const format = FlagFormatMixin(VideoDecodeFlagsKHR).format;
 };
-pub const VideoEncodeRateControlFlagsKHR = packed struct(Flags) {
+pub const VideoEncodeRateControlFlagsKHR = bitpack struct(Flags) {
     _reserved_bits: Flags = 0,
     pub const toInt = FlagsMixin(VideoEncodeRateControlFlagsKHR).toInt;
     pub const fromInt = FlagsMixin(VideoEncodeRateControlFlagsKHR).fromInt;
@@ -2452,7 +2452,7 @@ pub const RayTracingPipelineClusterAccelerationStructureCreateInfoNV = extern st
     p_next: ?*anyopaque = null,
     allow_cluster_acceleration_structure: Bool32,
 };
-pub const ClusterAccelerationStructureGeometryIndexAndGeometryFlagsNV = packed struct(u32) {
+pub const ClusterAccelerationStructureGeometryIndexAndGeometryFlagsNV = bitpack struct(u32) {
     geometry_index: u24,
     reserved: u5 = 0,
     geometry_flags: u3,
@@ -2471,7 +2471,7 @@ pub const ClusterAccelerationStructureGetTemplateIndicesInfoNV = extern struct {
 pub const ClusterAccelerationStructureBuildTriangleClusterInfoNV = extern struct {
     cluster_id: u32,
     cluster_flags: ClusterAccelerationStructureClusterFlagsNV,
-    cluster_data: packed struct(u32) {
+    cluster_data: bitpack struct(u32) {
         triangle_count: u9,
         vertex_count: u9,
         position_truncate_bit_count: u6,
@@ -2492,7 +2492,7 @@ pub const ClusterAccelerationStructureBuildTriangleClusterInfoNV = extern struct
 pub const ClusterAccelerationStructureBuildTriangleClusterTemplateInfoNV = extern struct {
     cluster_id: u32,
     cluster_flags: ClusterAccelerationStructureClusterFlagsNV,
-    cluster_data: packed struct(u32) {
+    cluster_data: bitpack struct(u32) {
         triangle_count: u9,
         vertex_count: u9,
         position_truncate_bit_count: u6,
@@ -2513,7 +2513,7 @@ pub const ClusterAccelerationStructureBuildTriangleClusterTemplateInfoNV = exter
 };
 pub const ClusterAccelerationStructureInstantiateClusterInfoNV = extern struct {
     cluster_id_offset: u32,
-    geometry_index_offset: packed struct(u32) {
+    geometry_index_offset: bitpack struct(u32) {
         offset: u24,
         reserved: u8 = 0,
     },
@@ -6189,11 +6189,11 @@ pub const TransformMatrixKHR = extern struct {
 pub const TransformMatrixNV = TransformMatrixKHR;
 pub const AccelerationStructureInstanceKHR = extern struct {
     transform: TransformMatrixKHR,
-    instance_custom_index_and_mask: packed struct(u32) {
+    instance_custom_index_and_mask: bitpack struct(u32) {
         instance_custom_index: u24,
         mask: u8,
     },
-    instance_shader_binding_table_record_offset_and_flags: packed struct(u32) {
+    instance_shader_binding_table_record_offset_and_flags: bitpack struct(u32) {
         instance_shader_binding_table_record_offset: u24,
         flags: u8, // GeometryInstanceFlagsKHR
     },
@@ -6201,11 +6201,11 @@ pub const AccelerationStructureInstanceKHR = extern struct {
 };
 pub const AccelerationStructureInstanceNV = extern struct {
     transform: TransformMatrixNV,
-    instance_custom_index_and_mask: packed struct(u32) {
+    instance_custom_index_and_mask: bitpack struct(u32) {
         instance_custom_index: u24,
         mask: u8,
     },
-    instance_shader_binding_table_record_offset_and_flags: packed struct(u32) {
+    instance_shader_binding_table_record_offset_and_flags: bitpack struct(u32) {
         instance_shader_binding_table_record_offset: u24,
         flags: u8, // GeometryInstanceFlagsKHR
     },
@@ -8504,11 +8504,11 @@ pub const SRTDataNV = extern struct {
 pub const AccelerationStructureSRTMotionInstanceNV = extern struct {
     transform_t0: SRTDataNV,
     transform_t1: SRTDataNV,
-    instance_custom_index_and_mask: packed struct(u32) {
+    instance_custom_index_and_mask: bitpack struct(u32) {
         instance_custom_index: u24,
         mask: u8,
     },
-    instance_shader_binding_table_record_offset_and_flags: packed struct(u32) {
+    instance_shader_binding_table_record_offset_and_flags: bitpack struct(u32) {
         instance_shader_binding_table_record_offset: u24,
         flags: u8, // GeometryInstanceFlagsKHR
     },
@@ -8517,11 +8517,11 @@ pub const AccelerationStructureSRTMotionInstanceNV = extern struct {
 pub const AccelerationStructureMatrixMotionInstanceNV = extern struct {
     transform_t0: TransformMatrixNV,
     transform_t1: TransformMatrixNV,
-    instance_custom_index_and_mask: packed struct(u32) {
+    instance_custom_index_and_mask: bitpack struct(u32) {
         instance_custom_index: u24,
         mask: u8,
     },
-    instance_shader_binding_table_record_offset_and_flags: packed struct(u32) {
+    instance_shader_binding_table_record_offset_and_flags: bitpack struct(u32) {
         instance_shader_binding_table_record_offset: u24,
         flags: u8, // GeometryInstanceFlagsKHR
     },
@@ -11033,7 +11033,7 @@ pub const PipelineCacheHeaderVersion = enum(i32) {
     data_graph_qcom = 1000629000,
     _,
 };
-pub const PipelineCacheCreateFlags = packed struct(Flags) {
+pub const PipelineCacheCreateFlags = bitpack struct(Flags) {
     externally_synchronized_bit: bool = false,
     _reserved_bit_1: bool = false,
     _reserved_bit_2: bool = false,
@@ -13271,7 +13271,7 @@ pub const AntiLagStageAMD = enum(i32) {
     present_amd = 1,
     _,
 };
-pub const QueueFlags = packed struct(Flags) {
+pub const QueueFlags = bitpack struct(Flags) {
     graphics_bit: bool = false,
     compute_bit: bool = false,
     transfer_bit: bool = false,
@@ -13313,7 +13313,7 @@ pub const QueueFlags = packed struct(Flags) {
     pub const contains = FlagsMixin(QueueFlags).contains;
     pub const format = FlagFormatMixin(QueueFlags).format;
 };
-pub const CullModeFlags = packed struct(Flags) {
+pub const CullModeFlags = bitpack struct(Flags) {
     front_bit: bool = false,
     back_bit: bool = false,
     _reserved_bit_2: bool = false,
@@ -13355,7 +13355,7 @@ pub const CullModeFlags = packed struct(Flags) {
     pub const contains = FlagsMixin(CullModeFlags).contains;
     pub const format = FlagFormatMixin(CullModeFlags).format;
 };
-pub const RenderPassCreateFlags = packed struct(Flags) {
+pub const RenderPassCreateFlags = bitpack struct(Flags) {
     _reserved_bit_0: bool = false,
     transform_bit_qcom: bool = false,
     per_layer_fragment_density_bit_valve: bool = false,
@@ -13397,7 +13397,7 @@ pub const RenderPassCreateFlags = packed struct(Flags) {
     pub const contains = FlagsMixin(RenderPassCreateFlags).contains;
     pub const format = FlagFormatMixin(RenderPassCreateFlags).format;
 };
-pub const DeviceQueueCreateFlags = packed struct(Flags) {
+pub const DeviceQueueCreateFlags = bitpack struct(Flags) {
     protected_bit: bool = false,
     _reserved_bit_1: bool = false,
     _reserved_bit_2: bool = false,
@@ -13439,7 +13439,7 @@ pub const DeviceQueueCreateFlags = packed struct(Flags) {
     pub const contains = FlagsMixin(DeviceQueueCreateFlags).contains;
     pub const format = FlagFormatMixin(DeviceQueueCreateFlags).format;
 };
-pub const MemoryPropertyFlags = packed struct(Flags) {
+pub const MemoryPropertyFlags = bitpack struct(Flags) {
     device_local_bit: bool = false,
     host_visible_bit: bool = false,
     host_coherent_bit: bool = false,
@@ -13481,7 +13481,7 @@ pub const MemoryPropertyFlags = packed struct(Flags) {
     pub const contains = FlagsMixin(MemoryPropertyFlags).contains;
     pub const format = FlagFormatMixin(MemoryPropertyFlags).format;
 };
-pub const MemoryHeapFlags = packed struct(Flags) {
+pub const MemoryHeapFlags = bitpack struct(Flags) {
     device_local_bit: bool = false,
     multi_instance_bit: bool = false,
     _reserved_bit_2: bool = false,
@@ -13523,7 +13523,7 @@ pub const MemoryHeapFlags = packed struct(Flags) {
     pub const contains = FlagsMixin(MemoryHeapFlags).contains;
     pub const format = FlagFormatMixin(MemoryHeapFlags).format;
 };
-pub const AccessFlags = packed struct(Flags) {
+pub const AccessFlags = bitpack struct(Flags) {
     indirect_command_read_bit: bool = false,
     index_read_bit: bool = false,
     vertex_attribute_read_bit: bool = false,
@@ -13565,7 +13565,7 @@ pub const AccessFlags = packed struct(Flags) {
     pub const contains = FlagsMixin(AccessFlags).contains;
     pub const format = FlagFormatMixin(AccessFlags).format;
 };
-pub const BufferUsageFlags = packed struct(Flags) {
+pub const BufferUsageFlags = bitpack struct(Flags) {
     transfer_src_bit: bool = false,
     transfer_dst_bit: bool = false,
     uniform_texel_buffer_bit: bool = false,
@@ -13607,7 +13607,7 @@ pub const BufferUsageFlags = packed struct(Flags) {
     pub const contains = FlagsMixin(BufferUsageFlags).contains;
     pub const format = FlagFormatMixin(BufferUsageFlags).format;
 };
-pub const BufferUsageFlags2 = packed struct(Flags64) {
+pub const BufferUsageFlags2 = bitpack struct(Flags64) {
     transfer_src_bit: bool = false,
     transfer_dst_bit: bool = false,
     uniform_texel_buffer_bit: bool = false,
@@ -13681,7 +13681,7 @@ pub const BufferUsageFlags2 = packed struct(Flags64) {
     pub const contains = FlagsMixin(BufferUsageFlags2).contains;
     pub const format = FlagFormatMixin(BufferUsageFlags2).format;
 };
-pub const BufferCreateFlags = packed struct(Flags) {
+pub const BufferCreateFlags = bitpack struct(Flags) {
     sparse_binding_bit: bool = false,
     sparse_residency_bit: bool = false,
     sparse_aliased_bit: bool = false,
@@ -13723,7 +13723,7 @@ pub const BufferCreateFlags = packed struct(Flags) {
     pub const contains = FlagsMixin(BufferCreateFlags).contains;
     pub const format = FlagFormatMixin(BufferCreateFlags).format;
 };
-pub const ShaderStageFlags = packed struct(Flags) {
+pub const ShaderStageFlags = bitpack struct(Flags) {
     vertex_bit: bool = false,
     tessellation_control_bit: bool = false,
     tessellation_evaluation_bit: bool = false,
@@ -13765,7 +13765,7 @@ pub const ShaderStageFlags = packed struct(Flags) {
     pub const contains = FlagsMixin(ShaderStageFlags).contains;
     pub const format = FlagFormatMixin(ShaderStageFlags).format;
 };
-pub const ImageUsageFlags = packed struct(Flags) {
+pub const ImageUsageFlags = bitpack struct(Flags) {
     transfer_src_bit: bool = false,
     transfer_dst_bit: bool = false,
     sampled_bit: bool = false,
@@ -13807,7 +13807,7 @@ pub const ImageUsageFlags = packed struct(Flags) {
     pub const contains = FlagsMixin(ImageUsageFlags).contains;
     pub const format = FlagFormatMixin(ImageUsageFlags).format;
 };
-pub const ImageCreateFlags = packed struct(Flags) {
+pub const ImageCreateFlags = bitpack struct(Flags) {
     sparse_binding_bit: bool = false,
     sparse_residency_bit: bool = false,
     sparse_aliased_bit: bool = false,
@@ -13849,7 +13849,7 @@ pub const ImageCreateFlags = packed struct(Flags) {
     pub const contains = FlagsMixin(ImageCreateFlags).contains;
     pub const format = FlagFormatMixin(ImageCreateFlags).format;
 };
-pub const ImageViewCreateFlags = packed struct(Flags) {
+pub const ImageViewCreateFlags = bitpack struct(Flags) {
     fragment_density_map_dynamic_bit_ext: bool = false,
     fragment_density_map_deferred_bit_ext: bool = false,
     descriptor_buffer_capture_replay_bit_ext: bool = false,
@@ -13891,7 +13891,7 @@ pub const ImageViewCreateFlags = packed struct(Flags) {
     pub const contains = FlagsMixin(ImageViewCreateFlags).contains;
     pub const format = FlagFormatMixin(ImageViewCreateFlags).format;
 };
-pub const SamplerCreateFlags = packed struct(Flags) {
+pub const SamplerCreateFlags = bitpack struct(Flags) {
     subsampled_bit_ext: bool = false,
     subsampled_coarse_reconstruction_bit_ext: bool = false,
     non_seamless_cube_map_bit_ext: bool = false,
@@ -13933,7 +13933,7 @@ pub const SamplerCreateFlags = packed struct(Flags) {
     pub const contains = FlagsMixin(SamplerCreateFlags).contains;
     pub const format = FlagFormatMixin(SamplerCreateFlags).format;
 };
-pub const PipelineCreateFlags = packed struct(Flags) {
+pub const PipelineCreateFlags = bitpack struct(Flags) {
     disable_optimization_bit: bool = false,
     allow_derivatives_bit: bool = false,
     derivative_bit: bool = false,
@@ -13975,7 +13975,7 @@ pub const PipelineCreateFlags = packed struct(Flags) {
     pub const contains = FlagsMixin(PipelineCreateFlags).contains;
     pub const format = FlagFormatMixin(PipelineCreateFlags).format;
 };
-pub const PipelineCreateFlags2 = packed struct(Flags64) {
+pub const PipelineCreateFlags2 = bitpack struct(Flags64) {
     disable_optimization_bit: bool = false,
     allow_derivatives_bit: bool = false,
     derivative_bit: bool = false,
@@ -14049,7 +14049,7 @@ pub const PipelineCreateFlags2 = packed struct(Flags64) {
     pub const contains = FlagsMixin(PipelineCreateFlags2).contains;
     pub const format = FlagFormatMixin(PipelineCreateFlags2).format;
 };
-pub const PipelineShaderStageCreateFlags = packed struct(Flags) {
+pub const PipelineShaderStageCreateFlags = bitpack struct(Flags) {
     allow_varying_subgroup_size_bit: bool = false,
     require_full_subgroups_bit: bool = false,
     _reserved_bit_2: bool = false,
@@ -14091,7 +14091,7 @@ pub const PipelineShaderStageCreateFlags = packed struct(Flags) {
     pub const contains = FlagsMixin(PipelineShaderStageCreateFlags).contains;
     pub const format = FlagFormatMixin(PipelineShaderStageCreateFlags).format;
 };
-pub const ColorComponentFlags = packed struct(Flags) {
+pub const ColorComponentFlags = bitpack struct(Flags) {
     r_bit: bool = false,
     g_bit: bool = false,
     b_bit: bool = false,
@@ -14133,7 +14133,7 @@ pub const ColorComponentFlags = packed struct(Flags) {
     pub const contains = FlagsMixin(ColorComponentFlags).contains;
     pub const format = FlagFormatMixin(ColorComponentFlags).format;
 };
-pub const FenceCreateFlags = packed struct(Flags) {
+pub const FenceCreateFlags = bitpack struct(Flags) {
     signaled_bit: bool = false,
     _reserved_bit_1: bool = false,
     _reserved_bit_2: bool = false,
@@ -14175,7 +14175,7 @@ pub const FenceCreateFlags = packed struct(Flags) {
     pub const contains = FlagsMixin(FenceCreateFlags).contains;
     pub const format = FlagFormatMixin(FenceCreateFlags).format;
 };
-pub const FormatFeatureFlags = packed struct(Flags) {
+pub const FormatFeatureFlags = bitpack struct(Flags) {
     sampled_image_bit: bool = false,
     storage_image_bit: bool = false,
     storage_image_atomic_bit: bool = false,
@@ -14217,7 +14217,7 @@ pub const FormatFeatureFlags = packed struct(Flags) {
     pub const contains = FlagsMixin(FormatFeatureFlags).contains;
     pub const format = FlagFormatMixin(FormatFeatureFlags).format;
 };
-pub const QueryControlFlags = packed struct(Flags) {
+pub const QueryControlFlags = bitpack struct(Flags) {
     precise_bit: bool = false,
     _reserved_bit_1: bool = false,
     _reserved_bit_2: bool = false,
@@ -14259,7 +14259,7 @@ pub const QueryControlFlags = packed struct(Flags) {
     pub const contains = FlagsMixin(QueryControlFlags).contains;
     pub const format = FlagFormatMixin(QueryControlFlags).format;
 };
-pub const QueryResultFlags = packed struct(Flags) {
+pub const QueryResultFlags = bitpack struct(Flags) {
     @"64_bit": bool = false,
     wait_bit: bool = false,
     with_availability_bit: bool = false,
@@ -14301,7 +14301,7 @@ pub const QueryResultFlags = packed struct(Flags) {
     pub const contains = FlagsMixin(QueryResultFlags).contains;
     pub const format = FlagFormatMixin(QueryResultFlags).format;
 };
-pub const CommandBufferUsageFlags = packed struct(Flags) {
+pub const CommandBufferUsageFlags = bitpack struct(Flags) {
     one_time_submit_bit: bool = false,
     render_pass_continue_bit: bool = false,
     simultaneous_use_bit: bool = false,
@@ -14343,7 +14343,7 @@ pub const CommandBufferUsageFlags = packed struct(Flags) {
     pub const contains = FlagsMixin(CommandBufferUsageFlags).contains;
     pub const format = FlagFormatMixin(CommandBufferUsageFlags).format;
 };
-pub const QueryPipelineStatisticFlags = packed struct(Flags) {
+pub const QueryPipelineStatisticFlags = bitpack struct(Flags) {
     input_assembly_vertices_bit: bool = false,
     input_assembly_primitives_bit: bool = false,
     vertex_shader_invocations_bit: bool = false,
@@ -14385,7 +14385,7 @@ pub const QueryPipelineStatisticFlags = packed struct(Flags) {
     pub const contains = FlagsMixin(QueryPipelineStatisticFlags).contains;
     pub const format = FlagFormatMixin(QueryPipelineStatisticFlags).format;
 };
-pub const MemoryMapFlags = packed struct(Flags) {
+pub const MemoryMapFlags = bitpack struct(Flags) {
     placed_bit_ext: bool = false,
     _reserved_bit_1: bool = false,
     _reserved_bit_2: bool = false,
@@ -14427,7 +14427,7 @@ pub const MemoryMapFlags = packed struct(Flags) {
     pub const contains = FlagsMixin(MemoryMapFlags).contains;
     pub const format = FlagFormatMixin(MemoryMapFlags).format;
 };
-pub const ImageAspectFlags = packed struct(Flags) {
+pub const ImageAspectFlags = bitpack struct(Flags) {
     color_bit: bool = false,
     depth_bit: bool = false,
     stencil_bit: bool = false,
@@ -14469,7 +14469,7 @@ pub const ImageAspectFlags = packed struct(Flags) {
     pub const contains = FlagsMixin(ImageAspectFlags).contains;
     pub const format = FlagFormatMixin(ImageAspectFlags).format;
 };
-pub const SparseImageFormatFlags = packed struct(Flags) {
+pub const SparseImageFormatFlags = bitpack struct(Flags) {
     single_miptail_bit: bool = false,
     aligned_mip_size_bit: bool = false,
     nonstandard_block_size_bit: bool = false,
@@ -14511,7 +14511,7 @@ pub const SparseImageFormatFlags = packed struct(Flags) {
     pub const contains = FlagsMixin(SparseImageFormatFlags).contains;
     pub const format = FlagFormatMixin(SparseImageFormatFlags).format;
 };
-pub const SparseMemoryBindFlags = packed struct(Flags) {
+pub const SparseMemoryBindFlags = bitpack struct(Flags) {
     metadata_bit: bool = false,
     _reserved_bit_1: bool = false,
     _reserved_bit_2: bool = false,
@@ -14553,7 +14553,7 @@ pub const SparseMemoryBindFlags = packed struct(Flags) {
     pub const contains = FlagsMixin(SparseMemoryBindFlags).contains;
     pub const format = FlagFormatMixin(SparseMemoryBindFlags).format;
 };
-pub const PipelineStageFlags = packed struct(Flags) {
+pub const PipelineStageFlags = bitpack struct(Flags) {
     top_of_pipe_bit: bool = false,
     draw_indirect_bit: bool = false,
     vertex_input_bit: bool = false,
@@ -14595,7 +14595,7 @@ pub const PipelineStageFlags = packed struct(Flags) {
     pub const contains = FlagsMixin(PipelineStageFlags).contains;
     pub const format = FlagFormatMixin(PipelineStageFlags).format;
 };
-pub const CommandPoolCreateFlags = packed struct(Flags) {
+pub const CommandPoolCreateFlags = bitpack struct(Flags) {
     transient_bit: bool = false,
     reset_command_buffer_bit: bool = false,
     protected_bit: bool = false,
@@ -14637,7 +14637,7 @@ pub const CommandPoolCreateFlags = packed struct(Flags) {
     pub const contains = FlagsMixin(CommandPoolCreateFlags).contains;
     pub const format = FlagFormatMixin(CommandPoolCreateFlags).format;
 };
-pub const CommandPoolResetFlags = packed struct(Flags) {
+pub const CommandPoolResetFlags = bitpack struct(Flags) {
     release_resources_bit: bool = false,
     _reserved_bit_1: bool = false,
     _reserved_bit_2: bool = false,
@@ -14679,7 +14679,7 @@ pub const CommandPoolResetFlags = packed struct(Flags) {
     pub const contains = FlagsMixin(CommandPoolResetFlags).contains;
     pub const format = FlagFormatMixin(CommandPoolResetFlags).format;
 };
-pub const CommandBufferResetFlags = packed struct(Flags) {
+pub const CommandBufferResetFlags = bitpack struct(Flags) {
     release_resources_bit: bool = false,
     _reserved_bit_1: bool = false,
     _reserved_bit_2: bool = false,
@@ -14721,7 +14721,7 @@ pub const CommandBufferResetFlags = packed struct(Flags) {
     pub const contains = FlagsMixin(CommandBufferResetFlags).contains;
     pub const format = FlagFormatMixin(CommandBufferResetFlags).format;
 };
-pub const SampleCountFlags = packed struct(Flags) {
+pub const SampleCountFlags = bitpack struct(Flags) {
     @"1_bit": bool = false,
     @"2_bit": bool = false,
     @"4_bit": bool = false,
@@ -14763,7 +14763,7 @@ pub const SampleCountFlags = packed struct(Flags) {
     pub const contains = FlagsMixin(SampleCountFlags).contains;
     pub const format = FlagFormatMixin(SampleCountFlags).format;
 };
-pub const AttachmentDescriptionFlags = packed struct(Flags) {
+pub const AttachmentDescriptionFlags = bitpack struct(Flags) {
     may_alias_bit: bool = false,
     resolve_skip_transfer_function_bit_khr: bool = false,
     resolve_enable_transfer_function_bit_khr: bool = false,
@@ -14805,7 +14805,7 @@ pub const AttachmentDescriptionFlags = packed struct(Flags) {
     pub const contains = FlagsMixin(AttachmentDescriptionFlags).contains;
     pub const format = FlagFormatMixin(AttachmentDescriptionFlags).format;
 };
-pub const StencilFaceFlags = packed struct(Flags) {
+pub const StencilFaceFlags = bitpack struct(Flags) {
     front_bit: bool = false,
     back_bit: bool = false,
     _reserved_bit_2: bool = false,
@@ -14847,7 +14847,7 @@ pub const StencilFaceFlags = packed struct(Flags) {
     pub const contains = FlagsMixin(StencilFaceFlags).contains;
     pub const format = FlagFormatMixin(StencilFaceFlags).format;
 };
-pub const DescriptorPoolCreateFlags = packed struct(Flags) {
+pub const DescriptorPoolCreateFlags = bitpack struct(Flags) {
     free_descriptor_set_bit: bool = false,
     update_after_bind_bit: bool = false,
     host_only_bit_ext: bool = false,
@@ -14889,7 +14889,7 @@ pub const DescriptorPoolCreateFlags = packed struct(Flags) {
     pub const contains = FlagsMixin(DescriptorPoolCreateFlags).contains;
     pub const format = FlagFormatMixin(DescriptorPoolCreateFlags).format;
 };
-pub const DependencyFlags = packed struct(Flags) {
+pub const DependencyFlags = bitpack struct(Flags) {
     by_region_bit: bool = false,
     view_local_bit: bool = false,
     device_group_bit: bool = false,
@@ -14938,7 +14938,7 @@ pub const SemaphoreType = enum(i32) {
     pub const binary_khr = SemaphoreType.binary;
     pub const timeline_khr = SemaphoreType.timeline;
 };
-pub const SemaphoreWaitFlags = packed struct(Flags) {
+pub const SemaphoreWaitFlags = bitpack struct(Flags) {
     any_bit: bool = false,
     _reserved_bit_1: bool = false,
     _reserved_bit_2: bool = false,
@@ -15012,7 +15012,7 @@ pub const ColorSpaceKHR = enum(i32) {
     pub const colorspace_srgb_nonlinear_khr = ColorSpaceKHR.srgb_nonlinear_khr;
     pub const dci_p3_linear_ext = ColorSpaceKHR.display_p3_linear_ext;
 };
-pub const DisplayPlaneAlphaFlagsKHR = packed struct(Flags) {
+pub const DisplayPlaneAlphaFlagsKHR = bitpack struct(Flags) {
     opaque_bit_khr: bool = false,
     global_bit_khr: bool = false,
     per_pixel_bit_khr: bool = false,
@@ -15054,7 +15054,7 @@ pub const DisplayPlaneAlphaFlagsKHR = packed struct(Flags) {
     pub const contains = FlagsMixin(DisplayPlaneAlphaFlagsKHR).contains;
     pub const format = FlagFormatMixin(DisplayPlaneAlphaFlagsKHR).format;
 };
-pub const CompositeAlphaFlagsKHR = packed struct(Flags) {
+pub const CompositeAlphaFlagsKHR = bitpack struct(Flags) {
     opaque_bit_khr: bool = false,
     pre_multiplied_bit_khr: bool = false,
     post_multiplied_bit_khr: bool = false,
@@ -15096,7 +15096,7 @@ pub const CompositeAlphaFlagsKHR = packed struct(Flags) {
     pub const contains = FlagsMixin(CompositeAlphaFlagsKHR).contains;
     pub const format = FlagFormatMixin(CompositeAlphaFlagsKHR).format;
 };
-pub const SurfaceTransformFlagsKHR = packed struct(Flags) {
+pub const SurfaceTransformFlagsKHR = bitpack struct(Flags) {
     identity_bit_khr: bool = false,
     rotate_90_bit_khr: bool = false,
     rotate_180_bit_khr: bool = false,
@@ -15145,7 +15145,7 @@ pub const DisplaySurfaceStereoTypeNV = enum(i32) {
     inband_displayport_nv = 3,
     _,
 };
-pub const SwapchainImageUsageFlagsANDROID = packed struct(Flags) {
+pub const SwapchainImageUsageFlagsANDROID = bitpack struct(Flags) {
     shared_bit_android: bool = false,
     _reserved_bit_1: bool = false,
     _reserved_bit_2: bool = false,
@@ -15198,7 +15198,7 @@ pub const TimeDomainKHR = enum(i32) {
     pub const clock_monotonic_raw_ext = TimeDomainKHR.clock_monotonic_raw_khr;
     pub const query_performance_counter_ext = TimeDomainKHR.query_performance_counter_khr;
 };
-pub const DebugReportFlagsEXT = packed struct(Flags) {
+pub const DebugReportFlagsEXT = bitpack struct(Flags) {
     information_bit_ext: bool = false,
     warning_bit_ext: bool = false,
     performance_warning_bit_ext: bool = false,
@@ -15301,7 +15301,7 @@ pub const RasterizationOrderAMD = enum(i32) {
     relaxed_amd = 1,
     _,
 };
-pub const ExternalMemoryHandleTypeFlagsNV = packed struct(Flags) {
+pub const ExternalMemoryHandleTypeFlagsNV = bitpack struct(Flags) {
     opaque_win32_bit_nv: bool = false,
     opaque_win32_kmt_bit_nv: bool = false,
     d3d11_image_bit_nv: bool = false,
@@ -15343,7 +15343,7 @@ pub const ExternalMemoryHandleTypeFlagsNV = packed struct(Flags) {
     pub const contains = FlagsMixin(ExternalMemoryHandleTypeFlagsNV).contains;
     pub const format = FlagFormatMixin(ExternalMemoryHandleTypeFlagsNV).format;
 };
-pub const ExternalMemoryFeatureFlagsNV = packed struct(Flags) {
+pub const ExternalMemoryFeatureFlagsNV = bitpack struct(Flags) {
     dedicated_only_bit_nv: bool = false,
     exportable_bit_nv: bool = false,
     importable_bit_nv: bool = false,
@@ -15385,7 +15385,7 @@ pub const ExternalMemoryFeatureFlagsNV = packed struct(Flags) {
     pub const contains = FlagsMixin(ExternalMemoryFeatureFlagsNV).contains;
     pub const format = FlagFormatMixin(ExternalMemoryFeatureFlagsNV).format;
 };
-pub const ClusterAccelerationStructureIndexFormatFlagsNV = packed struct(Flags) {
+pub const ClusterAccelerationStructureIndexFormatFlagsNV = bitpack struct(Flags) {
     @"8bit_nv": bool = false,
     @"16bit_nv": bool = false,
     @"32bit_nv": bool = false,
@@ -15448,7 +15448,7 @@ pub const ClusterAccelerationStructureOpModeNV = enum(i32) {
     compute_sizes_nv = 2,
     _,
 };
-pub const ClusterAccelerationStructureClusterFlagsNV = packed struct(Flags) {
+pub const ClusterAccelerationStructureClusterFlagsNV = bitpack struct(Flags) {
     allow_disable_opacity_micromaps_nv: bool = false,
     _reserved_bit_1: bool = false,
     _reserved_bit_2: bool = false,
@@ -15490,7 +15490,7 @@ pub const ClusterAccelerationStructureClusterFlagsNV = packed struct(Flags) {
     pub const contains = FlagsMixin(ClusterAccelerationStructureClusterFlagsNV).contains;
     pub const format = FlagFormatMixin(ClusterAccelerationStructureClusterFlagsNV).format;
 };
-pub const ClusterAccelerationStructureGeometryFlagsNV = packed struct(Flags) {
+pub const ClusterAccelerationStructureGeometryFlagsNV = bitpack struct(Flags) {
     cull_disable_bit_nv: bool = false,
     no_duplicate_anyhit_invocation_bit_nv: bool = false,
     opaque_bit_nv: bool = false,
@@ -15532,7 +15532,7 @@ pub const ClusterAccelerationStructureGeometryFlagsNV = packed struct(Flags) {
     pub const contains = FlagsMixin(ClusterAccelerationStructureGeometryFlagsNV).contains;
     pub const format = FlagFormatMixin(ClusterAccelerationStructureGeometryFlagsNV).format;
 };
-pub const ClusterAccelerationStructureAddressResolutionFlagsNV = packed struct(Flags) {
+pub const ClusterAccelerationStructureAddressResolutionFlagsNV = bitpack struct(Flags) {
     indirected_dst_implicit_data_bit_nv: bool = false,
     indirected_scratch_data_bit_nv: bool = false,
     indirected_dst_address_array_bit_nv: bool = false,
@@ -15609,7 +15609,7 @@ pub const LayerSettingTypeEXT = enum(i32) {
     string_ext = 7,
     _,
 };
-pub const SubgroupFeatureFlags = packed struct(Flags) {
+pub const SubgroupFeatureFlags = bitpack struct(Flags) {
     basic_bit: bool = false,
     vote_bit: bool = false,
     arithmetic_bit: bool = false,
@@ -15651,7 +15651,7 @@ pub const SubgroupFeatureFlags = packed struct(Flags) {
     pub const contains = FlagsMixin(SubgroupFeatureFlags).contains;
     pub const format = FlagFormatMixin(SubgroupFeatureFlags).format;
 };
-pub const IndirectCommandsLayoutUsageFlagsNV = packed struct(Flags) {
+pub const IndirectCommandsLayoutUsageFlagsNV = bitpack struct(Flags) {
     explicit_preprocess_bit_nv: bool = false,
     indexed_sequences_bit_nv: bool = false,
     unordered_sequences_bit_nv: bool = false,
@@ -15693,7 +15693,7 @@ pub const IndirectCommandsLayoutUsageFlagsNV = packed struct(Flags) {
     pub const contains = FlagsMixin(IndirectCommandsLayoutUsageFlagsNV).contains;
     pub const format = FlagFormatMixin(IndirectCommandsLayoutUsageFlagsNV).format;
 };
-pub const IndirectStateFlagsNV = packed struct(Flags) {
+pub const IndirectStateFlagsNV = bitpack struct(Flags) {
     flag_frontface_bit_nv: bool = false,
     _reserved_bit_1: bool = false,
     _reserved_bit_2: bool = false,
@@ -15749,7 +15749,7 @@ pub const IndirectCommandsTokenTypeNV = enum(i32) {
     dispatch_nv = 1000428004,
     _,
 };
-pub const DescriptorSetLayoutCreateFlags = packed struct(Flags) {
+pub const DescriptorSetLayoutCreateFlags = bitpack struct(Flags) {
     push_descriptor_bit: bool = false,
     update_after_bind_pool_bit: bool = false,
     host_only_pool_bit_ext: bool = false,
@@ -15791,7 +15791,7 @@ pub const DescriptorSetLayoutCreateFlags = packed struct(Flags) {
     pub const contains = FlagsMixin(DescriptorSetLayoutCreateFlags).contains;
     pub const format = FlagFormatMixin(DescriptorSetLayoutCreateFlags).format;
 };
-pub const ExternalMemoryHandleTypeFlags = packed struct(Flags) {
+pub const ExternalMemoryHandleTypeFlags = bitpack struct(Flags) {
     opaque_fd_bit: bool = false,
     opaque_win32_bit: bool = false,
     opaque_win32_kmt_bit: bool = false,
@@ -15833,7 +15833,7 @@ pub const ExternalMemoryHandleTypeFlags = packed struct(Flags) {
     pub const contains = FlagsMixin(ExternalMemoryHandleTypeFlags).contains;
     pub const format = FlagFormatMixin(ExternalMemoryHandleTypeFlags).format;
 };
-pub const ExternalMemoryFeatureFlags = packed struct(Flags) {
+pub const ExternalMemoryFeatureFlags = bitpack struct(Flags) {
     dedicated_only_bit: bool = false,
     exportable_bit: bool = false,
     importable_bit: bool = false,
@@ -15875,7 +15875,7 @@ pub const ExternalMemoryFeatureFlags = packed struct(Flags) {
     pub const contains = FlagsMixin(ExternalMemoryFeatureFlags).contains;
     pub const format = FlagFormatMixin(ExternalMemoryFeatureFlags).format;
 };
-pub const ExternalSemaphoreHandleTypeFlags = packed struct(Flags) {
+pub const ExternalSemaphoreHandleTypeFlags = bitpack struct(Flags) {
     opaque_fd_bit: bool = false,
     opaque_win32_bit: bool = false,
     opaque_win32_kmt_bit: bool = false,
@@ -15917,7 +15917,7 @@ pub const ExternalSemaphoreHandleTypeFlags = packed struct(Flags) {
     pub const contains = FlagsMixin(ExternalSemaphoreHandleTypeFlags).contains;
     pub const format = FlagFormatMixin(ExternalSemaphoreHandleTypeFlags).format;
 };
-pub const ExternalSemaphoreFeatureFlags = packed struct(Flags) {
+pub const ExternalSemaphoreFeatureFlags = bitpack struct(Flags) {
     exportable_bit: bool = false,
     importable_bit: bool = false,
     _reserved_bit_2: bool = false,
@@ -15959,7 +15959,7 @@ pub const ExternalSemaphoreFeatureFlags = packed struct(Flags) {
     pub const contains = FlagsMixin(ExternalSemaphoreFeatureFlags).contains;
     pub const format = FlagFormatMixin(ExternalSemaphoreFeatureFlags).format;
 };
-pub const SemaphoreImportFlags = packed struct(Flags) {
+pub const SemaphoreImportFlags = bitpack struct(Flags) {
     temporary_bit: bool = false,
     _reserved_bit_1: bool = false,
     _reserved_bit_2: bool = false,
@@ -16001,7 +16001,7 @@ pub const SemaphoreImportFlags = packed struct(Flags) {
     pub const contains = FlagsMixin(SemaphoreImportFlags).contains;
     pub const format = FlagFormatMixin(SemaphoreImportFlags).format;
 };
-pub const ExternalFenceHandleTypeFlags = packed struct(Flags) {
+pub const ExternalFenceHandleTypeFlags = bitpack struct(Flags) {
     opaque_fd_bit: bool = false,
     opaque_win32_bit: bool = false,
     opaque_win32_kmt_bit: bool = false,
@@ -16043,7 +16043,7 @@ pub const ExternalFenceHandleTypeFlags = packed struct(Flags) {
     pub const contains = FlagsMixin(ExternalFenceHandleTypeFlags).contains;
     pub const format = FlagFormatMixin(ExternalFenceHandleTypeFlags).format;
 };
-pub const ExternalFenceFeatureFlags = packed struct(Flags) {
+pub const ExternalFenceFeatureFlags = bitpack struct(Flags) {
     exportable_bit: bool = false,
     importable_bit: bool = false,
     _reserved_bit_2: bool = false,
@@ -16085,7 +16085,7 @@ pub const ExternalFenceFeatureFlags = packed struct(Flags) {
     pub const contains = FlagsMixin(ExternalFenceFeatureFlags).contains;
     pub const format = FlagFormatMixin(ExternalFenceFeatureFlags).format;
 };
-pub const FenceImportFlags = packed struct(Flags) {
+pub const FenceImportFlags = bitpack struct(Flags) {
     temporary_bit: bool = false,
     _reserved_bit_1: bool = false,
     _reserved_bit_2: bool = false,
@@ -16127,7 +16127,7 @@ pub const FenceImportFlags = packed struct(Flags) {
     pub const contains = FlagsMixin(FenceImportFlags).contains;
     pub const format = FlagFormatMixin(FenceImportFlags).format;
 };
-pub const SurfaceCounterFlagsEXT = packed struct(Flags) {
+pub const SurfaceCounterFlagsEXT = bitpack struct(Flags) {
     vblank_bit_ext: bool = false,
     _reserved_bit_1: bool = false,
     _reserved_bit_2: bool = false,
@@ -16183,7 +16183,7 @@ pub const DisplayEventTypeEXT = enum(i32) {
     first_pixel_out_ext = 0,
     _,
 };
-pub const PeerMemoryFeatureFlags = packed struct(Flags) {
+pub const PeerMemoryFeatureFlags = bitpack struct(Flags) {
     copy_src_bit: bool = false,
     copy_dst_bit: bool = false,
     generic_src_bit: bool = false,
@@ -16225,7 +16225,7 @@ pub const PeerMemoryFeatureFlags = packed struct(Flags) {
     pub const contains = FlagsMixin(PeerMemoryFeatureFlags).contains;
     pub const format = FlagFormatMixin(PeerMemoryFeatureFlags).format;
 };
-pub const MemoryAllocateFlags = packed struct(Flags) {
+pub const MemoryAllocateFlags = bitpack struct(Flags) {
     device_mask_bit: bool = false,
     device_address_bit: bool = false,
     device_address_capture_replay_bit: bool = false,
@@ -16267,7 +16267,7 @@ pub const MemoryAllocateFlags = packed struct(Flags) {
     pub const contains = FlagsMixin(MemoryAllocateFlags).contains;
     pub const format = FlagFormatMixin(MemoryAllocateFlags).format;
 };
-pub const DeviceGroupPresentModeFlagsKHR = packed struct(Flags) {
+pub const DeviceGroupPresentModeFlagsKHR = bitpack struct(Flags) {
     local_bit_khr: bool = false,
     remote_bit_khr: bool = false,
     sum_bit_khr: bool = false,
@@ -16309,7 +16309,7 @@ pub const DeviceGroupPresentModeFlagsKHR = packed struct(Flags) {
     pub const contains = FlagsMixin(DeviceGroupPresentModeFlagsKHR).contains;
     pub const format = FlagFormatMixin(DeviceGroupPresentModeFlagsKHR).format;
 };
-pub const SwapchainCreateFlagsKHR = packed struct(Flags) {
+pub const SwapchainCreateFlagsKHR = bitpack struct(Flags) {
     split_instance_bind_regions_bit_khr: bool = false,
     protected_bit_khr: bool = false,
     mutable_format_bit_khr: bool = false,
@@ -16367,7 +16367,7 @@ pub const DiscardRectangleModeEXT = enum(i32) {
     exclusive_ext = 1,
     _,
 };
-pub const SubpassDescriptionFlags = packed struct(Flags) {
+pub const SubpassDescriptionFlags = bitpack struct(Flags) {
     per_view_attributes_bit_nvx: bool = false,
     per_view_position_x_only_bit_nvx: bool = false,
     fragment_region_bit_qcom: bool = false,
@@ -16503,7 +16503,7 @@ pub const QueueGlobalPriority = enum(i32) {
     pub const high_khr = QueueGlobalPriority.high;
     pub const realtime_khr = QueueGlobalPriority.realtime;
 };
-pub const DebugUtilsMessageSeverityFlagsEXT = packed struct(Flags) {
+pub const DebugUtilsMessageSeverityFlagsEXT = bitpack struct(Flags) {
     verbose_bit_ext: bool = false,
     _reserved_bit_1: bool = false,
     _reserved_bit_2: bool = false,
@@ -16545,7 +16545,7 @@ pub const DebugUtilsMessageSeverityFlagsEXT = packed struct(Flags) {
     pub const contains = FlagsMixin(DebugUtilsMessageSeverityFlagsEXT).contains;
     pub const format = FlagFormatMixin(DebugUtilsMessageSeverityFlagsEXT).format;
 };
-pub const DebugUtilsMessageTypeFlagsEXT = packed struct(Flags) {
+pub const DebugUtilsMessageTypeFlagsEXT = bitpack struct(Flags) {
     general_bit_ext: bool = false,
     validation_bit_ext: bool = false,
     performance_bit_ext: bool = false,
@@ -16593,7 +16593,7 @@ pub const ConservativeRasterizationModeEXT = enum(i32) {
     underestimate_ext = 2,
     _,
 };
-pub const DescriptorBindingFlags = packed struct(Flags) {
+pub const DescriptorBindingFlags = bitpack struct(Flags) {
     update_after_bind_bit: bool = false,
     update_unused_while_pending_bit: bool = false,
     partially_bound_bit: bool = false,
@@ -16689,7 +16689,7 @@ pub const DriverId = enum(i32) {
     pub const ggp_proprietary_khr = DriverId.ggp_proprietary;
     pub const broadcom_proprietary_khr = DriverId.broadcom_proprietary;
 };
-pub const ConditionalRenderingFlagsEXT = packed struct(Flags) {
+pub const ConditionalRenderingFlagsEXT = bitpack struct(Flags) {
     inverted_bit_ext: bool = false,
     _reserved_bit_1: bool = false,
     _reserved_bit_2: bool = false,
@@ -16731,7 +16731,7 @@ pub const ConditionalRenderingFlagsEXT = packed struct(Flags) {
     pub const contains = FlagsMixin(ConditionalRenderingFlagsEXT).contains;
     pub const format = FlagFormatMixin(ConditionalRenderingFlagsEXT).format;
 };
-pub const ResolveModeFlags = packed struct(Flags) {
+pub const ResolveModeFlags = bitpack struct(Flags) {
     sample_zero_bit: bool = false,
     average_bit: bool = false,
     min_bit: bool = false,
@@ -16795,7 +16795,7 @@ pub const CoarseSampleOrderTypeNV = enum(i32) {
     sample_major_nv = 3,
     _,
 };
-pub const GeometryInstanceFlagsKHR = packed struct(Flags) {
+pub const GeometryInstanceFlagsKHR = bitpack struct(Flags) {
     triangle_facing_cull_disable_bit_khr: bool = false,
     triangle_flip_facing_bit_khr: bool = false,
     force_opaque_bit_khr: bool = false,
@@ -16837,7 +16837,7 @@ pub const GeometryInstanceFlagsKHR = packed struct(Flags) {
     pub const contains = FlagsMixin(GeometryInstanceFlagsKHR).contains;
     pub const format = FlagFormatMixin(GeometryInstanceFlagsKHR).format;
 };
-pub const GeometryFlagsKHR = packed struct(Flags) {
+pub const GeometryFlagsKHR = bitpack struct(Flags) {
     opaque_bit_khr: bool = false,
     no_duplicate_any_hit_invocation_bit_khr: bool = false,
     _reserved_bit_2: bool = false,
@@ -16879,7 +16879,7 @@ pub const GeometryFlagsKHR = packed struct(Flags) {
     pub const contains = FlagsMixin(GeometryFlagsKHR).contains;
     pub const format = FlagFormatMixin(GeometryFlagsKHR).format;
 };
-pub const BuildAccelerationStructureFlagsKHR = packed struct(Flags) {
+pub const BuildAccelerationStructureFlagsKHR = bitpack struct(Flags) {
     allow_update_bit_khr: bool = false,
     allow_compaction_bit_khr: bool = false,
     prefer_fast_trace_bit_khr: bool = false,
@@ -16921,7 +16921,7 @@ pub const BuildAccelerationStructureFlagsKHR = packed struct(Flags) {
     pub const contains = FlagsMixin(BuildAccelerationStructureFlagsKHR).contains;
     pub const format = FlagFormatMixin(BuildAccelerationStructureFlagsKHR).format;
 };
-pub const AccelerationStructureCreateFlagsKHR = packed struct(Flags) {
+pub const AccelerationStructureCreateFlagsKHR = bitpack struct(Flags) {
     device_address_capture_replay_bit_khr: bool = false,
     _reserved_bit_1: bool = false,
     motion_bit_nv: bool = false,
@@ -17035,7 +17035,7 @@ pub const MemoryOverallocationBehaviorAMD = enum(i32) {
     disallowed_amd = 2,
     _,
 };
-pub const FramebufferCreateFlags = packed struct(Flags) {
+pub const FramebufferCreateFlags = bitpack struct(Flags) {
     imageless_bit: bool = false,
     _reserved_bit_1: bool = false,
     _reserved_bit_2: bool = false,
@@ -17077,7 +17077,7 @@ pub const FramebufferCreateFlags = packed struct(Flags) {
     pub const contains = FlagsMixin(FramebufferCreateFlags).contains;
     pub const format = FlagFormatMixin(FramebufferCreateFlags).format;
 };
-pub const QueryPoolCreateFlags = packed struct(Flags) {
+pub const QueryPoolCreateFlags = bitpack struct(Flags) {
     reset_bit_khr: bool = false,
     _reserved_bit_1: bool = false,
     _reserved_bit_2: bool = false,
@@ -17119,7 +17119,7 @@ pub const QueryPoolCreateFlags = packed struct(Flags) {
     pub const contains = FlagsMixin(QueryPoolCreateFlags).contains;
     pub const format = FlagFormatMixin(QueryPoolCreateFlags).format;
 };
-pub const DeviceDiagnosticsConfigFlagsNV = packed struct(Flags) {
+pub const DeviceDiagnosticsConfigFlagsNV = bitpack struct(Flags) {
     enable_shader_debug_info_bit_nv: bool = false,
     enable_resource_tracking_bit_nv: bool = false,
     enable_automatic_checkpoints_bit_nv: bool = false,
@@ -17161,7 +17161,7 @@ pub const DeviceDiagnosticsConfigFlagsNV = packed struct(Flags) {
     pub const contains = FlagsMixin(DeviceDiagnosticsConfigFlagsNV).contains;
     pub const format = FlagFormatMixin(DeviceDiagnosticsConfigFlagsNV).format;
 };
-pub const PipelineCreationFeedbackFlags = packed struct(Flags) {
+pub const PipelineCreationFeedbackFlags = bitpack struct(Flags) {
     valid_bit: bool = false,
     application_pipeline_cache_hit_bit: bool = false,
     base_pipeline_acceleration_bit: bool = false,
@@ -17219,7 +17219,7 @@ pub const PerformanceCounterScopeKHR = enum(i32) {
     pub const query_scope_render_pass_khr = PerformanceCounterScopeKHR.render_pass_khr;
     pub const query_scope_command_khr = PerformanceCounterScopeKHR.command_khr;
 };
-pub const MemoryDecompressionMethodFlagsEXT = packed struct(Flags64) {
+pub const MemoryDecompressionMethodFlagsEXT = bitpack struct(Flags64) {
     gdeflate_1_0_bit_ext: bool = false,
     _reserved_bit_1: bool = false,
     _reserved_bit_2: bool = false,
@@ -17316,7 +17316,7 @@ pub const PerformanceCounterStorageKHR = enum(i32) {
     float64_khr = 5,
     _,
 };
-pub const PerformanceCounterDescriptionFlagsKHR = packed struct(Flags) {
+pub const PerformanceCounterDescriptionFlagsKHR = bitpack struct(Flags) {
     performance_impacting_bit_khr: bool = false,
     concurrently_impacted_bit_khr: bool = false,
     _reserved_bit_2: bool = false,
@@ -17358,7 +17358,7 @@ pub const PerformanceCounterDescriptionFlagsKHR = packed struct(Flags) {
     pub const contains = FlagsMixin(PerformanceCounterDescriptionFlagsKHR).contains;
     pub const format = FlagFormatMixin(PerformanceCounterDescriptionFlagsKHR).format;
 };
-pub const AcquireProfilingLockFlagsKHR = packed struct(Flags) {
+pub const AcquireProfilingLockFlagsKHR = bitpack struct(Flags) {
     _reserved_bits: Flags = 0,
     pub const toInt = FlagsMixin(AcquireProfilingLockFlagsKHR).toInt;
     pub const fromInt = FlagsMixin(AcquireProfilingLockFlagsKHR).fromInt;
@@ -17369,7 +17369,7 @@ pub const AcquireProfilingLockFlagsKHR = packed struct(Flags) {
     pub const contains = FlagsMixin(AcquireProfilingLockFlagsKHR).contains;
     pub const format = FlagFormatMixin(AcquireProfilingLockFlagsKHR).format;
 };
-pub const ShaderCorePropertiesFlagsAMD = packed struct(Flags) {
+pub const ShaderCorePropertiesFlagsAMD = bitpack struct(Flags) {
     _reserved_bits: Flags = 0,
     pub const toInt = FlagsMixin(ShaderCorePropertiesFlagsAMD).toInt;
     pub const fromInt = FlagsMixin(ShaderCorePropertiesFlagsAMD).fromInt;
@@ -17380,7 +17380,7 @@ pub const ShaderCorePropertiesFlagsAMD = packed struct(Flags) {
     pub const contains = FlagsMixin(ShaderCorePropertiesFlagsAMD).contains;
     pub const format = FlagFormatMixin(ShaderCorePropertiesFlagsAMD).format;
 };
-pub const RefreshObjectFlagsKHR = packed struct(Flags) {
+pub const RefreshObjectFlagsKHR = bitpack struct(Flags) {
     _reserved_bits: Flags = 0,
     pub const toInt = FlagsMixin(RefreshObjectFlagsKHR).toInt;
     pub const fromInt = FlagsMixin(RefreshObjectFlagsKHR).fromInt;
@@ -17448,7 +17448,7 @@ pub const LineRasterizationMode = enum(i32) {
     pub const bresenham_khr = LineRasterizationMode.bresenham;
     pub const rectangular_smooth_khr = LineRasterizationMode.rectangular_smooth;
 };
-pub const PipelineCompilerControlFlagsAMD = packed struct(Flags) {
+pub const PipelineCompilerControlFlagsAMD = bitpack struct(Flags) {
     _reserved_bits: Flags = 0,
     pub const toInt = FlagsMixin(PipelineCompilerControlFlagsAMD).toInt;
     pub const fromInt = FlagsMixin(PipelineCompilerControlFlagsAMD).fromInt;
@@ -17480,7 +17480,7 @@ pub const FaultQueryBehavior = enum(i32) {
     get_and_clear_all_faults = 0,
     _,
 };
-pub const ToolPurposeFlags = packed struct(Flags) {
+pub const ToolPurposeFlags = bitpack struct(Flags) {
     validation_bit: bool = false,
     profiling_bit: bool = false,
     tracing_bit: bool = false,
@@ -17571,7 +17571,7 @@ pub const SubpassMergeStatusEXT = enum(i32) {
     not_merged_unspecified_ext = 13,
     _,
 };
-pub const AccessFlags2 = packed struct(Flags64) {
+pub const AccessFlags2 = bitpack struct(Flags64) {
     indirect_command_read_bit: bool = false,
     index_read_bit: bool = false,
     vertex_attribute_read_bit: bool = false,
@@ -17645,7 +17645,7 @@ pub const AccessFlags2 = packed struct(Flags64) {
     pub const contains = FlagsMixin(AccessFlags2).contains;
     pub const format = FlagFormatMixin(AccessFlags2).format;
 };
-pub const PipelineStageFlags2 = packed struct(Flags64) {
+pub const PipelineStageFlags2 = bitpack struct(Flags64) {
     top_of_pipe_bit: bool = false,
     draw_indirect_bit: bool = false,
     vertex_input_bit: bool = false,
@@ -17719,7 +17719,7 @@ pub const PipelineStageFlags2 = packed struct(Flags64) {
     pub const contains = FlagsMixin(PipelineStageFlags2).contains;
     pub const format = FlagFormatMixin(PipelineStageFlags2).format;
 };
-pub const SubmitFlags = packed struct(Flags) {
+pub const SubmitFlags = bitpack struct(Flags) {
     protected_bit: bool = false,
     _reserved_bit_1: bool = false,
     _reserved_bit_2: bool = false,
@@ -17761,7 +17761,7 @@ pub const SubmitFlags = packed struct(Flags) {
     pub const contains = FlagsMixin(SubmitFlags).contains;
     pub const format = FlagFormatMixin(SubmitFlags).format;
 };
-pub const EventCreateFlags = packed struct(Flags) {
+pub const EventCreateFlags = bitpack struct(Flags) {
     device_only_bit: bool = false,
     _reserved_bit_1: bool = false,
     _reserved_bit_2: bool = false,
@@ -17803,7 +17803,7 @@ pub const EventCreateFlags = packed struct(Flags) {
     pub const contains = FlagsMixin(EventCreateFlags).contains;
     pub const format = FlagFormatMixin(EventCreateFlags).format;
 };
-pub const PipelineLayoutCreateFlags = packed struct(Flags) {
+pub const PipelineLayoutCreateFlags = bitpack struct(Flags) {
     _reserved_bit_0: bool = false,
     independent_sets_bit_ext: bool = false,
     _reserved_bit_2: bool = false,
@@ -17871,7 +17871,7 @@ pub const AccelerationStructureMotionInstanceTypeNV = enum(i32) {
     srt_motion_nv = 2,
     _,
 };
-pub const PipelineColorBlendStateCreateFlags = packed struct(Flags) {
+pub const PipelineColorBlendStateCreateFlags = bitpack struct(Flags) {
     rasterization_order_attachment_access_bit_ext: bool = false,
     _reserved_bit_1: bool = false,
     _reserved_bit_2: bool = false,
@@ -17913,7 +17913,7 @@ pub const PipelineColorBlendStateCreateFlags = packed struct(Flags) {
     pub const contains = FlagsMixin(PipelineColorBlendStateCreateFlags).contains;
     pub const format = FlagFormatMixin(PipelineColorBlendStateCreateFlags).format;
 };
-pub const PipelineDepthStencilStateCreateFlags = packed struct(Flags) {
+pub const PipelineDepthStencilStateCreateFlags = bitpack struct(Flags) {
     rasterization_order_attachment_depth_access_bit_ext: bool = false,
     rasterization_order_attachment_stencil_access_bit_ext: bool = false,
     _reserved_bit_2: bool = false,
@@ -17955,7 +17955,7 @@ pub const PipelineDepthStencilStateCreateFlags = packed struct(Flags) {
     pub const contains = FlagsMixin(PipelineDepthStencilStateCreateFlags).contains;
     pub const format = FlagFormatMixin(PipelineDepthStencilStateCreateFlags).format;
 };
-pub const GraphicsPipelineLibraryFlagsEXT = packed struct(Flags) {
+pub const GraphicsPipelineLibraryFlagsEXT = bitpack struct(Flags) {
     vertex_input_interface_bit_ext: bool = false,
     pre_rasterization_shaders_bit_ext: bool = false,
     fragment_shader_bit_ext: bool = false,
@@ -17997,7 +17997,7 @@ pub const GraphicsPipelineLibraryFlagsEXT = packed struct(Flags) {
     pub const contains = FlagsMixin(GraphicsPipelineLibraryFlagsEXT).contains;
     pub const format = FlagFormatMixin(GraphicsPipelineLibraryFlagsEXT).format;
 };
-pub const RenderingAttachmentFlagsKHR = packed struct(Flags) {
+pub const RenderingAttachmentFlagsKHR = bitpack struct(Flags) {
     input_attachment_feedback_bit_khr: bool = false,
     resolve_skip_transfer_function_bit_khr: bool = false,
     resolve_enable_transfer_function_bit_khr: bool = false,
@@ -18039,7 +18039,7 @@ pub const RenderingAttachmentFlagsKHR = packed struct(Flags) {
     pub const contains = FlagsMixin(RenderingAttachmentFlagsKHR).contains;
     pub const format = FlagFormatMixin(RenderingAttachmentFlagsKHR).format;
 };
-pub const ResolveImageFlagsKHR = packed struct(Flags) {
+pub const ResolveImageFlagsKHR = bitpack struct(Flags) {
     skip_transfer_function_bit_khr: bool = false,
     enable_transfer_function_bit_khr: bool = false,
     _reserved_bit_2: bool = false,
@@ -18081,7 +18081,7 @@ pub const ResolveImageFlagsKHR = packed struct(Flags) {
     pub const contains = FlagsMixin(ResolveImageFlagsKHR).contains;
     pub const format = FlagFormatMixin(ResolveImageFlagsKHR).format;
 };
-pub const DeviceAddressBindingFlagsEXT = packed struct(Flags) {
+pub const DeviceAddressBindingFlagsEXT = bitpack struct(Flags) {
     internal_object_bit_ext: bool = false,
     _reserved_bit_1: bool = false,
     _reserved_bit_2: bool = false,
@@ -18128,7 +18128,7 @@ pub const DeviceAddressBindingTypeEXT = enum(i32) {
     unbind_ext = 1,
     _,
 };
-pub const FrameBoundaryFlagsEXT = packed struct(Flags) {
+pub const FrameBoundaryFlagsEXT = bitpack struct(Flags) {
     frame_end_bit_ext: bool = false,
     _reserved_bit_1: bool = false,
     _reserved_bit_2: bool = false,
@@ -18170,7 +18170,7 @@ pub const FrameBoundaryFlagsEXT = packed struct(Flags) {
     pub const contains = FlagsMixin(FrameBoundaryFlagsEXT).contains;
     pub const format = FlagFormatMixin(FrameBoundaryFlagsEXT).format;
 };
-pub const PresentScalingFlagsKHR = packed struct(Flags) {
+pub const PresentScalingFlagsKHR = bitpack struct(Flags) {
     one_to_one_bit_khr: bool = false,
     aspect_ratio_stretch_bit_khr: bool = false,
     stretch_bit_khr: bool = false,
@@ -18212,7 +18212,7 @@ pub const PresentScalingFlagsKHR = packed struct(Flags) {
     pub const contains = FlagsMixin(PresentScalingFlagsKHR).contains;
     pub const format = FlagFormatMixin(PresentScalingFlagsKHR).format;
 };
-pub const PresentGravityFlagsKHR = packed struct(Flags) {
+pub const PresentGravityFlagsKHR = bitpack struct(Flags) {
     min_bit_khr: bool = false,
     max_bit_khr: bool = false,
     centered_bit_khr: bool = false,
@@ -18254,7 +18254,7 @@ pub const PresentGravityFlagsKHR = packed struct(Flags) {
     pub const contains = FlagsMixin(PresentGravityFlagsKHR).contains;
     pub const format = FlagFormatMixin(PresentGravityFlagsKHR).format;
 };
-pub const PhysicalDeviceSchedulingControlsFlagsARM = packed struct(Flags64) {
+pub const PhysicalDeviceSchedulingControlsFlagsARM = bitpack struct(Flags64) {
     shader_core_count_arm: bool = false,
     _reserved_bit_1: bool = false,
     _reserved_bit_2: bool = false,
@@ -18328,7 +18328,7 @@ pub const PhysicalDeviceSchedulingControlsFlagsARM = packed struct(Flags64) {
     pub const contains = FlagsMixin(PhysicalDeviceSchedulingControlsFlagsARM).contains;
     pub const format = FlagFormatMixin(PhysicalDeviceSchedulingControlsFlagsARM).format;
 };
-pub const VideoCodecOperationFlagsKHR = packed struct(Flags) {
+pub const VideoCodecOperationFlagsKHR = bitpack struct(Flags) {
     decode_h264_bit_khr: bool = false,
     decode_h265_bit_khr: bool = false,
     decode_av1_bit_khr: bool = false,
@@ -18370,7 +18370,7 @@ pub const VideoCodecOperationFlagsKHR = packed struct(Flags) {
     pub const contains = FlagsMixin(VideoCodecOperationFlagsKHR).contains;
     pub const format = FlagFormatMixin(VideoCodecOperationFlagsKHR).format;
 };
-pub const VideoChromaSubsamplingFlagsKHR = packed struct(Flags) {
+pub const VideoChromaSubsamplingFlagsKHR = bitpack struct(Flags) {
     monochrome_bit_khr: bool = false,
     @"420_bit_khr": bool = false,
     @"422_bit_khr": bool = false,
@@ -18412,7 +18412,7 @@ pub const VideoChromaSubsamplingFlagsKHR = packed struct(Flags) {
     pub const contains = FlagsMixin(VideoChromaSubsamplingFlagsKHR).contains;
     pub const format = FlagFormatMixin(VideoChromaSubsamplingFlagsKHR).format;
 };
-pub const VideoComponentBitDepthFlagsKHR = packed struct(Flags) {
+pub const VideoComponentBitDepthFlagsKHR = bitpack struct(Flags) {
     @"8_bit_khr": bool = false,
     _reserved_bit_1: bool = false,
     @"10_bit_khr": bool = false,
@@ -18454,7 +18454,7 @@ pub const VideoComponentBitDepthFlagsKHR = packed struct(Flags) {
     pub const contains = FlagsMixin(VideoComponentBitDepthFlagsKHR).contains;
     pub const format = FlagFormatMixin(VideoComponentBitDepthFlagsKHR).format;
 };
-pub const VideoCapabilityFlagsKHR = packed struct(Flags) {
+pub const VideoCapabilityFlagsKHR = bitpack struct(Flags) {
     protected_content_bit_khr: bool = false,
     separate_reference_images_bit_khr: bool = false,
     _reserved_bit_2: bool = false,
@@ -18496,7 +18496,7 @@ pub const VideoCapabilityFlagsKHR = packed struct(Flags) {
     pub const contains = FlagsMixin(VideoCapabilityFlagsKHR).contains;
     pub const format = FlagFormatMixin(VideoCapabilityFlagsKHR).format;
 };
-pub const VideoSessionCreateFlagsKHR = packed struct(Flags) {
+pub const VideoSessionCreateFlagsKHR = bitpack struct(Flags) {
     protected_content_bit_khr: bool = false,
     allow_encode_parameter_optimizations_bit_khr: bool = false,
     inline_queries_bit_khr: bool = false,
@@ -18538,7 +18538,7 @@ pub const VideoSessionCreateFlagsKHR = packed struct(Flags) {
     pub const contains = FlagsMixin(VideoSessionCreateFlagsKHR).contains;
     pub const format = FlagFormatMixin(VideoSessionCreateFlagsKHR).format;
 };
-pub const VideoSessionParametersCreateFlagsKHR = packed struct(Flags) {
+pub const VideoSessionParametersCreateFlagsKHR = bitpack struct(Flags) {
     quantization_map_compatible_bit_khr: bool = false,
     _reserved_bit_1: bool = false,
     _reserved_bit_2: bool = false,
@@ -18580,7 +18580,7 @@ pub const VideoSessionParametersCreateFlagsKHR = packed struct(Flags) {
     pub const contains = FlagsMixin(VideoSessionParametersCreateFlagsKHR).contains;
     pub const format = FlagFormatMixin(VideoSessionParametersCreateFlagsKHR).format;
 };
-pub const VideoDecodeH264PictureLayoutFlagsKHR = packed struct(Flags) {
+pub const VideoDecodeH264PictureLayoutFlagsKHR = bitpack struct(Flags) {
     interlaced_interleaved_lines_bit_khr: bool = false,
     interlaced_separate_planes_bit_khr: bool = false,
     _reserved_bit_2: bool = false,
@@ -18622,7 +18622,7 @@ pub const VideoDecodeH264PictureLayoutFlagsKHR = packed struct(Flags) {
     pub const contains = FlagsMixin(VideoDecodeH264PictureLayoutFlagsKHR).contains;
     pub const format = FlagFormatMixin(VideoDecodeH264PictureLayoutFlagsKHR).format;
 };
-pub const VideoCodingControlFlagsKHR = packed struct(Flags) {
+pub const VideoCodingControlFlagsKHR = bitpack struct(Flags) {
     reset_bit_khr: bool = false,
     encode_rate_control_bit_khr: bool = false,
     encode_quality_level_bit_khr: bool = false,
@@ -18671,7 +18671,7 @@ pub const QueryResultStatusKHR = enum(i32) {
     insufficient_bitstream_buffer_range_khr = -1000299000,
     _,
 };
-pub const VideoDecodeUsageFlagsKHR = packed struct(Flags) {
+pub const VideoDecodeUsageFlagsKHR = bitpack struct(Flags) {
     transcoding_bit_khr: bool = false,
     offline_bit_khr: bool = false,
     streaming_bit_khr: bool = false,
@@ -18713,7 +18713,7 @@ pub const VideoDecodeUsageFlagsKHR = packed struct(Flags) {
     pub const contains = FlagsMixin(VideoDecodeUsageFlagsKHR).contains;
     pub const format = FlagFormatMixin(VideoDecodeUsageFlagsKHR).format;
 };
-pub const VideoDecodeCapabilityFlagsKHR = packed struct(Flags) {
+pub const VideoDecodeCapabilityFlagsKHR = bitpack struct(Flags) {
     dpb_and_output_coincide_bit_khr: bool = false,
     dpb_and_output_distinct_bit_khr: bool = false,
     _reserved_bit_2: bool = false,
@@ -18755,7 +18755,7 @@ pub const VideoDecodeCapabilityFlagsKHR = packed struct(Flags) {
     pub const contains = FlagsMixin(VideoDecodeCapabilityFlagsKHR).contains;
     pub const format = FlagFormatMixin(VideoDecodeCapabilityFlagsKHR).format;
 };
-pub const VideoEncodeFlagsKHR = packed struct(Flags) {
+pub const VideoEncodeFlagsKHR = bitpack struct(Flags) {
     with_quantization_delta_map_bit_khr: bool = false,
     with_emphasis_map_bit_khr: bool = false,
     intra_refresh_bit_khr: bool = false,
@@ -18797,7 +18797,7 @@ pub const VideoEncodeFlagsKHR = packed struct(Flags) {
     pub const contains = FlagsMixin(VideoEncodeFlagsKHR).contains;
     pub const format = FlagFormatMixin(VideoEncodeFlagsKHR).format;
 };
-pub const VideoEncodeUsageFlagsKHR = packed struct(Flags) {
+pub const VideoEncodeUsageFlagsKHR = bitpack struct(Flags) {
     transcoding_bit_khr: bool = false,
     streaming_bit_khr: bool = false,
     recording_bit_khr: bool = false,
@@ -18839,7 +18839,7 @@ pub const VideoEncodeUsageFlagsKHR = packed struct(Flags) {
     pub const contains = FlagsMixin(VideoEncodeUsageFlagsKHR).contains;
     pub const format = FlagFormatMixin(VideoEncodeUsageFlagsKHR).format;
 };
-pub const VideoEncodeContentFlagsKHR = packed struct(Flags) {
+pub const VideoEncodeContentFlagsKHR = bitpack struct(Flags) {
     camera_bit_khr: bool = false,
     desktop_bit_khr: bool = false,
     rendered_bit_khr: bool = false,
@@ -18889,7 +18889,7 @@ pub const VideoEncodeTuningModeKHR = enum(i32) {
     lossless_khr = 4,
     _,
 };
-pub const VideoEncodeCapabilityFlagsKHR = packed struct(Flags) {
+pub const VideoEncodeCapabilityFlagsKHR = bitpack struct(Flags) {
     preceding_externally_encoded_bytes_bit_khr: bool = false,
     insufficient_bitstream_buffer_range_detection_bit_khr: bool = false,
     quantization_delta_map_bit_khr: bool = false,
@@ -18931,7 +18931,7 @@ pub const VideoEncodeCapabilityFlagsKHR = packed struct(Flags) {
     pub const contains = FlagsMixin(VideoEncodeCapabilityFlagsKHR).contains;
     pub const format = FlagFormatMixin(VideoEncodeCapabilityFlagsKHR).format;
 };
-pub const VideoEncodeFeedbackFlagsKHR = packed struct(Flags) {
+pub const VideoEncodeFeedbackFlagsKHR = bitpack struct(Flags) {
     bitstream_buffer_offset_bit_khr: bool = false,
     bitstream_bytes_written_bit_khr: bool = false,
     bitstream_has_overrides_bit_khr: bool = false,
@@ -18973,7 +18973,7 @@ pub const VideoEncodeFeedbackFlagsKHR = packed struct(Flags) {
     pub const contains = FlagsMixin(VideoEncodeFeedbackFlagsKHR).contains;
     pub const format = FlagFormatMixin(VideoEncodeFeedbackFlagsKHR).format;
 };
-pub const VideoEncodeRateControlModeFlagsKHR = packed struct(Flags) {
+pub const VideoEncodeRateControlModeFlagsKHR = bitpack struct(Flags) {
     disabled_bit_khr: bool = false,
     cbr_bit_khr: bool = false,
     vbr_bit_khr: bool = false,
@@ -19015,7 +19015,7 @@ pub const VideoEncodeRateControlModeFlagsKHR = packed struct(Flags) {
     pub const contains = FlagsMixin(VideoEncodeRateControlModeFlagsKHR).contains;
     pub const format = FlagFormatMixin(VideoEncodeRateControlModeFlagsKHR).format;
 };
-pub const VideoEncodeIntraRefreshModeFlagsKHR = packed struct(Flags) {
+pub const VideoEncodeIntraRefreshModeFlagsKHR = bitpack struct(Flags) {
     per_picture_partition_bit_khr: bool = false,
     block_based_bit_khr: bool = false,
     block_row_based_bit_khr: bool = false,
@@ -19057,7 +19057,7 @@ pub const VideoEncodeIntraRefreshModeFlagsKHR = packed struct(Flags) {
     pub const contains = FlagsMixin(VideoEncodeIntraRefreshModeFlagsKHR).contains;
     pub const format = FlagFormatMixin(VideoEncodeIntraRefreshModeFlagsKHR).format;
 };
-pub const VideoEncodeH264CapabilityFlagsKHR = packed struct(Flags) {
+pub const VideoEncodeH264CapabilityFlagsKHR = bitpack struct(Flags) {
     hrd_compliance_bit_khr: bool = false,
     prediction_weight_table_generated_bit_khr: bool = false,
     row_unaligned_slice_bit_khr: bool = false,
@@ -19099,7 +19099,7 @@ pub const VideoEncodeH264CapabilityFlagsKHR = packed struct(Flags) {
     pub const contains = FlagsMixin(VideoEncodeH264CapabilityFlagsKHR).contains;
     pub const format = FlagFormatMixin(VideoEncodeH264CapabilityFlagsKHR).format;
 };
-pub const VideoEncodeH264StdFlagsKHR = packed struct(Flags) {
+pub const VideoEncodeH264StdFlagsKHR = bitpack struct(Flags) {
     separate_color_plane_flag_set_bit_khr: bool = false,
     qpprime_y_zero_transform_bypass_flag_set_bit_khr: bool = false,
     scaling_matrix_present_flag_set_bit_khr: bool = false,
@@ -19141,7 +19141,7 @@ pub const VideoEncodeH264StdFlagsKHR = packed struct(Flags) {
     pub const contains = FlagsMixin(VideoEncodeH264StdFlagsKHR).contains;
     pub const format = FlagFormatMixin(VideoEncodeH264StdFlagsKHR).format;
 };
-pub const VideoEncodeH264RateControlFlagsKHR = packed struct(Flags) {
+pub const VideoEncodeH264RateControlFlagsKHR = bitpack struct(Flags) {
     attempt_hrd_compliance_bit_khr: bool = false,
     regular_gop_bit_khr: bool = false,
     reference_pattern_flat_bit_khr: bool = false,
@@ -19183,7 +19183,7 @@ pub const VideoEncodeH264RateControlFlagsKHR = packed struct(Flags) {
     pub const contains = FlagsMixin(VideoEncodeH264RateControlFlagsKHR).contains;
     pub const format = FlagFormatMixin(VideoEncodeH264RateControlFlagsKHR).format;
 };
-pub const HostImageCopyFlags = packed struct(Flags) {
+pub const HostImageCopyFlags = bitpack struct(Flags) {
     memcpy_bit: bool = false,
     _reserved_bit_1: bool = false,
     _reserved_bit_2: bool = false,
@@ -19231,7 +19231,7 @@ pub const PartitionedAccelerationStructureOpTypeNV = enum(i32) {
     write_partition_translation_nv = 2,
     _,
 };
-pub const PartitionedAccelerationStructureInstanceFlagsNV = packed struct(Flags) {
+pub const PartitionedAccelerationStructureInstanceFlagsNV = bitpack struct(Flags) {
     flag_triangle_facing_cull_disable_bit_nv: bool = false,
     flag_triangle_flip_facing_bit_nv: bool = false,
     flag_force_opaque_bit_nv: bool = false,
@@ -19273,7 +19273,7 @@ pub const PartitionedAccelerationStructureInstanceFlagsNV = packed struct(Flags)
     pub const contains = FlagsMixin(PartitionedAccelerationStructureInstanceFlagsNV).contains;
     pub const format = FlagFormatMixin(PartitionedAccelerationStructureInstanceFlagsNV).format;
 };
-pub const ImageConstraintsInfoFlagsFUCHSIA = packed struct(Flags) {
+pub const ImageConstraintsInfoFlagsFUCHSIA = bitpack struct(Flags) {
     cpu_read_rarely_fuchsia: bool = false,
     cpu_read_often_fuchsia: bool = false,
     cpu_write_rarely_fuchsia: bool = false,
@@ -19315,7 +19315,7 @@ pub const ImageConstraintsInfoFlagsFUCHSIA = packed struct(Flags) {
     pub const contains = FlagsMixin(ImageConstraintsInfoFlagsFUCHSIA).contains;
     pub const format = FlagFormatMixin(ImageConstraintsInfoFlagsFUCHSIA).format;
 };
-pub const FormatFeatureFlags2 = packed struct(Flags64) {
+pub const FormatFeatureFlags2 = bitpack struct(Flags64) {
     sampled_image_bit: bool = false,
     storage_image_bit: bool = false,
     storage_image_atomic_bit: bool = false,
@@ -19389,7 +19389,7 @@ pub const FormatFeatureFlags2 = packed struct(Flags64) {
     pub const contains = FlagsMixin(FormatFeatureFlags2).contains;
     pub const format = FlagFormatMixin(FormatFeatureFlags2).format;
 };
-pub const RenderingFlags = packed struct(Flags) {
+pub const RenderingFlags = bitpack struct(Flags) {
     contents_secondary_command_buffers_bit: bool = false,
     suspending_bit: bool = false,
     resuming_bit: bool = false,
@@ -19431,7 +19431,7 @@ pub const RenderingFlags = packed struct(Flags) {
     pub const contains = FlagsMixin(RenderingFlags).contains;
     pub const format = FlagFormatMixin(RenderingFlags).format;
 };
-pub const VideoEncodeH265CapabilityFlagsKHR = packed struct(Flags) {
+pub const VideoEncodeH265CapabilityFlagsKHR = bitpack struct(Flags) {
     hrd_compliance_bit_khr: bool = false,
     prediction_weight_table_generated_bit_khr: bool = false,
     row_unaligned_slice_segment_bit_khr: bool = false,
@@ -19473,7 +19473,7 @@ pub const VideoEncodeH265CapabilityFlagsKHR = packed struct(Flags) {
     pub const contains = FlagsMixin(VideoEncodeH265CapabilityFlagsKHR).contains;
     pub const format = FlagFormatMixin(VideoEncodeH265CapabilityFlagsKHR).format;
 };
-pub const VideoEncodeH265StdFlagsKHR = packed struct(Flags) {
+pub const VideoEncodeH265StdFlagsKHR = bitpack struct(Flags) {
     separate_color_plane_flag_set_bit_khr: bool = false,
     sample_adaptive_offset_enabled_flag_set_bit_khr: bool = false,
     scaling_list_data_present_flag_set_bit_khr: bool = false,
@@ -19515,7 +19515,7 @@ pub const VideoEncodeH265StdFlagsKHR = packed struct(Flags) {
     pub const contains = FlagsMixin(VideoEncodeH265StdFlagsKHR).contains;
     pub const format = FlagFormatMixin(VideoEncodeH265StdFlagsKHR).format;
 };
-pub const VideoEncodeH265RateControlFlagsKHR = packed struct(Flags) {
+pub const VideoEncodeH265RateControlFlagsKHR = bitpack struct(Flags) {
     attempt_hrd_compliance_bit_khr: bool = false,
     regular_gop_bit_khr: bool = false,
     reference_pattern_flat_bit_khr: bool = false,
@@ -19557,7 +19557,7 @@ pub const VideoEncodeH265RateControlFlagsKHR = packed struct(Flags) {
     pub const contains = FlagsMixin(VideoEncodeH265RateControlFlagsKHR).contains;
     pub const format = FlagFormatMixin(VideoEncodeH265RateControlFlagsKHR).format;
 };
-pub const VideoEncodeH265CtbSizeFlagsKHR = packed struct(Flags) {
+pub const VideoEncodeH265CtbSizeFlagsKHR = bitpack struct(Flags) {
     @"16_bit_khr": bool = false,
     @"32_bit_khr": bool = false,
     @"64_bit_khr": bool = false,
@@ -19599,7 +19599,7 @@ pub const VideoEncodeH265CtbSizeFlagsKHR = packed struct(Flags) {
     pub const contains = FlagsMixin(VideoEncodeH265CtbSizeFlagsKHR).contains;
     pub const format = FlagFormatMixin(VideoEncodeH265CtbSizeFlagsKHR).format;
 };
-pub const VideoEncodeH265TransformBlockSizeFlagsKHR = packed struct(Flags) {
+pub const VideoEncodeH265TransformBlockSizeFlagsKHR = bitpack struct(Flags) {
     @"4_bit_khr": bool = false,
     @"8_bit_khr": bool = false,
     @"16_bit_khr": bool = false,
@@ -19641,7 +19641,7 @@ pub const VideoEncodeH265TransformBlockSizeFlagsKHR = packed struct(Flags) {
     pub const contains = FlagsMixin(VideoEncodeH265TransformBlockSizeFlagsKHR).contains;
     pub const format = FlagFormatMixin(VideoEncodeH265TransformBlockSizeFlagsKHR).format;
 };
-pub const VideoEncodeAV1CapabilityFlagsKHR = packed struct(Flags) {
+pub const VideoEncodeAV1CapabilityFlagsKHR = bitpack struct(Flags) {
     per_rate_control_group_min_max_q_index_bit_khr: bool = false,
     generate_obu_extension_header_bit_khr: bool = false,
     primary_reference_cdf_only_bit_khr: bool = false,
@@ -19683,7 +19683,7 @@ pub const VideoEncodeAV1CapabilityFlagsKHR = packed struct(Flags) {
     pub const contains = FlagsMixin(VideoEncodeAV1CapabilityFlagsKHR).contains;
     pub const format = FlagFormatMixin(VideoEncodeAV1CapabilityFlagsKHR).format;
 };
-pub const VideoEncodeAV1StdFlagsKHR = packed struct(Flags) {
+pub const VideoEncodeAV1StdFlagsKHR = bitpack struct(Flags) {
     uniform_tile_spacing_flag_set_bit_khr: bool = false,
     skip_mode_present_unset_bit_khr: bool = false,
     primary_ref_frame_bit_khr: bool = false,
@@ -19725,7 +19725,7 @@ pub const VideoEncodeAV1StdFlagsKHR = packed struct(Flags) {
     pub const contains = FlagsMixin(VideoEncodeAV1StdFlagsKHR).contains;
     pub const format = FlagFormatMixin(VideoEncodeAV1StdFlagsKHR).format;
 };
-pub const VideoEncodeAV1RateControlFlagsKHR = packed struct(Flags) {
+pub const VideoEncodeAV1RateControlFlagsKHR = bitpack struct(Flags) {
     regular_gop_bit_khr: bool = false,
     temporal_layer_pattern_dyadic_bit_khr: bool = false,
     reference_pattern_flat_bit_khr: bool = false,
@@ -19767,7 +19767,7 @@ pub const VideoEncodeAV1RateControlFlagsKHR = packed struct(Flags) {
     pub const contains = FlagsMixin(VideoEncodeAV1RateControlFlagsKHR).contains;
     pub const format = FlagFormatMixin(VideoEncodeAV1RateControlFlagsKHR).format;
 };
-pub const VideoEncodeAV1SuperblockSizeFlagsKHR = packed struct(Flags) {
+pub const VideoEncodeAV1SuperblockSizeFlagsKHR = bitpack struct(Flags) {
     @"64_bit_khr": bool = false,
     @"128_bit_khr": bool = false,
     _reserved_bit_2: bool = false,
@@ -19822,7 +19822,7 @@ pub const VideoEncodeAV1RateControlGroupKHR = enum(i32) {
     bipredictive_khr = 2,
     _,
 };
-pub const ExportMetalObjectTypeFlagsEXT = packed struct(Flags) {
+pub const ExportMetalObjectTypeFlagsEXT = bitpack struct(Flags) {
     metal_device_bit_ext: bool = false,
     metal_command_queue_bit_ext: bool = false,
     metal_buffer_bit_ext: bool = false,
@@ -19864,7 +19864,7 @@ pub const ExportMetalObjectTypeFlagsEXT = packed struct(Flags) {
     pub const contains = FlagsMixin(ExportMetalObjectTypeFlagsEXT).contains;
     pub const format = FlagFormatMixin(ExportMetalObjectTypeFlagsEXT).format;
 };
-pub const InstanceCreateFlags = packed struct(Flags) {
+pub const InstanceCreateFlags = bitpack struct(Flags) {
     enumerate_portability_bit_khr: bool = false,
     _reserved_bit_1: bool = false,
     _reserved_bit_2: bool = false,
@@ -19906,7 +19906,7 @@ pub const InstanceCreateFlags = packed struct(Flags) {
     pub const contains = FlagsMixin(InstanceCreateFlags).contains;
     pub const format = FlagFormatMixin(InstanceCreateFlags).format;
 };
-pub const ImageCompressionFlagsEXT = packed struct(Flags) {
+pub const ImageCompressionFlagsEXT = bitpack struct(Flags) {
     fixed_rate_default_ext: bool = false,
     fixed_rate_explicit_ext: bool = false,
     disabled_ext: bool = false,
@@ -19948,7 +19948,7 @@ pub const ImageCompressionFlagsEXT = packed struct(Flags) {
     pub const contains = FlagsMixin(ImageCompressionFlagsEXT).contains;
     pub const format = FlagFormatMixin(ImageCompressionFlagsEXT).format;
 };
-pub const ImageCompressionFixedRateFlagsEXT = packed struct(Flags) {
+pub const ImageCompressionFixedRateFlagsEXT = bitpack struct(Flags) {
     @"1bpc_bit_ext": bool = false,
     @"2bpc_bit_ext": bool = false,
     @"3bpc_bit_ext": bool = false,
@@ -20012,7 +20012,7 @@ pub const PipelineRobustnessImageBehavior = enum(i32) {
     pub const robust_image_access_ext = PipelineRobustnessImageBehavior.robust_image_access;
     pub const robust_image_access_2_ext = PipelineRobustnessImageBehavior.robust_image_access_2;
 };
-pub const OpticalFlowGridSizeFlagsNV = packed struct(Flags) {
+pub const OpticalFlowGridSizeFlagsNV = bitpack struct(Flags) {
     @"1x1_bit_nv": bool = false,
     @"2x2_bit_nv": bool = false,
     @"4x4_bit_nv": bool = false,
@@ -20054,7 +20054,7 @@ pub const OpticalFlowGridSizeFlagsNV = packed struct(Flags) {
     pub const contains = FlagsMixin(OpticalFlowGridSizeFlagsNV).contains;
     pub const format = FlagFormatMixin(OpticalFlowGridSizeFlagsNV).format;
 };
-pub const OpticalFlowUsageFlagsNV = packed struct(Flags) {
+pub const OpticalFlowUsageFlagsNV = bitpack struct(Flags) {
     input_bit_nv: bool = false,
     output_bit_nv: bool = false,
     hint_bit_nv: bool = false,
@@ -20115,7 +20115,7 @@ pub const OpticalFlowSessionBindingPointNV = enum(i32) {
     global_flow_nv = 8,
     _,
 };
-pub const OpticalFlowSessionCreateFlagsNV = packed struct(Flags) {
+pub const OpticalFlowSessionCreateFlagsNV = bitpack struct(Flags) {
     enable_hint_bit_nv: bool = false,
     enable_cost_bit_nv: bool = false,
     enable_global_flow_bit_nv: bool = false,
@@ -20157,7 +20157,7 @@ pub const OpticalFlowSessionCreateFlagsNV = packed struct(Flags) {
     pub const contains = FlagsMixin(OpticalFlowSessionCreateFlagsNV).contains;
     pub const format = FlagFormatMixin(OpticalFlowSessionCreateFlagsNV).format;
 };
-pub const OpticalFlowExecuteFlagsNV = packed struct(Flags) {
+pub const OpticalFlowExecuteFlagsNV = bitpack struct(Flags) {
     disable_temporal_hints_bit_nv: bool = false,
     _reserved_bit_1: bool = false,
     _reserved_bit_2: bool = false,
@@ -20204,7 +20204,7 @@ pub const MicromapTypeEXT = enum(i32) {
     displacement_micromap_nv = 1000397000,
     _,
 };
-pub const BuildMicromapFlagsEXT = packed struct(Flags) {
+pub const BuildMicromapFlagsEXT = bitpack struct(Flags) {
     prefer_fast_trace_bit_ext: bool = false,
     prefer_fast_build_bit_ext: bool = false,
     allow_compaction_bit_ext: bool = false,
@@ -20246,7 +20246,7 @@ pub const BuildMicromapFlagsEXT = packed struct(Flags) {
     pub const contains = FlagsMixin(BuildMicromapFlagsEXT).contains;
     pub const format = FlagFormatMixin(BuildMicromapFlagsEXT).format;
 };
-pub const MicromapCreateFlagsEXT = packed struct(Flags) {
+pub const MicromapCreateFlagsEXT = bitpack struct(Flags) {
     device_address_capture_replay_bit_ext: bool = false,
     _reserved_bit_1: bool = false,
     _reserved_bit_2: bool = false,
@@ -20332,7 +20332,7 @@ pub const DeviceFaultVendorBinaryHeaderVersionEXT = enum(i32) {
     one_ext = 1,
     _,
 };
-pub const IndirectCommandsLayoutUsageFlagsEXT = packed struct(Flags) {
+pub const IndirectCommandsLayoutUsageFlagsEXT = bitpack struct(Flags) {
     explicit_preprocess_bit_ext: bool = false,
     unordered_sequences_bit_ext: bool = false,
     _reserved_bit_2: bool = false,
@@ -20379,7 +20379,7 @@ pub const IndirectExecutionSetInfoTypeEXT = enum(i32) {
     shader_objects_ext = 1,
     _,
 };
-pub const IndirectCommandsInputModeFlagsEXT = packed struct(Flags) {
+pub const IndirectCommandsInputModeFlagsEXT = bitpack struct(Flags) {
     vulkan_index_buffer_ext: bool = false,
     dxgi_index_buffer_ext: bool = false,
     _reserved_bit_2: bool = false,
@@ -20445,7 +20445,7 @@ pub const DisplacementMicromapFormatNV = enum(i32) {
     @"1024_triangles_128_bytes_nv" = 3,
     _,
 };
-pub const ShaderCreateFlagsEXT = packed struct(Flags) {
+pub const ShaderCreateFlagsEXT = bitpack struct(Flags) {
     link_stage_bit_ext: bool = false,
     allow_varying_subgroup_size_bit_ext: bool = false,
     require_full_subgroups_bit_ext: bool = false,
@@ -20580,7 +20580,7 @@ pub const OutOfBandQueueTypeNV = enum(i32) {
     present_nv = 1,
     _,
 };
-pub const MemoryUnmapFlags = packed struct(Flags) {
+pub const MemoryUnmapFlags = bitpack struct(Flags) {
     reserve_bit_ext: bool = false,
     _reserved_bit_1: bool = false,
     _reserved_bit_2: bool = false,
@@ -20631,7 +20631,7 @@ pub const DepthClampModeEXT = enum(i32) {
     user_defined_range_ext = 1,
     _,
 };
-pub const AccessFlags3KHR = packed struct(Flags64) {
+pub const AccessFlags3KHR = bitpack struct(Flags64) {
     _reserved_bit_0: bool = false,
     _reserved_bit_1: bool = false,
     _reserved_bit_2: bool = false,
@@ -20705,7 +20705,7 @@ pub const AccessFlags3KHR = packed struct(Flags64) {
     pub const contains = FlagsMixin(AccessFlags3KHR).contains;
     pub const format = FlagFormatMixin(AccessFlags3KHR).format;
 };
-pub const TileShadingRenderPassFlagsQCOM = packed struct(Flags) {
+pub const TileShadingRenderPassFlagsQCOM = bitpack struct(Flags) {
     enable_bit_qcom: bool = false,
     per_tile_execution_bit_qcom: bool = false,
     _reserved_bit_2: bool = false,
@@ -20754,7 +20754,7 @@ pub const CooperativeVectorMatrixLayoutNV = enum(i32) {
     training_optimal_nv = 3,
     _,
 };
-pub const AddressCopyFlagsKHR = packed struct(Flags) {
+pub const AddressCopyFlagsKHR = bitpack struct(Flags) {
     device_local_bit_khr: bool = false,
     sparse_bit_khr: bool = false,
     protected_bit_khr: bool = false,
@@ -20796,7 +20796,7 @@ pub const AddressCopyFlagsKHR = packed struct(Flags) {
     pub const contains = FlagsMixin(AddressCopyFlagsKHR).contains;
     pub const format = FlagFormatMixin(AddressCopyFlagsKHR).format;
 };
-pub const TensorCreateFlagsARM = packed struct(Flags64) {
+pub const TensorCreateFlagsARM = bitpack struct(Flags64) {
     mutable_format_bit_arm: bool = false,
     protected_bit_arm: bool = false,
     descriptor_buffer_capture_replay_bit_arm: bool = false,
@@ -20870,7 +20870,7 @@ pub const TensorCreateFlagsARM = packed struct(Flags64) {
     pub const contains = FlagsMixin(TensorCreateFlagsARM).contains;
     pub const format = FlagFormatMixin(TensorCreateFlagsARM).format;
 };
-pub const TensorUsageFlagsARM = packed struct(Flags64) {
+pub const TensorUsageFlagsARM = bitpack struct(Flags64) {
     _reserved_bit_0: bool = false,
     shader_bit_arm: bool = false,
     transfer_src_bit_arm: bool = false,
@@ -20949,7 +20949,7 @@ pub const TensorTilingARM = enum(i32) {
     linear_arm = 1,
     _,
 };
-pub const TensorViewCreateFlagsARM = packed struct(Flags64) {
+pub const TensorViewCreateFlagsARM = bitpack struct(Flags64) {
     descriptor_buffer_capture_replay_bit_arm: bool = false,
     _reserved_bit_1: bool = false,
     _reserved_bit_2: bool = false,
@@ -21028,7 +21028,7 @@ pub const DefaultVertexAttributeValueKHR = enum(i32) {
     zero_zero_zero_one_khr = 1,
     _,
 };
-pub const DataGraphPipelineSessionCreateFlagsARM = packed struct(Flags64) {
+pub const DataGraphPipelineSessionCreateFlagsARM = bitpack struct(Flags64) {
     protected_bit_arm: bool = false,
     _reserved_bit_1: bool = false,
     _reserved_bit_2: bool = false,
@@ -21115,7 +21115,7 @@ pub const DataGraphPipelinePropertyARM = enum(i32) {
     identifier_arm = 1,
     _,
 };
-pub const DataGraphPipelineDispatchFlagsARM = packed struct(Flags64) {
+pub const DataGraphPipelineDispatchFlagsARM = bitpack struct(Flags64) {
     _reserved_bits: Flags64 = 0,
     pub const toInt = FlagsMixin(DataGraphPipelineDispatchFlagsARM).toInt;
     pub const fromInt = FlagsMixin(DataGraphPipelineDispatchFlagsARM).fromInt;
@@ -21142,7 +21142,7 @@ pub const DataGraphModelCacheTypeQCOM = enum(i32) {
     generic_binary_qcom = 0,
     _,
 };
-pub const VideoEncodeRgbModelConversionFlagsVALVE = packed struct(Flags) {
+pub const VideoEncodeRgbModelConversionFlagsVALVE = bitpack struct(Flags) {
     rgb_identity_bit_valve: bool = false,
     ycbcr_identity_bit_valve: bool = false,
     ycbcr_709_bit_valve: bool = false,
@@ -21184,7 +21184,7 @@ pub const VideoEncodeRgbModelConversionFlagsVALVE = packed struct(Flags) {
     pub const contains = FlagsMixin(VideoEncodeRgbModelConversionFlagsVALVE).contains;
     pub const format = FlagFormatMixin(VideoEncodeRgbModelConversionFlagsVALVE).format;
 };
-pub const VideoEncodeRgbRangeCompressionFlagsVALVE = packed struct(Flags) {
+pub const VideoEncodeRgbRangeCompressionFlagsVALVE = bitpack struct(Flags) {
     full_range_bit_valve: bool = false,
     narrow_range_bit_valve: bool = false,
     _reserved_bit_2: bool = false,
@@ -21226,7 +21226,7 @@ pub const VideoEncodeRgbRangeCompressionFlagsVALVE = packed struct(Flags) {
     pub const contains = FlagsMixin(VideoEncodeRgbRangeCompressionFlagsVALVE).contains;
     pub const format = FlagFormatMixin(VideoEncodeRgbRangeCompressionFlagsVALVE).format;
 };
-pub const VideoEncodeRgbChromaOffsetFlagsVALVE = packed struct(Flags) {
+pub const VideoEncodeRgbChromaOffsetFlagsVALVE = bitpack struct(Flags) {
     cosited_even_bit_valve: bool = false,
     midpoint_bit_valve: bool = false,
     _reserved_bit_2: bool = false,
@@ -21268,7 +21268,7 @@ pub const VideoEncodeRgbChromaOffsetFlagsVALVE = packed struct(Flags) {
     pub const contains = FlagsMixin(VideoEncodeRgbChromaOffsetFlagsVALVE).contains;
     pub const format = FlagFormatMixin(VideoEncodeRgbChromaOffsetFlagsVALVE).format;
 };
-pub const SwapchainImageUsageFlagsOHOS = packed struct(Flags) {
+pub const SwapchainImageUsageFlagsOHOS = bitpack struct(Flags) {
     shared_bit_ohos: bool = false,
     _reserved_bit_1: bool = false,
     _reserved_bit_2: bool = false,
