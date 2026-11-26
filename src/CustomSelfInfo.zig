@@ -1,4 +1,4 @@
-// Based on lib/std/debug/SelfInfo/Elf.zig @ 117fd40fbf6ec8ff0574b30383b70d4d54f9b76b.
+// Based on lib/std/debug/SelfInfo/Elf.zig @ 1fb0e6330e6225f413a70396d474dde0fb05a76f.
 // https://codeberg.org/ziglang/zig/commits/branch/master/lib/std/debug/SelfInfo/Elf.zig
 
 // DynLoader extensions.
@@ -138,7 +138,7 @@ pub fn getSymbols(
     const dwarf_err: ?Error = err: {
         const dwarf = &(loaded_elf.file.dwarf orelse break :err null);
         switch (loaded_elf.dwarf) {
-            .not_scanned => if (dwarf.open(gpa, native_endian)) {
+            .not_scanned => if (dwarf.open(gpa, .{})) {
                 loaded_elf.dwarf = .ok;
             } else |err| switch (err) {
                 error.InvalidDebugInfo,
@@ -163,7 +163,6 @@ pub fn getSymbols(
         return dwarf.getSymbols(
             symbol_allocator,
             text_arena,
-            native_endian,
             vaddr,
             resolve_inline_callers,
             symbols,
@@ -216,7 +215,6 @@ pub const can_unwind: bool = s: {
             .aarch64,
             .arm,
             .riscv64,
-            .x86,
             .x86_64,
         },
         .illumos => &.{
@@ -225,7 +223,7 @@ pub const can_unwind: bool = s: {
         // Not supported yet: hppa, hppa64, microblaze/microblazeel, sh/sheb
         .linux => &.{
             .aarch64,
-            .aarch64_be,
+            .aarch64be,
             .alpha,
             .arc,
             .arm,
@@ -236,8 +234,22 @@ pub const can_unwind: bool = s: {
             .m68k,
             .mips,
             .mipsel,
+            .mipsf32,
+            .mipsf32el,
+            .mipsf64,
+            .mipsf64el,
+            .mipsf64n8,
+            .mipsf64n8el,
+            .mipsn8,
+            .mipsn8el,
+            .mipsr6,
+            .mipsr6el,
             .mips64,
             .mips64el,
+            .mips64n8,
+            .mips64n8el,
+            .mips64r6,
+            .mips64r6el,
             .or1k,
             .riscv32,
             .riscv64,
@@ -260,19 +272,22 @@ pub const can_unwind: bool = s: {
             .aarch64,
             .arm,
             .riscv64,
-            .x86,
             .x86_64,
         },
         // Not supported yet: hppa, mips64/mips64el, sh/sheb
         .netbsd => &.{
             .aarch64,
-            .aarch64_be,
+            .aarch64be,
             .alpha,
             .arm,
             .armeb,
             .m68k,
             .mips,
             .mipsel,
+            .mipsf32,
+            .mipsf32el,
+            .mips64,
+            .mips64el,
             .riscv32,
             .riscv64,
             .x86,
